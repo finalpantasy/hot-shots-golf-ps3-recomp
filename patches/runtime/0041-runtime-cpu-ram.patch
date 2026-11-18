@@ -1,0 +1,215 @@
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -134,6 +134,24 @@
+  *
+  * r3 = microseconds
+  * -----------------------------------------------------------------------*/
++#ifdef _WIN32
++/* RT_IDLE_WAIT wake-up: a guest thread parked in a short usleep (see below) is
++ * usually polling a word that one of our host threads is about to write --
++ * the RSX fence (ctrl->ref) or a SPURS job-done counter. Those writers call
++ * rt_idle_wake() so the poller re-checks at once instead of at the end of its
++ * ~0.5 ms timer. Auto-reset and only set while someone sleeps: a wake with no
++ * sleeper is dropped, and a stale one costs one early return of one usleep,
++ * which a polling loop just re-polls. */
++static HANDLE s_idle_wake_ev;
++static volatile long s_idle_sleepers;
++void rt_idle_wake(void)
++{
++    if (s_idle_sleepers > 0 && s_idle_wake_ev) SetEvent(s_idle_wake_ev);
++}
++#else
++void rt_idle_wake(void) {}
++#endif
++
+ int64_t sys_timer_usleep(ppu_context* ctx)
+ {
+     uint64_t usec = LV2_ARG_U64(ctx, 0);
+@@ -301,10 +319,62 @@
+         QueryPerformanceCounter(&qpc_start);
+         const int64_t qpc_deadline = qpc_start.QuadPart +
+             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+-        do {
+-            SwitchToThread();
+-            QueryPerformanceCounter(&qpc_now);
+-        } while (qpc_now.QuadPart < qpc_deadline);
++        /* RT_IDLE_WAIT (default on; =0 restores the pure spin): a guest that
++         * polls with short sleeps -- Hot Shots Golf's main thread calls
++         * usleep(30) at 0x00921DC4 in a loop while it waits on its job and
++         * GPU counters -- kept a whole core busy in the spin below, 40-70% of
++         * that thread's samples. Spin as before for the first
++         * RT_IDLE_SPIN_US (default 200) of a poll episode, so a short wait
++         * keeps its microsecond wake-up; once the same thread has been polling
++         * longer than that, block on a high-resolution waitable timer instead
++         * (wakes ~0.5 ms later on Windows 10+, using no CPU meanwhile), or
++         * earlier when a fence or job-done write calls rt_idle_wake(). An
++         * episode is a run of usleeps whose gaps are under the same 200 us.
++         * No high-resolution timer (pre-1803 Windows): spin as before. */
++        static int s_iw = -1; static int64_t s_iw_spin = 0;
++        if (s_iw < 0) {
++            const char* e = getenv("RT_IDLE_WAIT");
++            const char* sp = getenv("RT_IDLE_SPIN_US");
++            uint64_t sus = sp ? strtoull(sp, 0, 10) : 200;
++            s_iw_spin = (int64_t)((sus * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
++            if (!(e && e[0] == '0') && !s_idle_wake_ev) {
++                HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
++                if (ev && InterlockedCompareExchangePointer((PVOID volatile*)&s_idle_wake_ev, ev, NULL) != NULL)
++                    CloseHandle(ev);
++            }
++            s_iw = (e && e[0] == '0') ? 0 : 1;
++        }
++        int slept = 0;
++        static __thread int64_t ep_start, ep_last;
++        static __thread HANDLE tmr; static __thread int tmr_failed;
++        if (s_iw) {
++            if (qpc_start.QuadPart - ep_last > s_iw_spin) ep_start = qpc_start.QuadPart;
++            if (qpc_start.QuadPart - ep_start >= s_iw_spin && !tmr_failed) {
++                if (!tmr) {
++                    tmr = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
++                                                 TIMER_ALL_ACCESS);
++                    if (!tmr) tmr_failed = 1;
++                }
++                if (tmr) {
++                    LARGE_INTEGER due; due.QuadPart = -((LONGLONG)usec * 10);
++                    if (SetWaitableTimer(tmr, &due, 0, NULL, NULL, FALSE)) {
++                        HANDLE hs[2] = { tmr, s_idle_wake_ev };
++                        InterlockedIncrement(&s_idle_sleepers);
++                        DWORD w = WaitForMultipleObjects(hs[1] ? 2 : 1, hs, FALSE, 100);
++                        InterlockedDecrement(&s_idle_sleepers);
++                        if (w == WAIT_OBJECT_0 + 1) CancelWaitableTimer(tmr);   /* woken early */
++                        slept = (w == WAIT_OBJECT_0 || w == WAIT_OBJECT_0 + 1);
++                    }
++                }
++            }
++        }
++        if (!slept) {
++            do {
++                SwitchToThread();
++                QueryPerformanceCounter(&qpc_now);
++            } while (qpc_now.QuadPart < qpc_deadline);
++        }
++        if (s_iw) { QueryPerformanceCounter(&qpc_now); ep_last = qpc_now.QuadPart; }
+     }
+ #else
+     if (usec > 0) {
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -3027,6 +3027,9 @@
+ 
+ static void jc_signal_done(u32 jc_ea, int job_index)
+ {
++    /* RT_IDLE_WAIT: the job's done-counter DMA has landed; a PPU thread
++     * polling it in a short usleep re-checks now (sys_timer.c). */
++    { extern void rt_idle_wake(void); rt_idle_wake(); }
+     /* A job that posts its own completion event (send_event or throw_event
+      * through the interrupt mailbox, delivered by spurs_port_queue on this
+      * thread) must not also get an invented one. The invented event carries
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1983,6 +1983,9 @@
+                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
+     s_ref_qhead = h + 1;
+     g_gcm_ref_pub_count++;
++    /* RT_IDLE_WAIT: a thread polling ctrl->ref in a short usleep (Hot Shots
++     * Golf, 0x00921DD8) re-checks now instead of at its timer (sys_timer.c). */
++    { extern void rt_idle_wake(void); rt_idle_wake(); }
+ }
+ 
+ /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -70,6 +70,16 @@
+  * value: the allocation halves on failure rather than losing all geometry. */
+ static u32 s_vp_max_verts = 1572864u;
+ #define VP_MAX_VERTICES s_vp_max_verts
++/* RT_VB_GROW (default on; =0 restores the fixed 768 MB allocation): start the
++ * VP vertex buffer at VP_VB_GROW_START vertices and grow it to the full
++ * 1572864 the first time a batch needs more. The full size was
++ * an UPLOAD heap the driver keeps resident: 768 MB of RAM whether a scene used
++ * 20 MB of it or 400 MB. See vp_vb_grow. */
++#define VP_VB_GROW_START 262144u
++static u32 s_vp_cap_verts = 1572864u;       /* ceiling the buffer may grow to */
++static int s_vp_grow_on = 0;
++static ID3D12Resource* s_vp_vb_old = NULL;  /* replaced buffer the in-flight frame may read */
++static void vp_vb_release_old(void);
+ #define VP_MAX_INDICES  (1u << 21)  /* per-frame index buffer of indexed VP draws, x2 parity */
+ #define MAX_DRAWS         4096  /* per-frame draw records. A heavy Hot Shots
+                                  * Golf course records a 1600-2050 draw shadow
+@@ -1651,6 +1661,8 @@
+          * declines to upload -- the scene just does not render, with no error
+          * anywhere. Report the size too: this buffer is
+          * VP_MAX_VERTICES * 256 * 2 bytes and grows fast. */
++        { const char* g = getenv("RT_VB_GROW");
++          if (!(g && g[0] == '0')) { s_vp_grow_on = 1; s_vp_cap_verts = s_vp_max_verts; s_vp_max_verts = VP_VB_GROW_START; } }
+         for (;;) {
+             bd.Width = (u64)VP_MAX_VERTICES * 256 * 2;
+             fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
+@@ -6123,6 +6135,7 @@
+     const double _pf0 = rsx_prof_on() ? perf_now() : 0.0;
+     stall_mark("rf:gpuwait");
+     wait_for_gpu();
++    vp_vb_release_old();   /* RT_VB_GROW: the GPU no longer reads a replaced vertex buffer */
+     stall_mark("rf:record");
+     const double _pf1 = _pf0 ? perf_now() : 0.0;
+     if (_pf0) { s_prof[PF_RF_WAIT] += _pf1 - _pf0; s_prof_rf++; s_prof_rdraws += s_d3d.draw_count; }
+@@ -9401,8 +9414,60 @@
+     if (v < 0) { const char* e = getenv("RSX_FULL_SPLIT"); v = (e && e[0] == '0') ? 0 : 1; }
+     return v;
+ }
++/* RT_VB_GROW: when a batch needs more than the buffer holds, replace the VP
++ * vertex buffer with the full-size one -- straight to s_vp_cap_verts, the old fixed size:
++ * a course batch needs ~1.5M anyway, and stepping 2x at a time held three
++ * buffers at once and copied three times (a +640 MB private peak). This batch's
++ * vertices so far are copied into the new buffer's half for the current
++ * parity; the records hold offsets, not addresses, and the vertex buffer view
++ * is built from the live resource in render_frame. The old buffer may still
++ * be read by the frame the GPU is running (the other parity half), so it is
++ * released only after the next wait_for_gpu. A second grow before that point
++ * replaces a buffer no submitted frame has seen, which is released at once.
++ * On allocation failure the buffer stays as it is and batch_room splits the
++ * batch exactly as it did before. */
++static void vp_vb_release_old(void)
++{
++    if (s_vp_vb_old) { s_vp_vb_old->lpVtbl->Release(s_vp_vb_old); s_vp_vb_old = NULL; }
++}
++static int vp_vb_grow(u32 need)
++{
++    if (!s_vp_grow_on || !s_d3d.vp_vb_mapped || need <= VP_MAX_VERTICES ||
++        VP_MAX_VERTICES >= s_vp_cap_verts) return 0;
++    const u32 nv = s_vp_cap_verts;   /* one step: each grow copies and briefly holds two buffers */
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Height = 1;
++    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
++    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    bd.Width = (u64)nv * VP_VERT_STRIDE * 2;
++    ID3D12Resource* nb = NULL; void* nm = NULL; D3D12_RANGE nr = {0, 0};
++    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
++            D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
++            &IID_ID3D12Resource, (void**)&nb)) ||
++        FAILED(nb->lpVtbl->Map(nb, 0, &nr, &nm)) || !nm) {
++        if (nb) nb->lpVtbl->Release(nb);
++        { static int _n = 0; if (PS3_LOG_FIRST(_n, 3))
++            fprintf(stderr, "[VPVB] grow to %u verts failed; batches split instead%c", nv, 10); }
++        s_vp_cap_verts = VP_MAX_VERTICES;   /* stop trying */
++        return 0;
++    }
++    memcpy((u8*)nm + (u64)s_d3d.vp_parity * nv * VP_VERT_STRIDE,
++           (const u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE,
++           s_d3d.vp_vb_offset);
++    if (s_vp_vb_old) s_d3d.vp_vb->lpVtbl->Release(s_d3d.vp_vb);   /* never submitted */
++    else s_vp_vb_old = s_d3d.vp_vb;
++    fprintf(stderr, "[VPVB] grew vertex buffer %u -> %u verts (%llu MB, x2 parity)%c",
++            (unsigned)VP_MAX_VERTICES, nv, (unsigned long long)(bd.Width >> 20), 10);
++    s_d3d.vp_vb = nb; s_d3d.vp_vb_mapped = nm; s_vp_max_verts = nv;
++    return 1;
++}
++
+ static void batch_room(u32 verts)
+ {
++    if (s_d3d.initialized &&
++        (u64)s_d3d.vp_vb_offset / VP_VERT_STRIDE + verts > VP_MAX_VERTICES)
++        vp_vb_grow((u32)((u64)s_d3d.vp_vb_offset / VP_VERT_STRIDE + verts));
+     if (!s_d3d.initialized || !s_d3d.draw_count) return;
+     if (s_d3d.draw_count + 4u < MAX_DRAWS &&
+         (u64)s_d3d.vp_vb_offset / VP_VERT_STRIDE + verts <= VP_MAX_VERTICES)

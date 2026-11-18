@@ -265,3 +265,9 @@ The inverted frames at impact are the game's own effect. The last draw of those 
 The upside-down rectangle on hole 2 was fixed by patch `0039`. Before it, three fragment programs read display depth from guest memory that was never written, so a depth-faded quad showed as a rectangle. In a 524-second run with a capture every 6 seconds (`imp9`), the round reached hole 3, hole 2 showed the river with no rectangle, and no capture was black. With the three `0039` switches off, the rectangle comes back.
 
 Patch `0040` adds debug switches only, all off by default: `RSX_BLEND_LOG`, `RSX_SURF_LOG`, `RSX_CAP_NEWVP`, `RSX_CAP_SURF`, `RSX_CAP_SRCBLEND`, `VDATA_DBG`.
+
+## 2026-11-18 update 28: less CPU and RAM (patch 0041)
+
+The main game thread spent 40 to 70% of its time in a tight `usleep(30)` loop while waiting for the GPU. After 200 microseconds of polling it now sleeps on a timer, and the GPU fence and SPURS job completion wake it early. The vertex buffer starts at 128 MB and grows to 768 MB the first time a scene needs it. Switches: `RT_IDLE_WAIT=0`, `RT_VB_GROW=0`, `RT_IDLE_SPIN_US=<n>`.
+
+A/B on one build with the switches off, then on: title 1.68 to 1.12 cores and 1,671 to 1,149 MB private; menu 1.98 to 1.40 cores; course 3.03 to 2.59 cores at about 27 to 30 FPS. Course RAM did not change, because a course fills most of the buffer. A scripted 450-second round on the new build reached hole 3 at about 300 seconds, with no stall and nothing left running after exit.
