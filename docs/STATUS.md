@@ -257,3 +257,11 @@ The upside-down rectangle at the bottom left of hole 2 is probably the river's r
 Patch `0039` copies the real depth buffer when the game saves it for the swing, stops a bloom pass from clearing the shared depth buffer mid-frame, and keeps display surfaces across frames that start without a clear. Switches: `RSX_DISP_DEPTH_TEX=0`, `RSX_DISP_DEPTH_KEEP=0`, `RSX_KEEP_DISPLAY=0`. Over two 450-second runs with a capture every 6 seconds, black captures went from 4 of 41 to 0 of 41. The two runs reached different points of the round, so they are not the same scenes. In-round frame rate was about 22 FPS with the system CPU 95% busy.
 
 Still wrong: 2 frames per run at impact have inverted colors (purple grass, orange sky). The upside-down rectangle on hole 2 is not fixed.
+
+## 2026-11-18 update 27: impact flash and hole 2 rectangle
+
+The inverted frames at impact are the game's own effect. The last draw of those frames is a white full-screen quad with blend source ONE_MINUS_DST_COLOR and destination ZERO, so the game asks for a negative of the screen for about 8 frames, and the backend draws what it asks. Blend, color and depth state decode correctly. This has not been compared against hardware or RPCS3.
+
+The upside-down rectangle on hole 2 was fixed by patch `0039`. Before it, three fragment programs read display depth from guest memory that was never written, so a depth-faded quad showed as a rectangle. In a 524-second run with a capture every 6 seconds (`imp9`), the round reached hole 3, hole 2 showed the river with no rectangle, and no capture was black. With the three `0039` switches off, the rectangle comes back.
+
+Patch `0040` adds debug switches only, all off by default: `RSX_BLEND_LOG`, `RSX_SURF_LOG`, `RSX_CAP_NEWVP`, `RSX_CAP_SURF`, `RSX_CAP_SRCBLEND`, `VDATA_DBG`.

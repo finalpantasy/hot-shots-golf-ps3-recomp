@@ -43,7 +43,7 @@ Updated 2026-11-17.
 | Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout, lit terrain with tree shadows. |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
 | Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course" |
-| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots, finish the first hole (par 4) at +4, show the leaderboard and start hole 2. Patch `0036` fixed the stalls that hit about half the runs. A few frames at impact have inverted colors, and on hole 2 a rectangle at the bottom left shows the scene upside down. Not tested with a physical controller |
+| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots, finish the first hole (par 4) at +4, show the leaderboard and start hole 2. Patch `0036` fixed the stalls that hit about half the runs. A scripted round reaches hole 3. The negative flash at impact is the game's own effect. Not tested with a physical controller |
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 
 

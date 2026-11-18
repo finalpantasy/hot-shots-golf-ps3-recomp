@@ -1,0 +1,125 @@
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -682,6 +682,11 @@
+         state->blend_dirty = 1;
+         return 0;
+     }
++    if (method == NV4097_SET_BLEND_COLOR) {
++        state->blend_color = data;
++        state->blend_dirty = 1;
++        return 0;
++    }
+ 
+     /* Depth */
+     if (method == NV4097_SET_DEPTH_TEST_ENABLE) {
+@@ -817,6 +822,14 @@
+             fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
+         return 0;
+     }
++    /* VDATA_DBG=1 also names the other constant-attribute encodings
++     * (SCALED4S 0x1500, 2F 0x1880, 2S 0x1900, 4UB 0x1940, 4S 0x1980), which
++     * this decoder does not apply. */
++    { static int _d2 = -1; if (_d2 < 0) _d2 = getenv("VDATA_DBG") ? 1 : 0;
++      if (_d2 && ((method >= 0x1500u && method < 0x1580u) || (method >= 0x1880u && method < 0x1A00u))) {
++          static int _n2 = 0;
++          if (_n2 < 400) { _n2++;
++              fprintf(stderr, "[VDATAX] method=0x%04X data=0x%08X%c", method, data, 10); } } }
+ 
+ 
+     /* Registers that sit right after the 32-dword constant window. Taken as
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2191,6 +2191,9 @@
+                   if (cb == (const char*)1) { cb = getenv("RSX_CAP_CB"); want = cb ? (u32)strtoul(cb, NULL, 16) : 0; }
+                   int hit = 0;
+                   for (int u = 0; u < 16; u++) if (want && r->tex[u].set && r->tex[u].raw == want) hit = 1;
++                  { static int sbw = -2;   /* RSX_CAP_SRCBLEND: the matching draws too */
++                    if (sbw == -2) { const char* e = getenv("RSX_CAP_SRCBLEND"); sbw = e ? atoi(e) : -1; }
++                    if (sbw >= 0 && (r->blend_key & 1u) && (int)((r->blend_key >> 1) & 31u) == sbw) hit = 1; }
+                   if (hit && s_d3d.vp_cb_mapped) {
+                       const float* c = (const float*)((const char*)s_d3d.vp_cb_mapped
+                           + ((u64)(s_d3d.vp_parity ^ 1) * MAX_DRAWS + r->cb_slot) * VP_CB_STRIDE);
+@@ -2209,6 +2212,9 @@
+                                       vb[v*64+4], vb[v*64+5], vb[v*64+6], vb[v*64+7],
+                                       vb[v*64+8], vb[v*64+9], vb[v*64+10], vb[v*64+11],
+                                       vb[v*64+12], vb[v*64+13], vb[v*64+14], vb[v*64+15], 10);
++                          for (u32 v = 0; v < r->vertex_count && v < 4; v++)
++                              fprintf(mf, "      v%u: a8=(%g %g %g %g)%c", v,
++                                      vb[v*64+32], vb[v*64+33], vb[v*64+34], vb[v*64+35], 10);
+                       } } }
+                   fprintf(mf, "      call prim=%u first=%u count=%u ix=%d ixoff=0x%X ixdma=0x%X vpstart=%u brb=0x%X"
+                               " a0 off=0x%X stride=%u type=%u size=%u pos=[%.3g..%.3g, %.3g..%.3g, %.3g..%.3g, %.3g..%.3g]"
+@@ -2876,6 +2882,15 @@
+         if (!f && ns<32) { seen[ns++]=sk;
+             fprintf(stderr, "[BLEND] enable=%d sfactor=0x%X dfactor=0x%X%c", enable,
+                     st?st->blend_sfactor:0, st?st->blend_dfactor:0, 10); } } }
++    /* RSX_BLEND_LOG=1: each distinct guest blend setup (factors, equation,
++     * colour) with the frame it first appears in. */
++    { static int bl = -1; if (bl < 0) bl = getenv("RSX_BLEND_LOG") ? 1 : 0;
++      if (bl && enable && st) { static u32 seen[64][4]; static int ns = 0;
++        const u32 q[4] = { st->blend_sfactor, st->blend_dfactor, st->blend_equation, st->blend_color };
++        int f = 0; for (int k2 = 0; k2 < ns; k2++) if (!memcmp(seen[k2], q, sizeof q)) f = 1;
++        if (!f && ns < 64) { memcpy(seen[ns++], q, sizeof q);
++            fprintf(stderr, "[BLENDLOG] frame=%llu sf=0x%08X df=0x%08X eq=0x%08X color=0x%08X%c",
++                    (unsigned long long)s_d3d.frame_count, q[0], q[1], q[2], q[3], 10); } } }
+     if (!enable) return 0;
+     /* Factors never programmed: keep the legacy straight-alpha behaviour
+      * (dbgfont-style text enables blending without setting factors). */
+@@ -3362,8 +3377,8 @@
+      * fragment program that hangs the GPU shows up here as an implausible
+      * instruction count long before it shows up as a TDR. */
+     { static int fl = -1; if (fl < 0) fl = getenv("FP_LIST") ? 1 : 0;
+-      if (fl) fprintf(stderr, "[FPLIST] fp=0x%08X instrs=%d hlsl=%u bytes%c",
+-                      fp_addr, n, (unsigned)strlen(hlsl), 10); }
++      if (fl) fprintf(stderr, "[FPLIST] fp=0x%08X instrs=%d hlsl=%u bytes frame=%llu%c",
++                      fp_addr, n, (unsigned)strlen(hlsl), (unsigned long long)s_d3d.frame_count, 10); }
+     /* FP_DUMP=<n>: the first n compiled programs (1 = the old default of 4). */
+     if (getenv("FP_DUMP")) { static int _d=0, _cap=-1;
+       if (_cap < 0) { _cap = atoi(getenv("FP_DUMP")); if (_cap <= 1) _cap = 4; }
+@@ -7792,6 +7807,46 @@
+             if (s_cap_nodisp)
+                 for (u32 _i = 0; _i < s_dbg_last_draws && _i < MAX_DRAWS; _i++)
+                     if (dr_is_display_draw(&s_d3d.draws[_i])) { cap_ok = 0; break; }
++            /* RSX_SURF_LOG=1: log each new colour-draw target combination
++             * (surface, rt, viewport) with its frame; RSX_CAP_NEWVP=1 then
++             * captures only frames that brought a new one. */
++            { static int s_sl = -1, s_nv = 0; static u32 s_sl_seen[512][4]; static int s_sl_n = 0;
++              if (s_sl < 0) { s_sl = getenv("RSX_SURF_LOG") ? 1 : 0; s_nv = getenv("RSX_CAP_NEWVP") ? 1 : 0; }
++              if (s_sl) { int fresh = 0;
++                  for (u32 _i = 0; _i < s_dbg_last_draws && _i < MAX_DRAWS; _i++) {
++                      const D3D12DrawRecord* _r = &s_d3d.draws[_i];
++                      if (_r->is_clear || _r->no_color || !_r->cmask) continue;
++                      const u32 q[4] = { _r->surf_raw, _r->rt_off, (u32)_r->vp_x | ((u32)_r->vp_y << 16),
++                                         (u32)_r->vp_w | ((u32)_r->vp_h << 16) };
++                      int k = 0; for (; k < s_sl_n; k++) if (!memcmp(s_sl_seen[k], q, sizeof q)) break;
++                      if (k < s_sl_n || s_sl_n >= 512) continue;
++                      memcpy(s_sl_seen[s_sl_n++], q, sizeof q); fresh = 1;
++                      fprintf(stderr, "[SURFLOG] frame=%llu op%u surf=0x%08X rt=0x%08X vp=%u,%u,%ux%u clip=%ux%u fp=0x%08X n=%u%c",
++                              (unsigned long long)s_d3d.frame_count, _i, _r->surf_raw, _r->rt_off,
++                              _r->vp_x, _r->vp_y, _r->vp_w, _r->vp_h, _r->surf_w, _r->surf_h,
++                              _r->fp_addr, _r->vertex_count, 10); }
++                  if (s_nv && !fresh) cap_ok = 0; } }
++            /* RSX_CAP_SURF=<hex>: only frames with a colour draw to that raw
++             * surface offset (0 included). */
++            { static int s_cap_sf_on = -1; static u32 s_cap_sf = 0;
++              if (s_cap_sf_on < 0) { const char* e = getenv("RSX_CAP_SURF");
++                  s_cap_sf_on = e ? 1 : 0; s_cap_sf = e ? (u32)strtoul(e, NULL, 16) : 0; }
++              if (s_cap_sf_on) { int hit = 0;
++                  for (u32 _i = 0; _i < s_dbg_last_draws && _i < MAX_DRAWS; _i++) {
++                      const D3D12DrawRecord* _r = &s_d3d.draws[_i];
++                      if (!_r->is_clear && !_r->no_color && _r->cmask && _r->surf_raw == s_cap_sf) { hit = 1; break; } }
++                  if (!hit) cap_ok = 0; } }
++            /* RSX_CAP_SRCBLEND=<D3D12_BLEND n>: only frames with a blended draw
++             * whose colour source factor is n (10 = INV_DEST_COLOR). */
++            { static int s_cap_sb = -2;
++              if (s_cap_sb == -2) { const char* e = getenv("RSX_CAP_SRCBLEND"); s_cap_sb = e ? atoi(e) : -1; }
++              if (s_cap_sb >= 0) { int hit = 0;
++                  for (u32 _i = 0; _i < s_dbg_last_draws && _i < MAX_DRAWS; _i++) {
++                      const D3D12DrawRecord* _r = &s_d3d.draws[_i];
++                      if (!_r->is_clear && (_r->blend_key & 1u) && (int)((_r->blend_key >> 1) & 31u) == s_cap_sb) { hit = 1; break; } }
++                  static u64 s_cap_sb_last = 0;   /* also the frame after a hit */
++                  if (hit) s_cap_sb_last = s_d3d.frame_count;
++                  else if (!s_cap_sb_last || s_d3d.frame_count != s_cap_sb_last + 1) cap_ok = 0; } }
+             if (cap_ok && s_d3d.frame_count >= target && s_dbg_last_draws > 0 &&
+                 s_dbg_last_draws >= (u32)s_cap_min) {
+                 rsx_capture_frame(fi, s_dbg_last_draws, s_cap_done);

@@ -530,3 +530,8 @@ Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-f
 
 - Worker `ad4be5c8a2b3ae6f2` finished. `0039-rsx-swing-frames.patch` (`rsx_d3d12_backend.c`): `RSX_DISP_DEPTH_TEX`, `RSX_DISP_DEPTH_KEEP`, `RSX_KEEP_DISPLAY` (each `=0` off); debug `RSX_ZWATCH`, `RSX_DISPZ_DBG`. Black 4/41 (sw1) to 0/41 (sw4); sheets scratchpad `swing\sw1-sheet.png`, `sw4-sheet.png`. CPU 95% during sw4.
 - Open: inverted impact frames (2 per run, present with and without 0039); hole 2 upside-down rectangle; sw2 ran at 7 FPS once, cause unknown.
+
+- 2026-11-18 14:46 worker ab8788e0d2ec2dc5b (Opus): game CPU and RAM use, patch 0041; no edits to libs/video (owned by ac8e17dd1bf56697f, 0040) or port/**. Cleanup: 211 stale build/run/scratch folders deleted, 129 GB.
+
+
+- 2026-11-18 16:06 run 35 (worker ac8e17dd1bf56697f, imp9): impact negative flash is the game's blend (1-dst); hole 2 rectangle fixed by 0039 (0 of hole-2 shots); 0040 debug-only switches committed.
