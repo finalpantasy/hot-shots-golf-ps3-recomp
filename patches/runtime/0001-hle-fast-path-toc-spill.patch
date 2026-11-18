@@ -1,0 +1,24 @@
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 5148b38..92aa9b0 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -281,8 +281,18 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+ {
+-    if (const hle_fast_fn f = hle_fast(nid))
++    if (const hle_fast_fn f = hle_fast(nid)) {
++        /* The import stub's own `std r2,0x28(r1)`. The fast form leaves r2
++         * alone, but the caller still reloads it with `ld r2,0x28(r1)`, and a
++         * multi-TOC title has no other writer for that slot: Hot Shots Golf's
++         * libc lock helper (0xA3A4DC) came back from sys_lwmutex_lock with
++         * r2=0, so mspace_malloc read its heap state through a null TOC and
++         * every malloc returned NULL. Same FLOW_NOSPILL switch as the full
++         * path below. */
++        { static int _ns = -1; if (_ns < 0) _ns = getenv("FLOW_NOSPILL") ? 1 : 0;
++          if (!_ns) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); }
+         if (f(ctx)) return;
++    }
+ 
+     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
+      * call it makes. WAITBT_EVERY only samples threads that are blocking on an

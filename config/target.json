@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "title": "Hot Shots Golf: World Invitational",
+  "title_id": "NPUA80864",
+  "region": "US",
+  "baseline_profile": "fix-1.02",
+  "latest_profile": "official-1.03",
+  "profiles": {
+    "base-1.00": {
+      "package": "xWpDMWJncCozrjMGoggjRZPUtGIYrBSgsBYImpcRWhVOYMRSFnWScmVEvCOTnYxRGESNxTihPNAvgMOvwGJkrqDjkkjmobOndCLYU.pkg",
+      "package_sha256": "2a6e85a1b9ae6332e2d657bb752a0deae256fe34354a0457ce91c1b2224af13b",
+      "eboot": "work/extracted/base-1.00/USRDIR/EBOOT.BIN",
+      "eboot_sha256": "ad2a5a320fdb49daac74b47f62cdae85b407f1654fb7bfe97cfe82e1a8a3eba8",
+      "decryption_status": "blocked_missing_rap"
+    },
+    "official-1.01": {
+      "package": "UP9000-NPUA80864_00-0000111122223333-A0101-V0100-PE.pkg",
+      "package_sha256": "77b099d547b9f4b96a964b7a3f70bb4a26e7ed66bc2c13f35ebdd27d59f49383",
+      "eboot": "work/extracted/update-1.01/USRDIR/EBOOT.BIN",
+      "eboot_sha256": "9686468a73e068b38637640f6aa4f149681f1d160a9ff92d34eceff21ad6eb29",
+      "decryption_status": "blocked_missing_rap"
+    },
+    "official-1.02": {
+      "package": "UP9000-NPUA80864_00-0000111122223333-A0102-V0100-PE.pkg",
+      "package_sha256": "e53f97909baecd82bb89b452b0ed23c09373dde1b6630cb338eac062fd0ba0ef",
+      "eboot": "work/extracted/update-1.02/USRDIR/EBOOT.BIN",
+      "eboot_sha256": "ebe9300d8302b593b98fa3f7ecf88f51d5942fccc477c0bdcd5d6117ec70a9ca",
+      "decryption_status": "blocked_missing_rap"
+    },
+    "fix-1.02": {
+      "package": "HOT SHOTS GOLF WORLD INVITATIONAL USA PSN PATCH 1.02 FIX CFW 4.XX (NPUA80864).pkg",
+      "package_sha256": "7411bb4de49461b1a91b985beb53cf5f278a3f4cb11602e5a3a40b4cb3f339a9",
+      "eboot": "work/extracted/fix-1.02/USRDIR/EBOOT.BIN",
+      "eboot_sha256": "8e5e9f1f2705033ae325ac84360613e87ae3c91416b08b168ce2b700241f62d6",
+      "decrypted_elf": "work/extracted/fix-1.02/USRDIR/EBOOT.elf",
+      "decrypted_elf_sha256": "42bdddc5e419f7e18bcbecdf02eb24748dd1da911ea7257d86d8477e24777a8b",
+      "decryption_status": "decrypted",
+      "code_end": "0xd17018"
+    },
+    "official-1.03": {
+      "package": "UP9000-NPUA80864_00-0000111122223333-A0103-V0100-PE.pkg",
+      "package_sha256": "5b74329d682ddccaa1afa88cd6d7fe06dd5837daa796bf1522b5c5e44c48527e",
+      "eboot": "work/extracted/update-1.03/USRDIR/EBOOT.BIN",
+      "eboot_sha256": "491d9d5f66a47736150ba009ed1835a51503cfbf573dfae6ce005acbb1e4d5b4",
+      "decryption_status": "blocked_missing_rap",
+      "required_license_filename": "UP9000-NPUA80864_00-0000111122223333.rap",
+      "sony_update_manifest": "https://a0.ww.np.dl.playstation.net/tpl/np/NPUA80864/NPUA80864-ver.xml",
+      "sony_published_sha1": "05e54ee009117a3912b82d3333465c582d860e81",
+      "downloaded_sha1": "aaaa173760359b98d32a4271683356d809313636",
+      "provenance_warning": "Sony manifest lists 1.03 as latest and size/content ID match, but published and downloaded SHA-1 differ. Both Sony CDN endpoints served identical bytes."
+    }
+  },
+  "excluded_inputs": [
+    {
+      "path": "HP9000-NPHA80248_00-0000111122223333-A0103-V0100-PE.pkg",
+      "reason": "Asian Everybody's Golf 6 release NPHA80248, not US NPUA80864"
+    },
+    {
+      "path": "work/downloads/UP9000-NPUA80864_00-0000111122223333-A0103-V0100-PE.pkg",
+      "reason": "Byte-identical duplicate of the root official 1.03 package"
+    },
+    {
+      "path": "mngolf6alldlcps3u/",
+      "reason": "Fix packages are byte-identical duplicates of the root packages"
+    }
+  ],
+  "toolchain": {
+    "pkg_reader_repository": "https://github.com/llesieur99/rac8-act-decomp",
+    "pkg_reader_commit": "e609b33377ee29ee20dda92fbec2e7823633d722",
+    "ps3recomp_repository": "https://github.com/sp00nznet/ps3recomp",
+    "ps3recomp_tag": "v0.19.0",
+    "ps3recomp_commit": "ae92407bb1d899e3d32143e360fe6e6d4d8fa1b5",
+    "rpcs3_version": "0.0.43-20623-0ebb6369",
+    "rpcs3_asset_sha256": "c3154478224354d392f398767cddb23c54bd9726979de895e7cdda5341cc704d"
+  },
+  "analysis": {
+    "functions": 32751,
+    "opd_descriptors": 36026,
+    "imports": 445,
+    "import_libraries": 34,
+    "named_imports": 387,
+    "embedded_spu_elfs": 1,
+    "spu_functions": 133,
+    "spu_function_coverage_bytes": "6964/9344",
+    "rea_status": "open_binary rejects ELF machine 21; Rizin and objdump providers unavailable on Windows native host"
+  }
+}

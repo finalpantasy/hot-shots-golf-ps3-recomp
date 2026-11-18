@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "comment": "SPURS job binaries embedded in the PPU text of the fixed 1.02 EBOOT, lifted by tools/spu_lift_jobs.py. Each entry is a raw job image (job_start_w_crt 'JOBCRT Ver14' layout), not an SPU ELF, so build_spu_workloads.py --input cannot find it. code_ranges are the instruction spans established by disassembly; everything else in the image is data the job reads from local store at run time (the runtime copies the whole image to LS 0).",
+  "input": "work/extracted/fix-1.02/USRDIR/EBOOT.elf",
+  "jobs": [
+    {
+      "ea": "0x00CB3580",
+      "size": "0xE40",
+      "fingerprint": "3A3C233081147367",
+      "entry": "0x0",
+      "code_ranges": [["0x0", "0x20"], ["0x60", "0xAC8"]],
+      "extra_entries": ["0x138", "0x16C"],
+      "runtime_dump": "analysis/spu-miss/spujob_3A3C233081147367_3648.bin",
+      "evidence": [
+        "First job of chain 0x11041700 ('chlib/spu/Spu.cpp'); dispatch MISS in work/runtime/logs/boot-fix-1.02-tocspill.log. TOC 0xD96990 holds (0x00CB3580, 0x00000E40).",
+        "0x00-0x20: crt entry (ila watermarks, br 0x18, br 0xE0).",
+        "0x20-0x60: data. 0xA5 fill, 'JOBCRT Ver14', bss end 0xE00 at 0x3C, bss start 0xC20 at 0x40, init flag at 0x44 (the crt stores 1 there).",
+        "0x60-0xAC8: code. Ends with 'bi $r0' at 0xAC4; 0xAC8-0xACC are stop 0 padding.",
+        "0xAD0-0xB6C: printf strings ('_exit() has been called', 'Error!! Memory error occurred'); 0xB80: 'JOBCRT Ver' compare key; 0xBA0: relocation list; 0xC00-0xC20: data; 0xC20-0xE00: bss cleared by the crt (Duff loop at 0x5E0); 0xE00-0xE40: '%SPURS JOB INFO%' trailer.",
+        "extra_entries: 0x138 is _exit() (ila $r4,0xAD0 then printf and stopd), reached by no direct branch; 0x16C is the epilogue after the stopd at 0x168. Both are lifted so every non-padding instruction in code_ranges is covered."
+      ]
+    }
+  ]
+}
