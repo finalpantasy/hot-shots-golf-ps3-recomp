@@ -271,3 +271,9 @@ Patch `0040` adds debug switches only, all off by default: `RSX_BLEND_LOG`, `RSX
 The main game thread spent 40 to 70% of its time in a tight `usleep(30)` loop while waiting for the GPU. After 200 microseconds of polling it now sleeps on a timer, and the GPU fence and SPURS job completion wake it early. The vertex buffer starts at 128 MB and grows to 768 MB the first time a scene needs it. Switches: `RT_IDLE_WAIT=0`, `RT_VB_GROW=0`, `RT_IDLE_SPIN_US=<n>`.
 
 A/B on one build with the switches off, then on: title 1.68 to 1.12 cores and 1,671 to 1,149 MB private; menu 1.98 to 1.40 cores; course 3.03 to 2.59 cores at about 27 to 30 FPS. Course RAM did not change, because a course fills most of the buffer. A scripted 450-second round on the new build reached hole 3 at about 300 seconds, with no stall and nothing left running after exit.
+
+## 2026-11-18 update 29: packed vertices cut course RAM (patch 0042)
+
+Each vertex used to take 256 bytes, 16 slots whatever the shader read. Patch `0042` stores only the attributes the vertex program reads, about 115 bytes per vertex on a course, and the vertex buffer grows in steps to at most 384 MB instead of 768 MB. Each SPU job also builds its 256 KB local store in place instead of in a separate zeroed buffer. Switches: `RSX_VB_PACK=0`, `RSX_VB_PACK_CAP_MB=<n>`, `RSX_VB_PACK_STATS=1`, `SPU_JOB_REUSE=0`.
+
+A/B over a 450-second scripted round on one build, packing off, then on: course private memory 1,886 to 1,494 MB, working set 1,626 to 1,223 MB, peak private 1,920 to 1,615 MB, title 1,177 to 1,010 MB. CPU and FPS did not change (about 2.3 cores and 32 FPS on the course). Hole 1 and hole 2 render the same either way; the runs are not frame-identical, so this is a visual match, not a pixel match.

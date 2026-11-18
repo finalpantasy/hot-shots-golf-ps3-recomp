@@ -537,3 +537,5 @@ Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-f
 - 2026-11-18 16:06 run 35 (worker ac8e17dd1bf56697f, imp9): impact negative flash is the game's blend (1-dst); hole 2 rectangle fixed by 0039 (0 of hole-2 shots); 0040 debug-only switches committed.
 
 - 2026-11-18 16:57 run 36 (v41): 0041 CPU/RAM verified in a scripted round, hole 3 at ~300 s, marker zero, leftover 0. Worker ab8788e0d2ec2dc5b done.
+
+- 2026-11-18 18:08 run 37 (worker abc7d181f8e400f2c): 0042 vertex packing, course private 1886 -> 1494 MB, same FPS/CPU; committed.

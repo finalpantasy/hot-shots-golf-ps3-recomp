@@ -1,0 +1,1217 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -68,16 +68,70 @@
+  * as flat cyan, or the batch had no display draw and was never presented. At
+  * 786432, 626 of 3592 batches on a heavy course still filled it. A runtime
+  * value: the allocation halves on failure rather than losing all geometry. */
+-static u32 s_vp_max_verts = 1572864u;
+-#define VP_MAX_VERTICES s_vp_max_verts
++/* Sizes are in bytes per parity half: a vertex is 16 bytes per attribute it
++ * stores (RSX_VB_PACK), so the 256-byte vertex count no longer measures room.
++ * VP_MAX_VERTICES (that count) stays for the log lines. */
++static u64 s_vp_half = 1572864ull * 256u;
++#define VP_HALF s_vp_half
++#define VP_MAX_VERTICES ((u32)(s_vp_half / 256u))
+ /* RT_VB_GROW (default on; =0 restores the fixed 768 MB allocation): start the
+  * VP vertex buffer at VP_VB_GROW_START vertices and grow it to the full
+  * 1572864 the first time a batch needs more. The full size was
+  * an UPLOAD heap the driver keeps resident: 768 MB of RAM whether a scene used
+  * 20 MB of it or 400 MB. See vp_vb_grow. */
+ #define VP_VB_GROW_START 262144u
+-static u32 s_vp_cap_verts = 1572864u;       /* ceiling the buffer may grow to */
++static u64 s_vp_cap = 1572864ull * 256u;   /* ceiling (bytes per half) the buffer may grow to */
+ static int s_vp_grow_on = 0;
++/* RSX_VB_PACK (default on; =0 restores the 256-byte vertex): store per vertex
++ * only the attributes the draw's vertex program reads (rsx_vp_analyze_inputs;
++ * an inexact analysis keeps all 16), 16 bytes each, in ascending attribute
++ * order. The VP input layout then takes ATTRi from input slot i, and
++ * render_frame points slot i at the attribute's column of the packed vertex
++ * (stride = 16 x attributes stored); slots the program does not read point at
++ * column 0, which the shader never loads. A course batch is ~1.5M vertices:
++ * at 256 bytes that was a 768 MB upload heap, and the programs read 3-6
++ * attributes. Each draw starts on a multiple of its own stride so the draw's
++ * first vertex is a plain vertex index. With packing on, the buffer starts at
++ * VP_VB_PACK_START per half and grows by steps to what a batch needs. */
++#define VP_VB_PACK_START (16ull << 20)
++static int s_pk_on = -1;
++static int vb_pack_on(void)
++{
++    if (s_pk_on < 0) { const char* e = getenv("RSX_VB_PACK"); s_pk_on = (e && e[0] == '0') ? 0 : 1; }
++    return s_pk_on;
++}
++typedef struct { u32 mask, n, stride; s8 pos[16]; u8 idx[16]; } VPPack;
++static VPPack s_pk = { 0xFFFFu, 16u, 256u,
++    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}, {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15} };
++static void pk_layout(VPPack* p, u32 mask)
++{
++    mask &= 0xFFFFu;
++    if (!mask) mask = 1u;   /* a program reading no attribute still gets a vertex */
++    p->mask = mask; p->n = 0;
++    for (int i = 0; i < 16; i++) {
++        if (mask & (1u << i)) { p->pos[i] = (s8)p->n; p->idx[p->n++] = (u8)i; }
++        else p->pos[i] = -1;
++    }
++    p->stride = p->n * 16u;
++}
++/* Attribute a of vertex v in a record stored with attribute set `mask`
++ * (zeros when the record does not store it). For the capture dumps. */
++static const float* pk_rec_attr(const u8* base, u32 mask, u32 v, int a)
++{
++    static const float zero[4];
++    mask &= 0xFFFFu; if (!mask) mask = 1u;
++    if (!(mask & (1u << a))) return zero;
++    u32 n = 0, col = 0;
++    for (int i = 0; i < 16; i++) if (mask & (1u << i)) { if (i == a) col = n; n++; }
++    return (const float*)(base + (u64)v * n * 16u + col * 16u);
++}
++static u32 pk_stride_of(u32 mask)
++{
++    mask &= 0xFFFFu;
++    if (!mask) return 16u;
++    u32 n = 0; for (; mask; mask &= mask - 1) n++;
++    return n * 16u;
++}
+ static ID3D12Resource* s_vp_vb_old = NULL;  /* replaced buffer the in-flight frame may read */
+ static void vp_vb_release_old(void);
+ #define VP_MAX_INDICES  (1u << 21)  /* per-frame index buffer of indexed VP draws, x2 parity */
+@@ -142,6 +196,7 @@
+     int tex_ds[16];     /* pre-pass: OffDS read through unit u (its colour copy is tex_rt), -1 = none */
+     int tex_slot;       /* legacy single-slot path (atlas); -1 = none */
+     int vs_idx;         /* VPVSEntry slot for this draw's vertex program (-1 = primary) */
++    u32 pk_mask;        /* RSX_VB_PACK: attributes stored per vertex (0xFFFF = all 16) */
+     int blend;          /* guest blend enable at draw time */
+     u32 blend_key;      /* packed guest blend state (factors+equation), PSO key */
+     /* Render-to-texture: which colour surface this op targets. 0 = a display
+@@ -291,6 +346,7 @@
+     u32 hash;               /* FNV-1a of the ucode */
+     ID3DBlob* vs;
+     int uses_c03;
++    u32 in_mask;            /* attributes the program reads (0xFFFF if not exact) */
+ } VPVSEntry;
+ #define VP_VS_CACHE 128 /* wave uses 5+ distinct VPs; at 4 the cache
+                          * thrashed every frame and eviction shifted slots
+@@ -1651,7 +1707,7 @@
+         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+         D3D12_RANGE nr = {0,0};
+ 
+-        bd.Width = (u64)VP_MAX_VERTICES * 256 * 2;  /* generic VP vertex: 16 float4 slots,
++        bd.Width = VP_HALF * 2;  /* generic VP vertex: 16 float4 slots,
+                                           * DOUBLE-buffered by frame parity so a
+                                           * new frame's upload never overwrites
+                                           * vertices the in-flight GPU frame is
+@@ -1662,9 +1718,24 @@
+          * anywhere. Report the size too: this buffer is
+          * VP_MAX_VERTICES * 256 * 2 bytes and grows fast. */
+         { const char* g = getenv("RT_VB_GROW");
+-          if (!(g && g[0] == '0')) { s_vp_grow_on = 1; s_vp_cap_verts = s_vp_max_verts; s_vp_max_verts = VP_VB_GROW_START; } }
++          if (!(g && g[0] == '0')) {
++              s_vp_grow_on = 1; s_vp_cap = s_vp_half;
++              s_vp_half = vb_pack_on() ? VP_VB_PACK_START : (u64)VP_VB_GROW_START * 256u;
++              /* Packed ceiling: RSX_VB_PACK_CAP_MB per half (default 192). A
++               * course batch peaks at 90-130 MB packed (~115 bytes/vertex); the
++               * 165-200 MB outliers are backlogged drains spanning frames, which
++               * the old 1572864-vertex ceiling (~180 MB packed) split as well,
++               * and still split here rather than hold a 288 MB half. */
++              if (vb_pack_on()) {
++                  const char* cm = getenv("RSX_VB_PACK_CAP_MB");
++                  u64 c = (u64)(cm ? strtoul(cm, NULL, 10) : 192ul) << 20;
++                  if (c < VP_VB_PACK_START) c = VP_VB_PACK_START;
++                  if (c < s_vp_cap) s_vp_cap = c;
++              }
++          } }
++        fprintf(stderr, "[VPVB] vertex packing %s (RSX_VB_PACK)%c", vb_pack_on() ? "on" : "off", 10);
+         for (;;) {
+-            bd.Width = (u64)VP_MAX_VERTICES * 256 * 2;
++            bd.Width = VP_HALF * 2;
+             fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
+                     (unsigned long long)(bd.Width >> 20), (unsigned)VP_MAX_VERTICES, 10);
+             if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
+@@ -1673,11 +1744,11 @@
+                 s_d3d.vp_vb->lpVtbl->Map(s_d3d.vp_vb, 0, &nr, &s_d3d.vp_vb_mapped);
+                 break;
+             }
+-            if (VP_MAX_VERTICES <= 393216u) {
++            if (VP_HALF <= (vb_pack_on() ? VP_VB_PACK_START : 393216ull * 256u)) {
+                 fprintf(stderr, "[VPVB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
+                 break;
+             }
+-            s_vp_max_verts /= 2;
++            s_vp_half /= 2;
+         }
+ 
+         bd.Width = (u64)VP_MAX_INDICES * 4 * 2;   /* u32 indices, x2 parity */
+@@ -2194,10 +2265,11 @@
+                 { const DrawDbg* g = &s_drawdbg[d];
+                   float lo[4] = {1e30f,1e30f,1e30f,1e30f}, hi[4] = {-1e30f,-1e30f,-1e30f,-1e30f};
+                   if (r->is_vp && s_d3d.vp_vb_mapped) {
+-                      const float* vb = (const float*)((const u8*)s_d3d.vp_vb_mapped
+-                          + (u64)(s_d3d.vp_parity ^ 1) * VP_MAX_VERTICES * 256u + r->vb_byte_offset);   /* VP_VERT_STRIDE */
++                      const u8* vbb = (const u8*)s_d3d.vp_vb_mapped
++                          + (u64)(s_d3d.vp_parity ^ 1) * VP_HALF + r->vb_byte_offset;
++                      const u32 rm = (vb_pack_on() && r->pk_mask) ? r->pk_mask : 0xFFFFu;
+                       for (u32 v = 0; v < r->vertex_count && v < 65536; v++)
+-                          for (int c = 0; c < 4; c++) { float x = vb[(u64)v * 64u + c];
++                          for (int c = 0; c < 4; c++) { float x = pk_rec_attr(vbb, rm, v, 0)[c];
+                               if (x < lo[c]) lo[c] = x; if (x > hi[c]) hi[c] = x; } }
+                 { static const char* cb = (const char*)1; static u32 want = 0;
+                   if (cb == (const char*)1) { cb = getenv("RSX_CAP_CB"); want = cb ? (u32)strtoul(cb, NULL, 16) : 0; }
+@@ -2216,17 +2288,18 @@
+                               fprintf(mf, "      c[%3d] = %g %g %g %g%c", q, v[0], v[1], v[2], v[3], 10);
+                       }
+                       if (r->is_vp && s_d3d.vp_vb_mapped) {
+-                          const float* vb = (const float*)((const u8*)s_d3d.vp_vb_mapped
+-                              + (u64)(s_d3d.vp_parity ^ 1) * VP_MAX_VERTICES * 256u + r->vb_byte_offset);
+-                          for (u32 v = 0; v < r->vertex_count && v < 24; v++)
++                          const u8* vbb = (const u8*)s_d3d.vp_vb_mapped
++                              + (u64)(s_d3d.vp_parity ^ 1) * VP_HALF + r->vb_byte_offset;
++                          const u32 rm = (vb_pack_on() && r->pk_mask) ? r->pk_mask : 0xFFFFu;
++                          for (u32 v = 0; v < r->vertex_count && v < 24; v++) {
++                              const float* a0 = pk_rec_attr(vbb, rm, v, 0); const float* a1 = pk_rec_attr(vbb, rm, v, 1);
++                              const float* a2 = pk_rec_attr(vbb, rm, v, 2); const float* a3 = pk_rec_attr(vbb, rm, v, 3);
+                               fprintf(mf, "      v%u: a0=(%g %g %g %g) a1=(%g %g %g %g) a2=(%g %g %g %g) a3=(%g %g %g %g)%c", v,
+-                                      vb[v*64+0], vb[v*64+1], vb[v*64+2], vb[v*64+3],
+-                                      vb[v*64+4], vb[v*64+5], vb[v*64+6], vb[v*64+7],
+-                                      vb[v*64+8], vb[v*64+9], vb[v*64+10], vb[v*64+11],
+-                                      vb[v*64+12], vb[v*64+13], vb[v*64+14], vb[v*64+15], 10);
+-                          for (u32 v = 0; v < r->vertex_count && v < 4; v++)
+-                              fprintf(mf, "      v%u: a8=(%g %g %g %g)%c", v,
+-                                      vb[v*64+32], vb[v*64+33], vb[v*64+34], vb[v*64+35], 10);
++                                      a0[0], a0[1], a0[2], a0[3], a1[0], a1[1], a1[2], a1[3],
++                                      a2[0], a2[1], a2[2], a2[3], a3[0], a3[1], a3[2], a3[3], 10); }
++                          for (u32 v = 0; v < r->vertex_count && v < 4; v++) {
++                              const float* a8 = pk_rec_attr(vbb, rm, v, 8);
++                              fprintf(mf, "      v%u: a8=(%g %g %g %g)%c", v, a8[0], a8[1], a8[2], a8[3], 10); }
+                       } } }
+                   fprintf(mf, "      call prim=%u first=%u count=%u ix=%d ixoff=0x%X ixdma=0x%X vpstart=%u brb=0x%X"
+                               " a0 off=0x%X stride=%u type=%u size=%u pos=[%.3g..%.3g, %.3g..%.3g, %.3g..%.3g, %.3g..%.3g]"
+@@ -2396,6 +2469,9 @@
+          * slots hold (0,0,0,1)). Covers tiny3d (a0/a3/a8), SDK gcm samples
+          * (a0/a1/a2), dbgfont -- no aliasing. */
+         il[_e].AlignedByteOffset = (UINT)(_e * 16);
++        /* RSX_VB_PACK: ATTRi comes from input slot i at offset 0; render_frame
++         * points each slot at its attribute's column (see vp_bind_packed). */
++        if (vb_pack_on()) { il[_e].InputSlot = (UINT)_e; il[_e].AlignedByteOffset = 0; }
+         il[_e].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+         il[_e].InstanceDataStepRate = 0;
+     }
+@@ -2481,6 +2557,7 @@
+  * hardcoded pixel shaders for draws whose FP we can translate -- e.g.
+  * gcm/cube's plasma FP `c = tex2D(t0, uv).x; out = (c, 0, c, 1)`. */
+ #include "rsx_fp_decompiler.h"
++#include "rsx_vp_decompiler.h"   /* rsx_vp_analyze_inputs (RSX_VB_PACK) */
+ 
+ /* Hash + compile the CURRENT rsx_state vertex program into the VS cache;
+  * returns the cache slot (or -1). Called at draw-record time so each draw
+@@ -2492,6 +2569,38 @@
+     return h ? h : 1u;
+ }
+ 
++/* ATTRn inputs the compiled vertex shader actually reads, from the DXBC input
++ * signature (ISGN: per element a name offset, semantic index, system value,
++ * component type, register, mask byte and read mask byte); 0xFFFFFFFF if the
++ * blob has no signature this parser understands. */
++static u32 dxbc_attr_mask(const void* blob, size_t size)
++{
++    const u8* p = (const u8*)blob;
++    if (!p || size < 32 || memcmp(p, "DXBC", 4) != 0) return 0xFFFFFFFFu;
++    u32 nchunks; memcpy(&nchunks, p + 28, 4);
++    if (32 + (size_t)nchunks * 4 > size) return 0xFFFFFFFFu;
++    for (u32 c = 0; c < nchunks; c++) {
++        u32 off; memcpy(&off, p + 32 + c * 4, 4);
++        if ((size_t)off + 8 > size) return 0xFFFFFFFFu;
++        if (memcmp(p + off, "ISGN", 4) != 0) continue;
++        u32 len; memcpy(&len, p + off + 4, 4);
++        const u8* d = p + off + 8;
++        if ((size_t)off + 8 + len > size || len < 8) return 0xFFFFFFFFu;
++        u32 n; memcpy(&n, d, 4);
++        if (8 + (size_t)n * 24 > len) return 0xFFFFFFFFu;
++        u32 mask = 0;
++        for (u32 i = 0; i < n; i++) {
++            const u8* el = d + 8 + i * 24;
++            u32 name, sem; memcpy(&name, el, 4); memcpy(&sem, el + 4, 4);
++            if ((size_t)name + 5 > len) return 0xFFFFFFFFu;
++            if (memcmp(d + name, "ATTR", 5) != 0 || sem > 15) return 0xFFFFFFFFu;
++            if (el[21]) mask |= 1u << sem;   /* read mask: components the shader uses */
++        }
++        return mask;
++    }
++    return 0xFFFFFFFFu;
++}
++
+ #define VS_MEMO_N 8
+ static struct { u32 start, len, hash; int idx; u8 bytes[1024 * 16]; } s_vs_memo[VS_MEMO_N];
+ static int vs_memo_on(void)
+@@ -2662,6 +2771,22 @@
+     s_d3d.vp_vs[slot].uses_c03 =
+         (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
+          strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
++    /* RSX_VB_PACK: the attributes this VS reads. The compiled shader's own
++     * input signature is the authority -- it lists exactly the ATTRn the GPU
++     * will fetch -- with the ucode analysis as the fallback and all 16 when
++     * neither answers. */
++    { rsx_vp_input_analysis an;
++      const int r = rsx_vp_analyze_inputs(vuc, vlen, &an);
++      const u32 am = (r > 0 && an.exact) ? (an.input_mask & 0xFFFFu) : 0xFFFFu;
++      const u32 sm = dxbc_attr_mask(vb->lpVtbl->GetBufferPointer(vb), vb->lpVtbl->GetBufferSize(vb));
++      s_d3d.vp_vs[slot].in_mask = (sm != 0xFFFFFFFFu) ? sm : am;
++      if (sm != 0xFFFFFFFFu && (sm & ~am)) {
++          static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
++              fprintf(stderr, "[VBPACK] VS 0x%08X: ucode analysis 0x%04X misses inputs the shader reads (0x%04X)%c",
++                      hash, am, sm, 10); }
++      { static int _n = 0; if (getenv("RSX_VB_PACK_STATS") && PS3_LOG_FIRST(_n, 64))
++          fprintf(stderr, "[VBPACK] VS 0x%08X reads 0x%04X (analysis 0x%04X%s)%c", hash,
++                  s_d3d.vp_vs[slot].in_mask, am, (r > 0 && an.exact) ? "" : ", inexact", 10); } }
+     { static int _n=0; if (PS3_LOG_FIRST(_n, 6)) printf("[VP] per-draw VS cached (hash=0x%08X, %d instrs, slot %d)\n", hash, ni, slot); }
+     /* Build the base VP pipeline here if it does not exist yet. render_frame's
+      * trigger reads s_d3d.current_rsx_state, which by frame end no longer has
+@@ -3614,6 +3739,7 @@
+         il[_i].SemanticName = "ATTR"; il[_i].SemanticIndex = _i;
+         il[_i].Format = DXGI_FORMAT_R32G32B32A32_FLOAT; il[_i].InputSlot = 0;
+         il[_i].AlignedByteOffset = (UINT)(_i * 16);
++        if (vb_pack_on()) { il[_i].InputSlot = (UINT)_i; il[_i].AlignedByteOffset = 0; }   /* RSX_VB_PACK */
+         il[_i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+         il[_i].InstanceDataStepRate = 0;
+     }
+@@ -6119,6 +6245,27 @@
+     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &gb);
+ }
+ 
++/* RSX_VB_PACK: bind the VP vertex buffer for records stored with attribute
++ * set `mask`: input slot i (ATTRi) reads column pos(i) of a vertex of stride
++ * 16 x |mask|, starting at this parity half. Slots the program does not read
++ * get column 0, a valid range the shader never loads. Draws then start at
++ * vb_byte_offset / stride, which vp_pack_begin keeps whole. */
++static void vp_bind_packed(u32 mask)
++{
++    VPPack L;
++    pk_layout(&L, mask);
++    const D3D12_GPU_VIRTUAL_ADDRESS base =
++        s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb) + (u64)s_d3d.vp_parity * VP_HALF;
++    D3D12_VERTEX_BUFFER_VIEW v[16];
++    for (int i = 0; i < 16; i++) {
++        const u32 col = L.pos[i] >= 0 ? (u32)L.pos[i] * 16u : 0u;
++        v[i].BufferLocation = base + col;
++        v[i].SizeInBytes    = (UINT)(VP_HALF - col);
++        v[i].StrideInBytes  = L.stride;
++    }
++    s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 16, v);
++}
++
+ static void render_frame(void)
+ {
+     double _rf0 = perf_on() ? perf_now() : 0.0;
+@@ -6136,6 +6283,30 @@
+     stall_mark("rf:gpuwait");
+     wait_for_gpu();
+     vp_vb_release_old();   /* RT_VB_GROW: the GPU no longer reads a replaced vertex buffer */
++    /* RSX_VB_PACK_STATS=1: every 600 batches, the stored bytes per vertex of
++     * the VP draws, the share of vertices stored whole (16 attributes: an
++     * inexact input analysis or a program reading them all) and the largest
++     * batch, in bytes, against the buffer half. */
++    { static int on = -1; static u64 nv, nb, nfull, peak; static u32 nbatch;
++      if (on < 0) on = getenv("RSX_VB_PACK_STATS") ? 1 : 0;
++      if (on) {
++          for (u32 i = 0; i < s_d3d.draw_count && i < MAX_DRAWS; i++) {
++              const D3D12DrawRecord* r = &s_d3d.draws[i];
++              if (!r->is_vp || r->is_clear) continue;
++              const u32 m = (vb_pack_on() && r->pk_mask) ? r->pk_mask : 0xFFFFu;
++              nv += r->vertex_count; nb += (u64)r->vertex_count * pk_stride_of(m);
++              if (m == 0xFFFFu) nfull += r->vertex_count;
++          }
++          if (s_d3d.vp_vb_offset > peak) peak = s_d3d.vp_vb_offset;
++          if (++nbatch >= 600) {
++              fprintf(stderr, "[VBPACK] %u batches: %.1f bytes/vertex, %.1f%% of %llu vertices stored whole,"
++                              " largest batch %llu KB of %llu KB%c", nbatch,
++                      nv ? (double)nb / (double)nv : 0.0, nv ? 100.0 * (double)nfull / (double)nv : 0.0,
++                      (unsigned long long)nv, (unsigned long long)(peak >> 10),
++                      (unsigned long long)(VP_HALF >> 10), 10);
++              nv = nb = nfull = peak = 0; nbatch = 0;
++          }
++      } }
+     stall_mark("rf:record");
+     const double _pf1 = _pf0 ? perf_now() : 0.0;
+     if (_pf0) { s_prof[PF_RF_WAIT] += _pf1 - _pf0; s_prof_rf++; s_prof_rdraws += s_d3d.draw_count; }
+@@ -6986,10 +7157,12 @@
+             for (int _s = 0; _s < 16; _s++) samp_bound[_s] = -1;
+             D3D12_VERTEX_BUFFER_VIEW vbv;
+             vbv.BufferLocation = s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb)
+-                               + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * 256;
+-            vbv.SizeInBytes    = VP_MAX_VERTICES * 256;
++                               + (u64)s_d3d.vp_parity * VP_HALF;
++            vbv.SizeInBytes    = (UINT)VP_HALF;
+             vbv.StrideInBytes  = 256;   /* 16 float4 attrib slots */
+-            s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &vbv);
++            if (!vb_pack_on())   /* RSX_VB_PACK binds per layout at each draw */
++                s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &vbv);
++            u32 vb_bound_mask = 0;                 /* RSX_VB_PACK layout bound, 0 = none */
+             D3D12_GPU_DESCRIPTOR_HANDLE gh_base;
+             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
+             int cur_rt = -1;                       /* target A: -1 = backbuffer */
+@@ -7149,9 +7322,9 @@
+                      * this backend draws reaches a render target at all. */
+                     { static int tt = -1;
+                       if (tt < 0) { const char* e = getenv("VP_TESTTRI"); tt = e ? atoi(e) : 0; }
+-                      if (tt && want >= 0 && s_d3d.vp_vb_mapped) {
++                      if (tt && want >= 0 && s_d3d.vp_vb_mapped && !vb_pack_on()) {   /* needs RSX_VB_PACK=0 */
+                           float* vtx = (float*)((char*)s_d3d.vp_vb_mapped
+-                              + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * 256u
++                              + (u64)s_d3d.vp_parity * VP_HALF
+                               + (u64)1000 * 256u);
+                           static const float tri[3][4] = {
+                               {-2.0f, -2.0f, 0.0f, 1.0f},
+@@ -7347,6 +7520,12 @@
+                       s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
+                           s_d3d.cmd_list, bn, brh, FALSE, &cur_dsv);
+                   } }
++                u32 vstride = 256u;               /* bytes per vertex of this record */
++                if (vb_pack_on()) {
++                    const u32 m = dr->pk_mask ? dr->pk_mask : 0xFFFFu;
++                    vstride = pk_stride_of(m);
++                    if (m != vb_bound_mask) { vp_bind_packed(m); vb_bound_mask = m; }
++                }
+                 if (dr->indexed) {
+                     if (!ib_bound) {
+                         D3D12_INDEX_BUFFER_VIEW ibv;
+@@ -7358,10 +7537,10 @@
+                         ib_bound = 1;
+                     }
+                     s_d3d.cmd_list->lpVtbl->DrawIndexedInstanced(s_d3d.cmd_list,
+-                        dr->index_count, 1, dr->ib_first, (INT)(dr->vb_byte_offset / 256), 0);
++                        dr->index_count, 1, dr->ib_first, (INT)(dr->vb_byte_offset / vstride), 0);
+                 } else
+                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
+-                    dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
++                    dr->vertex_count, 1, dr->vb_byte_offset / vstride, 0);
+                 if (cur_rt < 0 && !cur_nc && dr->cmask) disp_dirty = 1;
+                 /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
+                  * "records exist" and "draws were submitted" are different
+@@ -8312,7 +8491,44 @@
+  * cover them: every enabled attrib is fetched from guest memory and converted
+  * by its RSX type; disabled slots read (0,0,0,1). */
+ typedef struct { float v[4]; } VPSlot;
+-#define VP_VERT_STRIDE (16 * sizeof(VPSlot))   /* 256 */
++#define VP_VERT_STRIDE (16 * sizeof(VPSlot))   /* 256: the unpacked vertex */
++
++/* RSX_VB_PACK helpers. Upload paths address vertex k of a draw as
++ * pk_vtx(base, k) and write a converted 16-slot vertex with pk_put, which keeps
++ * only the attributes in s_pk (all 16, i.e. the old memcpy, when packing is
++ * off). pk_attr is for the diagnostics that read one attribute back; an
++ * attribute the draw does not store reads as zeros. */
++static VPSlot s_pk_scratch;
++static u8* pk_vtx(u8* base, u64 k) { return base + k * s_pk.stride; }
++static VPSlot* pk_attr(u8* base, u64 k, int a)
++{
++    const int p = s_pk.pos[a & 15];
++    if (p < 0) { memset(&s_pk_scratch, 0, sizeof s_pk_scratch); return &s_pk_scratch; }
++    return (VPSlot*)(pk_vtx(base, k) + 16u * (u32)p);
++}
++static void pk_put(u8* dst, const VPSlot* src16)
++{
++    if (s_pk.n == 16) { memcpy(dst, src16, sizeof(VPSlot) * 16); return; }
++    for (u32 j = 0; j < s_pk.n; j++) memcpy(dst + 16u * j, &src16[s_pk.idx[j]], sizeof(VPSlot));
++}
++/* Compare a 16-slot vertex with a stored one, attribute by stored attribute. */
++static int pk_cmp(const VPSlot* ref16, const u8* v)
++{
++    for (u32 j = 0; j < s_pk.n; j++)
++        if (memcmp(v + 16u * j, &ref16[s_pk.idx[j]], sizeof(VPSlot))) return 1;
++    return 0;
++}
++/* Vertices of the current layout that still fit in this parity half. */
++static u32 vp_room(void)
++{
++    const u64 off = s_d3d.vp_vb_offset;
++    return off >= VP_HALF ? 0u : (u32)((VP_HALF - off) / s_pk.stride);
++}
++/* Where the next vertex of this parity half goes. */
++static u8* vp_out(void)
++{
++    return (u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * VP_HALF + s_d3d.vp_vb_offset;
++}
+ 
+ 
+ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
+@@ -8428,8 +8644,19 @@
+     if (v < 0) { const char* e = getenv("RSX_VTX_FAST"); v = (e && e[0] == '0') ? 0 : 1; }
+     return v;
+ }
++static void read_vp_vertex_to(const rsx_state* state, u32 vi, VPSlot* out16, u8* pk_dst);
+ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
+ {
++    read_vp_vertex_to(state, vi, out16, NULL);
++}
++/* Convert vertex vi straight into the vertex buffer in the draw's layout. */
++static void read_vp_vertex_pk(const rsx_state* state, u32 vi, u8* dst)
++{
++    VPSlot t[16];
++    read_vp_vertex_to(state, vi, t, dst);
++}
++static void read_vp_vertex_to(const rsx_state* state, u32 vi, VPSlot* out16, u8* pk_dst)
++{
+     if (s_vs_on > 0) s_vs.conv++;
+     s_rp_conv++;
+     if (vtx_fast_on()) {
+@@ -8444,7 +8671,8 @@
+         { const rsx_vertex_attrib* a = &state->vertex_attribs[0];
+           u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+           rsx_vtx_pos_dbg(state, tmp[0], n); }
+-        memcpy(out16, tmp, sizeof tmp);
++        if (pk_dst) pk_put(pk_dst, (const VPSlot*)tmp);
++        else memcpy(out16, tmp, sizeof tmp);
+         if (speed_chk_vtx()) {
+             VPSlot ref[16];
+             for (int i = 0; i < 16; i++) rsx_fetch_attrib(state, i, vi, ref[i].v);
+@@ -8462,6 +8690,7 @@
+             rsx_vtx_pos_dbg(state, out16[0].v, n);
+         }
+     }
++    if (pk_dst) pk_put(pk_dst, out16);
+ }
+ 
+ /* Per-draw vertex cache for the paths that expand one guest vertex into
+@@ -8487,16 +8716,16 @@
+     if (++s_vc_cur == 0) { memset(s_vc_gen, 0, sizeof s_vc_gen); s_vc_cur = 1; }
+ }
+ 
+-static void read_vp_vertex_cached(const rsx_state* state, u32 vi, VPSlot* out16)
++/* The cached 16-slot vertex vi, or NULL when the cache is off. */
++static const VPSlot* vc_lookup(const rsx_state* state, u32 vi)
+ {
+-    if (!s_vc || !s_vc_cur) { read_vp_vertex(state, vi, out16); return; }
++    if (!s_vc || !s_vc_cur) return NULL;
+     u32 h = vi & (VC_N - 1);
+     if (s_vc_gen[h] != s_vc_cur || s_vc_tag[h] != vi) {
+         read_vp_vertex(state, vi, s_vc[h]);
+         s_vc_gen[h] = s_vc_cur;
+         s_vc_tag[h] = vi;
+     }
+-    memcpy(out16, s_vc[h], sizeof(VPSlot) * 16);
+     /* VTX_CACHE_CHECK=1: also refetch on every lookup and count differences
+      * (validation for a new title; the refetch costs what the cache saves). */
+     { static int chk = -1; if (chk < 0) chk = getenv("VTX_CACHE_CHECK") ? 1 : 0;
+@@ -8505,6 +8734,19 @@
+         if (memcmp(fresh, s_vc[h], sizeof fresh)) bad++;
+         if ((hits & 0xFFFFF) == 0)
+             fprintf(stderr, "[vtx-cache-check] %llu lookups, %llu mismatches\n", hits, bad); } }
++    return s_vc[h];
++}
++static void read_vp_vertex_cached(const rsx_state* state, u32 vi, VPSlot* out16)
++{
++    const VPSlot* c = vc_lookup(state, vi);
++    if (!c) { read_vp_vertex(state, vi, out16); return; }
++    memcpy(out16, c, sizeof(VPSlot) * 16);
++}
++static void read_vp_vertex_cached_pk(const rsx_state* state, u32 vi, u8* dst)
++{
++    const VPSlot* c = vc_lookup(state, vi);
++    if (!c) { read_vp_vertex_pk(state, vi, dst); return; }
++    pk_put(dst, c);
+ }
+ 
+ /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
+@@ -8636,10 +8878,9 @@
+     if (!state->vertex_attribs[0].enabled) return 0;
+     vp_attrs_dbg(state);
+     u32 quads = count / 4;
+-    u32 maxv = (VP_MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u32 maxv = vp_room();
+     if (quads * 6 > maxv) quads = maxv / 6;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    u8* out = vp_out();
+     u32 o = 0;
+     for (u32 q = 0; q < quads; q++) {
+         VPSlot c[4][16];
+@@ -8647,7 +8888,7 @@
+             read_vp_vertex(state, first + q*4 + k, c[k]);
+         /* quad -> two triangles (perimeter winding) */
+         static const int idx[6] = {0,1,2, 0,2,3};
+-        for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
++        for (int t = 0; t < 6; t++) { pk_put(pk_vtx(out, o), c[idx[t]]); o++; }
+         if (env_on("VTX_DUMP", &s_env_vtx_dump)) { static int _n=0; if (PS3_LOG_FIRST(_n, 4)) {
+             FILE* f = fopen("vtx_dump.txt", _n==1 ? "w" : "a");
+             if (f) { for (u32 k = 0; k < 4; k++)
+@@ -8656,7 +8897,7 @@
+                     c[k][8].v[0],c[k][8].v[1]);
+               fclose(f); } } }
+     }
+-    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += o * s_pk.stride;
+     return o;
+ }
+ 
+@@ -8669,17 +8910,16 @@
+     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
+     if (!state->vertex_attribs[0].enabled) return 0;
+     vp_attrs_dbg(state);
+-    u32 maxv = (VP_MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u32 maxv = vp_room();
+     if (count > maxv) { s_drop_draws++;
+         { static int _n = 0; if (getenv("VBFULL") && PS3_LOG_FIRST(_n, 12))
+             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
+                     state->shader_program, count, maxv, 10); }
+         count = maxv - (maxv % 3); }
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    u8* out = vp_out();
+     { double _tv = perf_on() ? perf_now() : 0.0;
+       for (u32 k = 0; k < count; k++)
+-          read_vp_vertex(state, first + k, &out[k*16]);
++          read_vp_vertex_pk(state, first + k, pk_vtx(out, k));
+       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
+     /* IDXDBG=<hex shader_program>: vertex range for that program's draws. */
+     { static const char* ie = (const char*)1; static u32 iw = 0;
+@@ -8700,7 +8940,7 @@
+         fprintf(stderr, "[DUCKVTX] first=%u count=%u", first, count);
+         for (u32 k = 0; k < count && k < 4; k++)
+             fprintf(stderr, "  v%u=(%.2f,%.2f,%.2f)", k,
+-                    out[k*16].v[0], out[k*16].v[1], out[k*16].v[2]);
++                    pk_attr(out, k, 0)->v[0], pk_attr(out, k, 0)->v[1], pk_attr(out, k, 0)->v[2]);
+         { int lo = -1, hi = -1, nz = 0;
+           for (int r = 0; r < RSX_MAX_VERTEX_CONSTANTS; r++) {
+               const float* m = state->vertex_constants[r];
+@@ -8716,11 +8956,11 @@
+                          state->surface_color_offset[0], count, first);
+           for (u32 k = 0; k < count && k < 30; k++)
+             fprintf(f, "v%02u a0=(%.3f,%.3f,%.3f) a2=(%.3f,%.3f,%.3f) a9=(%.4f,%.4f,%.4f,%.4f)\n", k,
+-                out[k*16].v[0],out[k*16].v[1],out[k*16].v[2],
+-                out[k*16+2].v[0],out[k*16+2].v[1],out[k*16+2].v[2],
+-                out[k*16+9].v[0],out[k*16+9].v[1],out[k*16+9].v[2],out[k*16+9].v[3]);
++                pk_attr(out, k, 0)->v[0],pk_attr(out, k, 0)->v[1],pk_attr(out, k, 0)->v[2],
++                pk_attr(out, k, 2)->v[0],pk_attr(out, k, 2)->v[1],pk_attr(out, k, 2)->v[2],
++                pk_attr(out, k, 9)->v[0],pk_attr(out, k, 9)->v[1],pk_attr(out, k, 9)->v[2],pk_attr(out, k, 9)->v[3]);
+           fclose(f); } } }
+-    s_d3d.vp_vb_offset += count * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += count * s_pk.stride;
+     return count;
+ }
+ 
+@@ -8736,10 +8976,9 @@
+     if (!state->vertex_attribs[0].enabled) return 0;
+     if (count < 3) return 0;
+     u32 tris = count - 2;
+-    u32 maxv = (VP_MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u32 maxv = vp_room();
+     if (tris * 3 > maxv) tris = maxv / 3;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    u8* out = vp_out();
+     u32 o = 0;
+     vc_begin_draw();
+     for (u32 t = 0; t < tris; t++) {
+@@ -8747,11 +8986,11 @@
+         /* strip winding alternates per triangle to keep facing consistent */
+         u32 i1 = t + 1, i2 = t + 2;
+         if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
+-        read_vp_vertex_cached(state, first + i0, &out[o*16]); o++;
+-        read_vp_vertex_cached(state, first + i1, &out[o*16]); o++;
+-        read_vp_vertex_cached(state, first + i2, &out[o*16]); o++;
++        read_vp_vertex_cached_pk(state, first + i0, pk_vtx(out, o)); o++;
++        read_vp_vertex_cached_pk(state, first + i1, pk_vtx(out, o)); o++;
++        read_vp_vertex_cached_pk(state, first + i2, pk_vtx(out, o)); o++;
+     }
+-    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += o * s_pk.stride;
+     return o;
+ }
+ 
+@@ -8762,10 +9001,9 @@
+     if (!state->vertex_attribs[0].enabled) return 0;
+     if (count < 4) return 0;
+     u32 quads = (count - 2) / 2;
+-    u32 maxv = (VP_MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u32 maxv = vp_room();
+     if (quads * 6 > maxv) quads = maxv / 6;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    u8* out = vp_out();
+     u32 o = 0;
+     for (u32 q = 0; q < quads; q++) {
+         u32 b = first + q * 2;
+@@ -8774,15 +9012,15 @@
+         read_vp_vertex(state, b + 1, v1);
+         read_vp_vertex(state, b + 2, v2);
+         read_vp_vertex(state, b + 3, v3);
+-        memcpy(&out[(o + 0)*16], v0, sizeof(v0));
+-        memcpy(&out[(o + 1)*16], v1, sizeof(v1));
+-        memcpy(&out[(o + 2)*16], v3, sizeof(v3));
+-        memcpy(&out[(o + 3)*16], v0, sizeof(v0));
+-        memcpy(&out[(o + 4)*16], v3, sizeof(v3));
+-        memcpy(&out[(o + 5)*16], v2, sizeof(v2));
++        pk_put(pk_vtx(out, o + 0), v0);
++        pk_put(pk_vtx(out, o + 1), v1);
++        pk_put(pk_vtx(out, o + 2), v3);
++        pk_put(pk_vtx(out, o + 3), v0);
++        pk_put(pk_vtx(out, o + 4), v3);
++        pk_put(pk_vtx(out, o + 5), v2);
+         o += 6;
+     }
+-    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += o * s_pk.stride;
+     return o;
+ }
+ 
+@@ -8811,10 +9049,9 @@
+     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
+     if (!state->vertex_attribs[0].enabled) return 0;
+     u32 quads = count / 4;
+-    u32 maxv = (VP_MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u32 maxv = vp_room();
+     if (quads * 6 > maxv) quads = maxv / 6;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    u8* out = vp_out();
+     u32 o = 0;
+     vc_begin_draw();
+     for (u32 q = 0; q < quads; q++) {
+@@ -8822,7 +9059,7 @@
+         for (u32 k = 0; k < 4; k++)
+             read_vp_vertex_cached(state, read_guest_index(state, first + q*4 + k), c[k]);
+         static const int idx[6] = {0,1,2, 0,2,3};
+-        for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
++        for (int t = 0; t < 6; t++) { pk_put(pk_vtx(out, o), c[idx[t]]); o++; }
+         if (env_on("VTX_DUMP", &s_env_vtx_dump)) { static int _n=0; if (PS3_LOG_FIRST(_n, 6)) {
+             FILE* f = fopen("vtx_dump.txt", _n==1 ? "w" : "a");
+             if (f) {
+@@ -8842,7 +9079,7 @@
+                 fclose(f);
+             } } }
+     }
+-    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += o * s_pk.stride;
+     return o;
+ }
+ 
+@@ -8856,7 +9093,7 @@
+  * VTX_LIST=1 goes back to the expansion. */
+ static u32* s_ix_stamp;   /* guest index -> generation that converted it */
+ static u32* s_ix_slot;    /* guest index -> vertex within the run        */
+-static u32  s_ix_gen, s_ix_vbase, s_ix_nverts;
++static u32  s_ix_gen, s_ix_vbyte, s_ix_nverts;   /* run start: byte offset in the parity half */
+ 
+ static int ix_on(void)
+ {
+@@ -8876,8 +9113,9 @@
+            pv->fp_addr == (st ? st->shader_program : 0) &&
+            pv->begin_epoch == (st ? st->begin_epoch : 0) &&
+            pv->ib_first + pv->index_count == s_d3d.vp_ib_offset &&
+-           pv->vb_byte_offset == s_ix_vbase * VP_VERT_STRIDE &&
+-           s_d3d.vp_vb_offset == (s_ix_vbase + s_ix_nverts) * VP_VERT_STRIDE;
++           pv->pk_mask == s_pk.mask &&
++           pv->vb_byte_offset == s_ix_vbyte &&
++           s_d3d.vp_vb_offset == s_ix_vbyte + s_ix_nverts * s_pk.stride;
+ }
+ 
+ /* Returns the number of indices written; 0 means "use the list path". */
+@@ -8895,10 +9133,10 @@
+     }
+     if (!cont) {
+         if (++s_ix_gen == 0) { memset(s_ix_stamp, 0, (1u << 20) * sizeof(u32)); s_ix_gen = 1; }
+-        s_ix_vbase  = s_d3d.vp_vb_offset / VP_VERT_STRIDE;
++        s_ix_vbyte  = s_d3d.vp_vb_offset;
+         s_ix_nverts = 0;
+     }
+-    VPSlot* vb = (VPSlot*)((u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE);
++    u8* vb = (u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * VP_HALF + s_ix_vbyte;
+     u32* ib = (u32*)s_d3d.vp_ib_mapped + (u64)s_d3d.vp_parity * VP_MAX_INDICES + s_d3d.vp_ib_offset;
+     const int local = ((state->index_array_dma & 0xF) == 0);
+     const u8* ip = vm_base + cellGcmResolveLocated(local, state->index_array_offset);
+@@ -8909,7 +9147,7 @@
+         const u32 ix = sixteen ? (((u32)ip[kk * 2] << 8) | ip[kk * 2 + 1])
+                                : (((u32)ip[kk * 4] << 24) | ((u32)ip[kk * 4 + 1] << 16) |
+                                   ((u32)ip[kk * 4 + 2] << 8) | ip[kk * 4 + 3]);
+-        if (ix >= (1u << 20) || s_ix_vbase + n >= VP_MAX_VERTICES) {
++        if (ix >= (1u << 20) || (u64)s_ix_vbyte + (u64)(n + 1) * s_pk.stride > VP_HALF) {
+             /* Out of range for the tables, or the buffer is full: abandon the
+              * run; nothing of it is published, the list path takes the draw. */
+             s_ix_run_valid = 0;
+@@ -8919,12 +9157,12 @@
+         if (s_ix_stamp[ix] != s_ix_gen) {
+             s_ix_stamp[ix] = s_ix_gen;
+             s_ix_slot[ix] = n;
+-            read_vp_vertex(state, ix, &vb[(u64)(s_ix_vbase + n) * 16]);
++            read_vp_vertex_pk(state, ix, pk_vtx(vb, n));
+             n++;
+         }
+         ib[k] = s_ix_slot[ix];
+     }
+-    s_d3d.vp_vb_offset += (n - s_ix_nverts) * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += (n - s_ix_nverts) * s_pk.stride;
+     s_ix_nverts = n;
+     s_d3d.vp_ib_offset += count;
+     s_ix_run_valid = 1;
+@@ -8938,18 +9176,17 @@
+     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
+     if (!state->vertex_attribs[0].enabled) return 0;
+     vp_attrs_dbg(state);
+-    u32 maxv = (VP_MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u32 maxv = vp_room();
+     if (count > maxv) { s_drop_draws++;
+         { static int _n = 0; if (getenv("VBFULL") && PS3_LOG_FIRST(_n, 12))
+             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
+                     state->shader_program, count, maxv, 10); }
+         count = maxv - (maxv % 3); }
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    u8* out = vp_out();
+     { double _tv = perf_on() ? perf_now() : 0.0;
+       vc_begin_draw();
+       for (u32 k = 0; k < count; k++)
+-          read_vp_vertex_cached(state, read_guest_index(state, first + k), &out[k*16]);
++          read_vp_vertex_cached_pk(state, read_guest_index(state, first + k), pk_vtx(out, k));
+       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
+     /* IDXDBG=<hex shader_program>: index range for that program's draws. An
+      * index past the vertex array reads unmapped guest memory as zero, which
+@@ -8988,7 +9225,7 @@
+           && (pick == -2 || (int)first == pick)) {
+           double sx = 0, sy = 0, sz = 0;
+           for (u32 k = 0; k < count; k++) {
+-              sx += out[k*16].v[0]; sy += out[k*16].v[1]; sz += out[k*16].v[2];
++              sx += pk_attr(out, k, 0)->v[0]; sy += pk_attr(out, k, 0)->v[1]; sz += pk_attr(out, k, 0)->v[2];
+           }
+           float v[4] = { (float)(sx/count), (float)(sy/count), (float)(sz/count), 1.0f };
+           float clip[4];
+@@ -9034,7 +9271,7 @@
+         if (!have_c || recen) {
+             double sx = 0, sy = 0, sz = 0;
+             for (u32 k = 0; k < count; k++) {
+-                sx += out[k*16].v[0]; sy += out[k*16].v[1]; sz += out[k*16].v[2];
++                sx += pk_attr(out, k, 0)->v[0]; sy += pk_attr(out, k, 0)->v[1]; sz += pk_attr(out, k, 0)->v[2];
+             }
+             ox = (float)(sx/count); oy = (float)(sy/count); oz = (float)(sz/count);
+             have_c = 1;
+@@ -9049,8 +9286,8 @@
+                            if (e) { double a=0,b=0; sscanf(e, "%lf,%lf", &a, &b);
+                                     dx = (float)a; dy = (float)b; }
+                            shf = 1; }
+-            out[k*16].v[0] = (out[k*16].v[0] - ox) * sc + dx;
+-            out[k*16].v[1] = (out[k*16].v[1] - oy) * sc + dy;
++            pk_attr(out, k, 0)->v[0] = (pk_attr(out, k, 0)->v[0] - ox) * sc + dx;
++            pk_attr(out, k, 0)->v[1] = (pk_attr(out, k, 0)->v[1] - oy) * sc + dy;
+             /* Leave z alone: under VP_BYPASS the object z maps straight to clip
+              * z, so scaling it walks the geometry out of the depth range and
+              * everything clips away. */
+@@ -9066,7 +9303,7 @@
+       if (want && s_d3d.cur_texs[0].raw == want && n < 8) { n++;
+         float mnx=1e30f,mny=1e30f,mnz=1e30f,mxx=-1e30f,mxy=-1e30f,mxz=-1e30f;
+         for (u32 k = 0; k < count; k++) {
+-            float x=out[k*16].v[0], y=out[k*16].v[1], z=out[k*16].v[2];
++            float x=pk_attr(out, k, 0)->v[0], y=pk_attr(out, k, 0)->v[1], z=pk_attr(out, k, 0)->v[2];
+             if (x<mnx)mnx=x; if (y<mny)mny=y; if (z<mnz)mnz=z;
+             if (x>mxx)mxx=x; if (y>mxy)mxy=y; if (z>mxz)mxz=z;
+         }
+@@ -9075,7 +9312,7 @@
+                         " -> col0 v0=(%.3f %.3f %.3f %.3f)%c",
+                 _a3->enabled, _a3->type, _a3->size, _a3->stride, _a3->offset,
+                 _a3->frequency,
+-                out[3].v[0], out[3].v[1], out[3].v[2], out[3].v[3], 10);
++                pk_attr(out, 0, 3)->v[0], pk_attr(out, 0, 3)->v[1], pk_attr(out, 0, 3)->v[2], pk_attr(out, 0, 3)->v[3], 10);
+         const rsx_vertex_attrib* _a0 = &state->vertex_attribs[0];
+         fprintf(stderr, "[DUCKVTX] first=%u count=%u a0(type=%u size=%u stride=%u off=0x%08X)"
+                         " obj-bbox x[%.3f,%.3f] y[%.3f,%.3f] z[%.3f,%.3f]%c",
+@@ -9140,8 +9377,8 @@
+                 read_guest_index(state, first), read_guest_index(state, first+1),
+                 read_guest_index(state, first+2),
+                 a0->offset, vbase, nz, a0->stride, a0->size, a0->type,
+-                out[0].v[0], out[0].v[1], out[0].v[2], 10); } }
+-    s_d3d.vp_vb_offset += count * VP_VERT_STRIDE;
++                pk_attr(out, 0, 0)->v[0], pk_attr(out, 0, 0)->v[1], pk_attr(out, 0, 0)->v[2], 10); } }
++    s_d3d.vp_vb_offset += count * s_pk.stride;
+     return count;
+ }
+ 
+@@ -9158,21 +9395,20 @@
+     if (!state->vertex_attribs[0].enabled) return 0;
+     if (count < 3) return 0;
+     u32 tris = count - 2;
+-    u32 maxv = (VP_MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u32 maxv = vp_room();
+     if (tris * 3 > maxv) tris = maxv / 3;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    u8* out = vp_out();
+     u32 o = 0;
+     vc_begin_draw();
+     for (u32 t = 0; t < tris; t++) {
+         u32 i0 = fan ? 0 : t;
+         u32 i1 = t + 1, i2 = t + 2;
+         if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
+-        read_vp_vertex_cached(state, read_guest_index(state, first + i0), &out[o*16]); o++;
+-        read_vp_vertex_cached(state, read_guest_index(state, first + i1), &out[o*16]); o++;
+-        read_vp_vertex_cached(state, read_guest_index(state, first + i2), &out[o*16]); o++;
++        read_vp_vertex_cached_pk(state, read_guest_index(state, first + i0), pk_vtx(out, o)); o++;
++        read_vp_vertex_cached_pk(state, read_guest_index(state, first + i1), pk_vtx(out, o)); o++;
++        read_vp_vertex_cached_pk(state, read_guest_index(state, first + i2), pk_vtx(out, o)); o++;
+     }
+-    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += o * s_pk.stride;
+     return o;
+ }
+ 
+@@ -9183,10 +9419,9 @@
+     if (!state->vertex_attribs[0].enabled) return 0;
+     if (count < 4) return 0;
+     u32 quads = (count - 2) / 2;
+-    u32 maxv = (VP_MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u32 maxv = vp_room();
+     if (quads * 6 > maxv) quads = maxv / 6;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    u8* out = vp_out();
+     u32 o = 0;
+     for (u32 q = 0; q < quads; q++) {
+         u32 b = first + q * 2;
+@@ -9195,15 +9430,15 @@
+         read_vp_vertex(state, read_guest_index(state, b + 1), v1);
+         read_vp_vertex(state, read_guest_index(state, b + 2), v2);
+         read_vp_vertex(state, read_guest_index(state, b + 3), v3);
+-        memcpy(&out[(o + 0)*16], v0, sizeof(v0));
+-        memcpy(&out[(o + 1)*16], v1, sizeof(v1));
+-        memcpy(&out[(o + 2)*16], v3, sizeof(v3));
+-        memcpy(&out[(o + 3)*16], v0, sizeof(v0));
+-        memcpy(&out[(o + 4)*16], v3, sizeof(v3));
+-        memcpy(&out[(o + 5)*16], v2, sizeof(v2));
++        pk_put(pk_vtx(out, o + 0), v0);
++        pk_put(pk_vtx(out, o + 1), v1);
++        pk_put(pk_vtx(out, o + 2), v3);
++        pk_put(pk_vtx(out, o + 3), v0);
++        pk_put(pk_vtx(out, o + 4), v3);
++        pk_put(pk_vtx(out, o + 5), v2);
+         o += 6;
+     }
+-    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += o * s_pk.stride;
+     return o;
+ }
+ 
+@@ -9262,9 +9497,8 @@
+     extern uint8_t* vm_base;
+     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
+     if (!state->vertex_attribs[0].enabled) return 0;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
+-    u32 maxv = (VP_MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u8* out = vp_out();
++    u32 maxv = vp_room();
+     u32 o = 0;
+ #define SJ_IDX(p) (indexed ? read_guest_index(state, (p)) : (p))
+     if (prim == RSX_PRIMITIVE_QUAD_STRIP) {
+@@ -9277,12 +9511,12 @@
+             read_vp_vertex(state, SJ_IDX(b + 1), v1);
+             read_vp_vertex(state, SJ_IDX(b + 2), v2);
+             read_vp_vertex(state, SJ_IDX(b + 3), v3);
+-            memcpy(&out[(o + 0)*16], v0, sizeof(v0));
+-            memcpy(&out[(o + 1)*16], v1, sizeof(v1));
+-            memcpy(&out[(o + 2)*16], v3, sizeof(v3));
+-            memcpy(&out[(o + 3)*16], v0, sizeof(v0));
+-            memcpy(&out[(o + 4)*16], v3, sizeof(v3));
+-            memcpy(&out[(o + 5)*16], v2, sizeof(v2));
++            pk_put(pk_vtx(out, o + 0), v0);
++            pk_put(pk_vtx(out, o + 1), v1);
++            pk_put(pk_vtx(out, o + 2), v3);
++            pk_put(pk_vtx(out, o + 3), v0);
++            pk_put(pk_vtx(out, o + 4), v3);
++            pk_put(pk_vtx(out, o + 5), v2);
+             o += 6;
+         }
+     } else {
+@@ -9293,13 +9527,13 @@
+         for (u32 t = t0; t < t1 && o + 3 <= maxv; t++) {
+             u32 i0 = fan ? 0 : t, i1 = t + 1, i2 = t + 2;
+             if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
+-            read_vp_vertex_cached(state, SJ_IDX(s + i0), &out[o*16]); o++;
+-            read_vp_vertex_cached(state, SJ_IDX(s + i1), &out[o*16]); o++;
+-            read_vp_vertex_cached(state, SJ_IDX(s + i2), &out[o*16]); o++;
++            read_vp_vertex_cached_pk(state, SJ_IDX(s + i0), pk_vtx(out, o)); o++;
++            read_vp_vertex_cached_pk(state, SJ_IDX(s + i1), pk_vtx(out, o)); o++;
++            read_vp_vertex_cached_pk(state, SJ_IDX(s + i2), pk_vtx(out, o)); o++;
+         }
+     }
+ #undef SJ_IDX
+-    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += o * s_pk.stride;
+     return o;
+ }
+ 
+@@ -9338,10 +9572,10 @@
+     }
+     if (!cont) {
+         if (++s_ix_gen == 0) { memset(s_ix_stamp, 0, (1u << 20) * sizeof(u32)); s_ix_gen = 1; }
+-        s_ix_vbase  = s_d3d.vp_vb_offset / VP_VERT_STRIDE;
++        s_ix_vbyte  = s_d3d.vp_vb_offset;
+         s_ix_nverts = 0;
+     }
+-    VPSlot* vb = (VPSlot*)((u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE);
++    u8* vb = (u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * VP_HALF + s_ix_vbyte;
+     u32* ib = (u32*)s_d3d.vp_ib_mapped + (u64)s_d3d.vp_parity * VP_MAX_INDICES + s_d3d.vp_ib_offset;
+     const int local = ((state->index_array_dma & 0xF) == 0);
+     const u8* ip = vm_base + cellGcmResolveLocated(local, state->index_array_offset);
+@@ -9355,7 +9589,7 @@
+             const u32 ix = sixteen ? (((u32)ip[kk * 2] << 8) | ip[kk * 2 + 1])
+                                    : (((u32)ip[kk * 4] << 24) | ((u32)ip[kk * 4 + 1] << 16) |
+                                       ((u32)ip[kk * 4 + 2] << 8) | ip[kk * 4 + 3]);
+-            if (ix >= (1u << 20) || s_ix_vbase + n >= VP_MAX_VERTICES) {
++            if (ix >= (1u << 20) || (u64)s_ix_vbyte + (u64)(n + 1) * s_pk.stride > VP_HALF) {
+                 s_ix_run_valid = 0;
+                 if (++s_ix_gen == 0) { memset(s_ix_stamp, 0, (1u << 20) * sizeof(u32)); s_ix_gen = 1; }
+                 return 0;
+@@ -9363,7 +9597,7 @@
+             if (s_ix_stamp[ix] != s_ix_gen) {
+                 s_ix_stamp[ix] = s_ix_gen;
+                 s_ix_slot[ix] = n;
+-                read_vp_vertex(state, ix, &vb[(u64)(s_ix_vbase + n) * 16]);
++                read_vp_vertex_pk(state, ix, pk_vtx(vb, n));
+                 n++;
+             }
+             ib[k++] = s_ix_slot[ix];
+@@ -9379,11 +9613,11 @@
+                 VPSlot ref[16];
+                 read_vp_vertex(state, read_guest_index(state, pos[c]), ref);
+                 ck(CK_STRIP, ib[k] >= n ||
+-                   memcmp(ref, &vb[(u64)(s_ix_vbase + ib[k]) * 16], sizeof ref) != 0);
++                   pk_cmp(ref, pk_vtx(vb, ib[k])) != 0);
+             }
+         }
+     }
+-    s_d3d.vp_vb_offset += (n - s_ix_nverts) * VP_VERT_STRIDE;
++    s_d3d.vp_vb_offset += (n - s_ix_nverts) * s_pk.stride;
+     s_ix_nverts = n;
+     s_d3d.vp_ib_offset += count;
+     s_ix_run_valid = 1;
+@@ -9415,7 +9649,7 @@
+     return v;
+ }
+ /* RT_VB_GROW: when a batch needs more than the buffer holds, replace the VP
+- * vertex buffer with the full-size one -- straight to s_vp_cap_verts, the old fixed size:
++ * vertex buffer with the full-size one -- straight to s_vp_cap, the old fixed size:
+  * a course batch needs ~1.5M anyway, and stepping 2x at a time held three
+  * buffers at once and copied three times (a +640 MB private peak). This batch's
+  * vertices so far are copied into the new buffer's half for the current
+@@ -9430,17 +9664,40 @@
+ {
+     if (s_vp_vb_old) { s_vp_vb_old->lpVtbl->Release(s_vp_vb_old); s_vp_vb_old = NULL; }
+ }
+-static int vp_vb_grow(u32 need)
+-{
+-    if (!s_vp_grow_on || !s_d3d.vp_vb_mapped || need <= VP_MAX_VERTICES ||
+-        VP_MAX_VERTICES >= s_vp_cap_verts) return 0;
+-    const u32 nv = s_vp_cap_verts;   /* one step: each grow copies and briefly holds two buffers */
++/* RSX_VB_PACK: the buffer starts at VP_VB_PACK_START per half and each grow
++ * goes to 1.25x the bytes the batch needs (at least 1.5x the current size, in
++ * 16 MB steps, at most s_vp_cap), so it settles at the scene's real peak
++ * instead of the 384 MB-per-half ceiling. Packing off keeps the single step
++ * to the ceiling described above. */
++static void vp_pack_begin(const rsx_state* st)
++{
++    u32 mask = 0xFFFFu;
++    if (vb_pack_on() && st && st->vp_ucode_bytes >= 16) {
++        const int vi = vp_get_vs(st);
++        if (vi >= 0 && vi < s_d3d.vp_vs_n) mask = s_d3d.vp_vs[vi].in_mask;
++    }
++    if (mask != s_pk.mask) pk_layout(&s_pk, mask);
++    const u32 r = s_d3d.vp_vb_offset % s_pk.stride;   /* start on a whole vertex */
++    if (r) s_d3d.vp_vb_offset += s_pk.stride - r;
++}
++static int vp_vb_grow(u64 need)
++{
++    if (!s_vp_grow_on || !s_d3d.vp_vb_mapped || need <= VP_HALF ||
++        VP_HALF >= s_vp_cap) return 0;
++    u64 nv = s_vp_cap;   /* one step: each grow copies and briefly holds two buffers */
++    if (vb_pack_on()) {
++        const u64 step = 16ull << 20;
++        nv = need + need / 4;
++        if (nv < VP_HALF + VP_HALF / 2) nv = VP_HALF + VP_HALF / 2;
++        nv = (nv + step - 1) & ~(step - 1);
++        if (nv > s_vp_cap) nv = s_vp_cap;
++    }
+     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+     D3D12_RESOURCE_DESC bd = {0};
+     bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Height = 1;
+     bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+-    bd.Width = (u64)nv * VP_VERT_STRIDE * 2;
++    bd.Width = nv * 2;
+     ID3D12Resource* nb = NULL; void* nm = NULL; D3D12_RANGE nr = {0, 0};
+     if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
+             D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+@@ -9448,29 +9705,31 @@
+         FAILED(nb->lpVtbl->Map(nb, 0, &nr, &nm)) || !nm) {
+         if (nb) nb->lpVtbl->Release(nb);
+         { static int _n = 0; if (PS3_LOG_FIRST(_n, 3))
+-            fprintf(stderr, "[VPVB] grow to %u verts failed; batches split instead%c", nv, 10); }
+-        s_vp_cap_verts = VP_MAX_VERTICES;   /* stop trying */
++            fprintf(stderr, "[VPVB] grow to %llu MB per half failed; batches split instead%c",
++                    (unsigned long long)(nv >> 20), 10); }
++        s_vp_cap = VP_HALF;   /* stop trying */
+         return 0;
+     }
+-    memcpy((u8*)nm + (u64)s_d3d.vp_parity * nv * VP_VERT_STRIDE,
+-           (const u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * VP_MAX_VERTICES * VP_VERT_STRIDE,
++    memcpy((u8*)nm + (u64)s_d3d.vp_parity * nv,
++           (const u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * VP_HALF,
+            s_d3d.vp_vb_offset);
+     if (s_vp_vb_old) s_d3d.vp_vb->lpVtbl->Release(s_d3d.vp_vb);   /* never submitted */
+     else s_vp_vb_old = s_d3d.vp_vb;
+-    fprintf(stderr, "[VPVB] grew vertex buffer %u -> %u verts (%llu MB, x2 parity)%c",
+-            (unsigned)VP_MAX_VERTICES, nv, (unsigned long long)(bd.Width >> 20), 10);
+-    s_d3d.vp_vb = nb; s_d3d.vp_vb_mapped = nm; s_vp_max_verts = nv;
++    fprintf(stderr, "[VPVB] grew vertex buffer %llu -> %llu MB per half (%llu MB, x2 parity; need %llu MB)%c",
++            (unsigned long long)(VP_HALF >> 20), (unsigned long long)(nv >> 20),
++            (unsigned long long)(bd.Width >> 20), (unsigned long long)(need >> 20), 10);
++    s_d3d.vp_vb = nb; s_d3d.vp_vb_mapped = nm; s_vp_half = nv;
+     return 1;
+ }
+ 
+ static void batch_room(u32 verts)
+ {
+-    if (s_d3d.initialized &&
+-        (u64)s_d3d.vp_vb_offset / VP_VERT_STRIDE + verts > VP_MAX_VERTICES)
+-        vp_vb_grow((u32)((u64)s_d3d.vp_vb_offset / VP_VERT_STRIDE + verts));
++    /* Bytes, in the layout vp_pack_begin chose for this draw. */
++    const u64 need = (u64)s_d3d.vp_vb_offset + (u64)verts * s_pk.stride;
++    if (s_d3d.initialized && need > VP_HALF)
++        vp_vb_grow(need);
+     if (!s_d3d.initialized || !s_d3d.draw_count) return;
+-    if (s_d3d.draw_count + 4u < MAX_DRAWS &&
+-        (u64)s_d3d.vp_vb_offset / VP_VERT_STRIDE + verts <= VP_MAX_VERTICES)
++    if (s_d3d.draw_count + 4u < MAX_DRAWS && need <= VP_HALF)
+         return;
+     int has_disp = 0;
+     for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
+@@ -9520,6 +9779,7 @@
+ 
+     if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) return;
+     if (count == 0 || count > MAX_VERTICES) return;
++    vp_pack_begin(s_d3d.current_rsx_state);
+     { const double _t = rsx_prof2() ? perf_now() : 0.0; batch_room(count * 3u);
+       if (_t) s_rp[RP_BATCH] += perf_now() - _t; }
+     s_dd_cur.prim = primitive; s_dd_cur.first = first; s_dd_cur.count = count; s_dd_cur.indexed = 0;
+@@ -9547,7 +9807,7 @@
+                 dr->vertex_count   = emitted;
+                 dr->topology       = RSX_TOPOLOGY_TRIANGLES;
+                 dr->textured       = s_d3d.tex_bound;
+-                dr->is_vp          = 1;
++                dr->is_vp          = 1; dr->pk_mask = s_pk.mask;
+                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+                 dr->fp_ctrl = rec_fp_ctrl();
+                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+@@ -9675,7 +9935,8 @@
+                 pv->fp_addr == fpnow && primitive == RSX_PRIMITIVE_TRIANGLES &&
+                 pv->begin_epoch == (s_d3d.current_rsx_state
+                                     ? s_d3d.current_rsx_state->begin_epoch : 0) &&
+-                pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
++                pv->pk_mask == s_pk.mask &&
++                pv->vb_byte_offset + pv->vertex_count * s_pk.stride == rec) {
+                 pv->vertex_count += emitted;
+                 s_d3d.merge_first_end = first + count;
+                 return;
+@@ -9687,7 +9948,7 @@
+             dr->vertex_count   = emitted;
+             dr->topology       = RSX_TOPOLOGY_TRIANGLES;
+             dr->textured       = s_d3d.tex_bound;
+-            dr->is_vp          = 1;
++            dr->is_vp          = 1; dr->pk_mask = s_pk.mask;
+             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+             dr->fp_ctrl = rec_fp_ctrl();
+             dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+@@ -9796,6 +10057,7 @@
+     if (!s_d3d.pipeline_ready) return;
+     if (count == 0 || count > MAX_VERTICES) return;
+     if (!s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) return;
++    vp_pack_begin(s_d3d.current_rsx_state);
+     { const double _t = rsx_prof2() ? perf_now() : 0.0; batch_room(count * 3u);
+       if (_t) s_rp[RP_BATCH] += perf_now() - _t; }
+     s_dd_cur.prim = primitive; s_dd_cur.first = first; s_dd_cur.count = count; s_dd_cur.indexed = 1;
+@@ -9861,7 +10123,8 @@
+             pv->fp_addr == fpnow &&
+             pv->begin_epoch == (s_d3d.current_rsx_state
+                                 ? s_d3d.current_rsx_state->begin_epoch : 0) &&
+-            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
++            pv->pk_mask == s_pk.mask &&
++            pv->vb_byte_offset + pv->vertex_count * s_pk.stride == rec) {
+             pv->vertex_count += emitted;
+             s_d3d.merge_first_end = first + count;
+             return;
+@@ -9873,14 +10136,14 @@
+         dr->vertex_count   = emitted;
+         dr->indexed        = ix_used;
+         if (ix_used) {
+-            dr->vb_byte_offset = s_ix_vbase * VP_VERT_STRIDE;
++            dr->vb_byte_offset = s_ix_vbyte;
+             dr->vertex_count   = s_ix_nverts;
+             dr->ib_first       = ib0;
+             dr->index_count    = emitted;
+         }
+         dr->topology       = RSX_TOPOLOGY_TRIANGLES;
+         dr->textured       = s_d3d.tex_bound;
+-        dr->is_vp          = 1;
++        dr->is_vp          = 1; dr->pk_mask = s_pk.mask;
+         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
+         dr->fp_ctrl = rec_fp_ctrl();
+         dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -225,6 +225,20 @@
+ #endif
+ }
+ 
++/* SPU_JOB_REUSE (default on; =0 restores the separate buffer): lay the job's
++ * local store out directly in the context it runs in. The old path calloc'd
++ * and zeroed a 256 KB buffer per job, built the store there, then copied all
++ * of it into the context's own (already zeroed) store and freed the buffer:
++ * two extra 256 KB passes and a heap round trip for every job. The bytes the
++ * job starts with are the same -- spu_context_init zeroes the store, and the
++ * same writes follow. */
++static int spu_job_reuse_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = ps3_env_once("SPU_JOB_REUSE"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++
+ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                       uint32_t job_ea, uint32_t job_desc_size)
+ {
+@@ -251,8 +265,16 @@
+         return -1;
+     }
+ 
+-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+-    if (!ls) return -1;
++    const int ls_direct = spu_job_reuse_on();
++    spu_context ctx;
++    uint8_t* ls;
++    if (ls_direct) {
++        spu_context_init(&ctx, 0);
++        ls = ctx.ls;
++    } else {
++        ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
++        if (!ls) return -1;
++    }
+ 
+     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
+     memcpy(ls, vm_base + ea_bin, size_bin);
+@@ -435,10 +457,11 @@
+     }
+ 
+     /* ---- enter the job -------------------------------------------------- */
+-    spu_context ctx;
+-    spu_context_init(&ctx, 0);
++    if (!ls_direct) {
++        spu_context_init(&ctx, 0);
++        memcpy(ctx.ls, ls, SPU_LS_SIZE);
++    }
+     ctx.image_id = image_id;
+-    memcpy(ctx.ls, ls, SPU_LS_SIZE);
+     /* SPU stack grows down. A function saves its link register in its
+      * caller's frame, at 16($sp), so the entry's first store lands 16 bytes
+      * above $sp. The cache buffers start right at stack_top: with $sp at
+@@ -534,7 +557,7 @@
+     spu_mfc_release(&ctx);
+     spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
+     { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
+-    free(ls);
++    if (!ls_direct) free(ls);
+     if (sjp_t0)
+         sjp_add(ea_bin, sjp_t1 - sjp_t0, sjp_t2 - sjp_t1, sjp_now_ns() - sjp_t2,
+                 ctx.steps, sjp_ib, sjp_dma, sjp_dmab);
