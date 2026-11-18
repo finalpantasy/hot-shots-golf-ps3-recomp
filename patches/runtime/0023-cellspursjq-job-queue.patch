@@ -1,0 +1,1006 @@
+diff --git a/libs/spurs/cellSpursJq.c b/libs/spurs/cellSpursJq.c
+index ffb6e54..2756966 100644
+--- a/libs/spurs/cellSpursJq.c
++++ b/libs/spurs/cellSpursJq.c
+@@ -1,273 +1,626 @@
+ /*
+  * ps3recomp - cellSpursJq HLE implementation
+  *
+- * SPURS Job Queue — manages job submission and tracking.
+- * Jobs are accepted and immediately marked as complete (no SPU execution).
+- * This satisfies games that check for job completion but don't depend
+- * on SPU side effects.
++ * SPURS Job Queue. Sony's model: a job queue owns SPU workers that pop job
++ * descriptors pushed through ports; cellSpursJobQueuePort2Sync blocks until
++ * every job pushed through that port has finished.
++ *
++ * Here each queue owns ONE host worker thread. Pushes append to a FIFO ring;
++ * the worker runs the jobs in push order through the shared SPURS job dispatch
++ * (spu_workload_dispatch_job, the same path the job-chain walker uses: it
++ * fingerprints the job binary and runs the lifted image on jm2's local-store
++ * layout). One worker keeps push order exactly; the title's own
++ * maxGrab/numSpus parallelism is not modelled.
++ *
++ * A job whose binary has no lifted image is NOT run (dispatch MISS, logged by
++ * the dispatcher with its fingerprint and by this file with its binary EA); it
++ * still counts as finished so Sync does not hang.
++ *
++ * Every pointer argument arrives as a raw 32-bit guest EA through the generic
++ * HLE adapter, so all entry points take u32 EAs and access guest memory
++ * big-endian through vm_read and vm_write.
+  */
+ 
+ #include "cellSpursJq.h"
+-#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
++#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read*, vm_write* */
++#include "spu_workload.h"                    /* spu_workload_dispatch_job */
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <stdint.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <pthread.h>
++#include <time.h>
++#include <errno.h>
++#endif
++#include "ps3emu/thread_name.h"
++
++/* spurs_job.c: which job owns the retained local store, and the SPU number a
++ * job sees (cellSpursGetCurrentSpuId). */
++extern uint32_t g_spurs_job_ls_handle;
++extern void spurs_job_set_spu_num(uint32_t n);
++
++/* The SPU number the queue worker's jobs see. The job-chain walkers never set
++ * one, so their jobs see SPU 0; a job queue job runs concurrently with them on
++ * its own thread and must not share per-SPU resources keyed on that number. */
++#define JQ_WORKER_SPU_NUM 1u
++
++/* ---------------------------------------------------------------------------
++ * Lock + condition variable (one for the whole module: pushes, completions and
++ * waits are all rare relative to job run time)
++ * -----------------------------------------------------------------------*/
++#ifdef _WIN32
++static SRWLOCK            s_lock = SRWLOCK_INIT;
++static CONDITION_VARIABLE s_cv   = CONDITION_VARIABLE_INIT;
++static void jq_lock(void)   { AcquireSRWLockExclusive(&s_lock); }
++static void jq_unlock(void) { ReleaseSRWLockExclusive(&s_lock); }
++static void jq_wake(void)   { WakeAllConditionVariable(&s_cv); }
++/* Returns 0 on timeout. */
++static int  jq_wait_ms(unsigned ms) { return SleepConditionVariableSRW(&s_cv, &s_lock, ms, 0) ? 1 : 0; }
++#else
++static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t  s_cv   = PTHREAD_COND_INITIALIZER;
++static void jq_lock(void)   { pthread_mutex_lock(&s_lock); }
++static void jq_unlock(void) { pthread_mutex_unlock(&s_lock); }
++static void jq_wake(void)   { pthread_cond_broadcast(&s_cv); }
++static int  jq_wait_ms(unsigned ms)
++{
++    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
++    ts.tv_sec += ms / 1000; ts.tv_nsec += (long)(ms % 1000) * 1000000L;
++    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
++    return pthread_cond_timedwait(&s_cv, &s_lock, &ts) == ETIMEDOUT ? 0 : 1;
++}
++#endif
+ 
+-/* Internal state */
++/* ---------------------------------------------------------------------------
++ * State
++ * -----------------------------------------------------------------------*/
++typedef struct {
++    u32 job_ea;
++    u32 size_desc;
++    int port;          /* port slot, -1 for the legacy port-less push */
++    u32 tag;
++} JqJob;
+ 
+ typedef struct {
+-    int in_use;
+-    u32 maxJobs;
+-    u32 jobCount;       /* number of pending (not-yet-completed) jobs */
+-    u32 nextJobId;
+-    u32 submitCount;    /* total jobs submitted over lifetime */
+-    u32 completeCount;  /* total jobs completed over lifetime */
+-    /*
+-     * Per-job completion ring: tracks the last CELL_SPURS_JQ_MAX_JOBS
+-     * job IDs that have completed.  Wait/TryWait check this.
+-     */
+-    u32 completedIds[CELL_SPURS_JQ_MAX_JOBS];
+-    u32 completedHead;  /* next write position in the ring */
+-} JqState;
+-
+-static JqState s_queues[CELL_SPURS_JQ_MAX_QUEUES];
+-
+-/* Check whether a job ID has completed in the given queue */
+-static int jq_is_completed(const JqState* q, CellSpursJobId id)
+-{
+-    /* Job ID 0 is invalid / never assigned */
+-    if (id == 0) return 0;
++    int  in_use;
++    u32  jq_ea;
++    u32  spurs_ea;
++    u32  max_size_desc;
++    JqJob ring[CELL_SPURS_JQ_RING];
++    u64  head;         /* next job to run */
++    u64  tail;         /* next free entry; tail - head = queued + running */
++    u64  done;         /* jobs finished (== head once the worker caught up) */
++    u64  ran, missed, skipped;
++    int  shutdown;
++    int  worker_exited;
++#ifdef _WIN32
++    HANDLE thread;
++#else
++    pthread_t thread;
++#endif
++} JqQueue;
+ 
+-    for (int i = 0; i < CELL_SPURS_JQ_MAX_JOBS; i++) {
+-        if (q->completedIds[i] == id)
+-            return 1;
+-    }
+-    return 0;
++typedef struct {
++    int  in_use;
++    u32  port_ea;
++    int  q;            /* queue slot */
++    u64  pushed;
++    u64  done;
++} JqPort;
++
++static JqQueue s_q[CELL_SPURS_JQ_MAX_QUEUES];
++static JqPort  s_p[CELL_SPURS_JQ_MAX_PORTS];
++
++/* Caller holds the lock. */
++static int jq_find(u32 jq_ea)
++{
++    if (!jq_ea) return -1;
++    for (int i = 0; i < CELL_SPURS_JQ_MAX_QUEUES; i++)
++        if (s_q[i].in_use && s_q[i].jq_ea == jq_ea) return i;
++    return -1;
+ }
+ 
+-/* Record a job as completed */
+-static void jq_mark_completed(JqState* q, CellSpursJobId id)
++static int jq_find_port(u32 port_ea)
+ {
+-    q->completedIds[q->completedHead] = id;
+-    q->completedHead = (q->completedHead + 1) % CELL_SPURS_JQ_MAX_JOBS;
+-    q->completeCount++;
+-    if (q->jobCount > 0)
+-        q->jobCount--;
++    if (!port_ea) return -1;
++    for (int i = 0; i < CELL_SPURS_JQ_MAX_PORTS; i++)
++        if (s_p[i].in_use && s_p[i].port_ea == port_ea) return i;
++    return -1;
+ }
+ 
+-static int jq_alloc(void)
++/* ---------------------------------------------------------------------------
++ * Running one job (same descriptor reading as cellSpurs.c's jc_run_one_job)
++ * -----------------------------------------------------------------------*/
++enum { JH_EA_BINARY = 0x00, JH_SIZE_BINARY = 0x08 };
++
++/* Returns 1 ran, 0 dispatch MISS (no lifted image), -1 implausible descriptor. */
++static int jq_run_job(JqQueue* q, const JqJob* j)
+ {
+-    for (int i = 0; i < CELL_SPURS_JQ_MAX_QUEUES; i++) {
+-        if (!s_queues[i].in_use) return i;
++    u64 ea_bin_raw = vm_read64(j->job_ea + JH_EA_BINARY);
++    u32 ea_bin     = (u32)(ea_bin_raw & ~7ull);           /* low 3 bits = flags */
++    u32 size_bin   = ((vm_read32(j->job_ea + JH_SIZE_BINARY) >> 16) & 0xFFFFu) << 4;
++
++    { static int n = 0;
++      if (n < 6) {
++          n++;
++          fprintf(stderr, "[cellSpursJq] run jq=0x%08X job=0x%08X bin=0x%08X size=%u desc=%u hdr:",
++                  q->jq_ea, j->job_ea, ea_bin, size_bin, j->size_desc);
++          for (u32 o = 0; o < 0x30; o += 4) fprintf(stderr, " %08X", vm_read32(j->job_ea + o));
++          fprintf(stderr, "\n");
++      } }
++
++    if (!ea_bin || !size_bin || ea_bin >= 0x10000000u || size_bin > 0x40000u) {
++        static int b = 0;
++        if (b < 8) {
++            b++;
++            fprintf(stderr, "[cellSpursJq] job 0x%08X NOT RUN: implausible binary "
++                    "(ea=0x%08X size=%u)\n", j->job_ea, ea_bin, size_bin);
++        }
++        return -1;
+     }
+-    return -1;
++
++    g_spurs_job_ls_handle = q->jq_ea;
++    int hit = spu_workload_dispatch_job(vm_base + ea_bin, size_bin, j->job_ea, j->size_desc);
++    if (!hit) {
++        /* One line per distinct binary: the dispatcher already prints the
++         * fingerprint; this adds which queue and where the binary lives. */
++        static u32 seen[32]; static int nseen = 0;
++        int k = 0;
++        for (; k < nseen; k++) if (seen[k] == ea_bin) break;
++        if (k == nseen && nseen < 32) {
++            seen[nseen++] = ea_bin;
++            fprintf(stderr, "[cellSpursJq] job 0x%08X NOT RUN: no lifted image for binary "
++                    "0x%08X size=%u (dispatch MISS) -- counted finished so Sync returns\n",
++                    j->job_ea, ea_bin, size_bin);
++        }
++        return 0;
++    }
++    return 1;
+ }
+ 
+-/* API */
++#ifdef _WIN32
++static DWORD WINAPI jq_worker(LPVOID p)
++#else
++static void* jq_worker(void* p)
++#endif
++{
++    int slot = (int)(intptr_t)p;
++    JqQueue* q = &s_q[slot];
++    ps3_thread_name("spurs jq %d", slot);
++    spurs_job_set_spu_num(JQ_WORKER_SPU_NUM);
++
++    for (;;) {
++        jq_lock();
++        while (q->head == q->tail && !q->shutdown) jq_wait_ms(1000);
++        if (q->head == q->tail) { jq_unlock(); break; }      /* shut down, drained */
++        JqJob j = q->ring[q->head % CELL_SPURS_JQ_RING];
++        jq_unlock();
++
++        int rc = jq_run_job(q, &j);
++
++        jq_lock();
++        q->head++;
++        q->done++;
++        if (rc > 0) q->ran++; else if (rc == 0) q->missed++; else q->skipped++;
++        if (j.port >= 0 && s_p[j.port].in_use) s_p[j.port].done++;
++        jq_wake();
++        jq_unlock();
++    }
++
++    fprintf(stderr, "[cellSpursJq] jq=0x%08X worker exit: %llu job(s) ran, %llu dispatch MISS, "
++            "%llu implausible\n", q->jq_ea, (unsigned long long)q->ran,
++            (unsigned long long)q->missed, (unsigned long long)q->skipped);
++    jq_lock();
++    q->worker_exited = 1;
++    jq_wake();
++    jq_unlock();
++    return 0;
++}
+ 
+-s32 cellSpursJobQueueAttributeInitialize(CellSpursJobQueueAttribute* attr)
++/* Core create on an EA handle. */
++static s32 jq_create(u32 spurs, u32 jq, u32 attr, const char* who)
+ {
+-    attr = GUEST_PTR(attr, CellSpursJobQueueAttribute*);
+-    if (!attr) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
++    if (!jq) return (s32)CELL_SPURS_JOB_ERROR_NULL_POINTER;
++    if (jq & 127) return (s32)CELL_SPURS_JOB_ERROR_ALIGN;
+ 
+-    memset(attr, 0, sizeof(*attr));
+-    attr->maxJobs = 64;
+-    attr->maxGrab = 1;
+-    /* Default priority: normal on all SPUs */
+-    for (int i = 0; i < 8; i++)
+-        attr->priorities[i] = CELL_SPURS_JQ_PRIORITY_NORMAL;
++    u32 max_desc = 256;
++    if (attr && vm_read32(attr + JQA_MAGIC) == JQA_MAGIC_VALUE) {
++        u32 m = vm_read32(attr + JQA_MAX_SIZE_JOB_DESC);
++        if (m) max_desc = m;
++    }
+ 
++    jq_lock();
++    if (jq_find(jq) >= 0) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_STAT; }
++    int slot = -1;
++    for (int i = 0; i < CELL_SPURS_JQ_MAX_QUEUES; i++)
++        if (!s_q[i].in_use) { slot = i; break; }
++    if (slot < 0) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_NOMEM; }
++    JqQueue* q = &s_q[slot];
++    memset(q, 0, sizeof(*q));
++    q->in_use = 1;
++    q->jq_ea = jq;
++    q->spurs_ea = spurs;
++    q->max_size_desc = max_desc;
++    jq_unlock();
++
++    /* Lifted SPU code recurses on the host stack: reserve generously (address
++     * space only; it is committed on demand). */
++#ifdef _WIN32
++    q->thread = CreateThread(NULL, 64u << 20, jq_worker, (LPVOID)(intptr_t)slot,
++                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
++    int ok = q->thread != NULL;
++#else
++    pthread_attr_t pa; pthread_attr_init(&pa);
++    pthread_attr_setstacksize(&pa, 64u << 20);
++    int ok = pthread_create(&q->thread, &pa, jq_worker, (void*)(intptr_t)slot) == 0;
++    pthread_attr_destroy(&pa);
++#endif
++    if (!ok) {
++        jq_lock(); q->in_use = 0; jq_unlock();
++        fprintf(stderr, "[cellSpursJq] %s: worker thread creation FAILED\n", who);
++        return (s32)CELL_SPURS_JOB_ERROR_NOMEM;
++    }
++    fprintf(stderr, "[cellSpursJq] %s: jq=0x%08X spurs=0x%08X maxSizeJobDescriptor=%u -> slot %d, worker started\n",
++            who, jq, spurs, max_desc, slot);
+     return CELL_OK;
+ }
+ 
+-s32 cellSpursJobQueueAttributeSetMaxGrab(CellSpursJobQueueAttribute* attr, u32 maxGrab)
++/* Core push. port < 0: legacy port-less push. Returns the 1-based sequence
++ * number of the job in *seq_out. */
++static s32 jq_push(int qslot, int port, u32 job, u32 size_desc, u32 tag,
++                   int blocking, u64* seq_out)
+ {
+-    attr = GUEST_PTR(attr, CellSpursJobQueueAttribute*);
+-    if (!attr) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-    attr->maxGrab = maxGrab;
++    if (!job) return (s32)CELL_SPURS_JOB_ERROR_NULL_POINTER;
++    if (job & 15) return (s32)CELL_SPURS_JOB_ERROR_ALIGN;
++
++    jq_lock();
++    JqQueue* q = &s_q[qslot];
++    while (q->in_use && !q->shutdown && q->tail - q->head >= CELL_SPURS_JQ_RING) {
++        if (!blocking) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_AGAIN; }
++        jq_wait_ms(1000);
++    }
++    if (!q->in_use || q->shutdown) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_STAT; }
++    JqJob* j = &q->ring[q->tail % CELL_SPURS_JQ_RING];
++    j->job_ea = job;
++    j->size_desc = size_desc;
++    j->port = port;
++    j->tag = tag;
++    q->tail++;
++    if (seq_out) *seq_out = q->tail;
++    if (port >= 0) s_p[port].pushed++;
++    jq_wake();
++    jq_unlock();
+     return CELL_OK;
+ }
+ 
+-s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
+-                            const CellSpursJobQueueAttribute* attr,
+-                            void* buffer, u32 bufferSize)
++/* ---------------------------------------------------------------------------
++ * Attribute
++ * -----------------------------------------------------------------------*/
++s32 cellSpursJobQueueAttributeInitialize(u32 attr)
+ {
+-    attr = GUEST_PTR(attr, const CellSpursJobQueueAttribute*);
+-    jq = GUEST_PTR(jq, CellSpursJobQueue*);
+-    (void)spurs; (void)buffer; (void)bufferSize;
+-    printf("[cellSpursJq] CreateJobQueue()\n");
+-
+-    if (!jq || !attr) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-
+-    int slot = jq_alloc();
+-    if (slot < 0) return (s32)CELL_SPURS_JQ_ERROR_OUT_OF_MEMORY;
+-
+-    memset(&s_queues[slot], 0, sizeof(JqState));
+-    s_queues[slot].in_use = 1;
+-    s_queues[slot].maxJobs = attr->maxJobs;
+-    s_queues[slot].jobCount = 0;
+-    s_queues[slot].nextJobId = 1;
+-    s_queues[slot].submitCount = 0;
+-    s_queues[slot].completeCount = 0;
+-    s_queues[slot].completedHead = 0;
+-
+-    *jq = (u32)slot;
++    if (!attr) return (s32)CELL_SPURS_JOB_ERROR_NULL_POINTER;
++    if (attr & 7) return (s32)CELL_SPURS_JOB_ERROR_ALIGN;
++    memset(vm_base + attr, 0, JQA_SIZE);
++    vm_write32(attr + JQA_MAGIC, JQA_MAGIC_VALUE);
++    vm_write32(attr + JQA_MAX_GRAB, 1);
++    vm_write32(attr + JQA_MAX_JOBS_ON_A_SPU, 1);
++    vm_write32(attr + JQA_MAX_SIZE_JOB_DESC, 256);
+     return CELL_OK;
+ }
+ 
+-s32 cellSpursDestroyJobQueue(CellSpursJobQueue* jq)
++static s32 jq_attr_set(u32 attr, u32 off, u32 v)
+ {
+-    jq = GUEST_PTR(jq, CellSpursJobQueue*);
+-    if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-
+-    u32 slot = *jq;
+-    if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
+-        return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-
+-    printf("[cellSpursJq] DestroyJobQueue(%u)\n", slot);
+-    s_queues[slot].in_use = 0;
++    if (!attr) return (s32)CELL_SPURS_JOB_ERROR_NULL_POINTER;
++    if (vm_read32(attr + JQA_MAGIC) != JQA_MAGIC_VALUE) return (s32)CELL_SPURS_JOB_ERROR_INVAL;
++    vm_write32(attr + off, v);
+     return CELL_OK;
+ }
+ 
+-/* Host-pointer core. cellSpursJobQueuePort2PushSync reads the queue id out of
+- * the port into a LOCAL and pushes with its address, so it cannot go through
+- * the entry point -- that translates its argument as a guest EA and would
+- * resolve a host stack address to a nonsense queue slot. Same shape as
+- * cellHttpUtil's escape core. */
+-static s32 jq_push_host(const u32* jq, const void* job,
+-                        u32 jobSize, u32 tag, u32* id_ea)
++s32 cellSpursJobQueueAttributeSetMaxGrab(u32 attr, u32 maxGrab)
+ {
+-    (void)job; (void)jobSize; (void)tag;
+-
+-    if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-
+-    u32 slot = *jq;
+-    if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
+-        return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-
+-    JqState* q = &s_queues[slot];
+-
+-    if (q->jobCount >= q->maxJobs)
+-        return (s32)CELL_SPURS_JQ_ERROR_QUEUE_FULL;
+-
+-    u32 jobId = q->nextJobId++;
+-    q->jobCount++;
+-    q->submitCount++;
+-
+-    if (id_ea) vm_write32((u32)(uintptr_t)id_ea, jobId);
+-
+-    /*
+-     * Job is immediately "complete" since we don't execute SPU code,
+-     * but we now record completion so Wait/TryWait can track it.
+-     */
+-    jq_mark_completed(q, jobId);
++    if (maxGrab == 0 || maxGrab > 16) return (s32)CELL_SPURS_JOB_ERROR_INVAL;
++    return jq_attr_set(attr, JQA_MAX_GRAB, maxGrab);
++}
+ 
+-    return CELL_OK;
++/* Guest: (attr, 0xFF, 4). Recorded; the single worker grabs one job at a time. */
++s32 cellSpursJobQueueAttributeSetGrabParameters(u32 attr, u32 maxNumJobsOnASpu, u32 maxGrab)
++{
++    s32 rc = jq_attr_set(attr, JQA_MAX_JOBS_ON_A_SPU, maxNumJobsOnASpu);
++    if (rc == CELL_OK) rc = jq_attr_set(attr, JQA_MAX_GRAB, maxGrab);
++    return rc;
+ }
+ 
+-s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
+-                          u32 jobSize, u32 tag, CellSpursJobId* id)
++/* Guest: (attr, 0x100). Used as the descriptor size handed to the job. */
++s32 cellSpursJobQueueAttributeSetMaxSizeJobDescriptor(u32 attr, u32 size)
+ {
+-    return jq_push_host(GUEST_PTR(jq, const u32*), job, jobSize, tag, id);
++    if (size < 64 || size > 1024 || (size & 15)) return (s32)CELL_SPURS_JOB_ERROR_INVAL;
++    return jq_attr_set(attr, JQA_MAX_SIZE_JOB_DESC, size);
+ }
+ 
+-s32 cellSpursJobQueuePushJob(CellSpursJobQueue* jq, const CellSpursJob256* job,
+-                             u32 tag, CellSpursJobId* id)
++/* The next four only tune how real SPUs contend for the queue (entry lock,
++ * spinning vs sleeping, halt on job error, job-type memory check). They are
++ * recorded in the attribute; a host worker has nothing to apply them to. The
++ * guest passes 0 for all four. */
++s32 cellSpursJobQueueAttributeSetSubmitWithEntryLock(u32 attr, u32 enable)
++{ return jq_attr_set(attr, JQA_SUBMIT_ENTRY_LOCK, enable ? 1u : 0u); }
++
++s32 cellSpursJobQueueAttributeSetDoBusyWaiting(u32 attr, u32 enable)
++{ return jq_attr_set(attr, JQA_DO_BUSY_WAITING, enable ? 1u : 0u); }
++
++s32 cellSpursJobQueueAttributeSetIsHaltOnError(u32 attr, u32 enable)
++{ return jq_attr_set(attr, JQA_IS_HALT_ON_ERROR, enable ? 1u : 0u); }
++
++s32 cellSpursJobQueueAttributeSetIsJobTypeMemoryCheck(u32 attr, u32 enable)
++{ return jq_attr_set(attr, JQA_IS_JOBTYPE_MEMCHK, enable ? 1u : 0u); }
++
++/* ---------------------------------------------------------------------------
++ * Queue
++ * -----------------------------------------------------------------------*/
++
++/* Guest call at 0x008743C4: r3=2, r4=0x00330000 (SDK version), r5=spurs,
++ * r6=job queue (0x80-aligned, inside a 0x1980-byte allocation), r7=attr,
++ * r8=a TOC constant, r9=jq+0x1000 (descriptor buffer), r10=0x20 (depth);
++ * sp+0x70 = 5 (numSpus) and sp+0x78 = priority table pointer are stack
++ * arguments the generic adapter does not pass. */
++s32 _cellSpursCreateJobQueue(u32 jqRevision, u32 sdkVersion, u32 spurs, u32 jq,
++                             u32 attr, u32 arg6, u32 buffer, u32 depth)
+ {
+-    return cellSpursJobQueuePush(jq, job, sizeof(CellSpursJob256), tag, id);
++    fprintf(stderr, "[cellSpursJq] _cellSpursCreateJobQueue(rev=%u sdk=0x%08X spurs=0x%08X jq=0x%08X "
++            "attr=0x%08X arg6=0x%08X buffer=0x%08X depth=%u)\n",
++            jqRevision, sdkVersion, spurs, jq, attr, arg6, buffer, depth);
++    { static int once = 0;
++      if (!once) { once = 1;
++          fprintf(stderr, "[cellSpursJq] not done: numSpus/priority table (stack args) are not read; "
++                  "one host worker per queue runs jobs in push order\n"); } }
++    return jq_create(spurs, jq, attr, "_cellSpursCreateJobQueue");
+ }
+ 
+-s32 cellSpursJobQueuePort2Create(CellSpursJobQueue* jq, CellSpursJobQueuePort* port)
++/* Stop accepting work; the worker drains what is queued and exits. */
++s32 cellSpursShutdownJobQueue(u32 jq)
+ {
+-    port = GUEST_PTR(port, CellSpursJobQueuePort*);
+-    jq = GUEST_PTR(jq, CellSpursJobQueue*);
+-    if (!jq || !port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-    *port = *jq; /* Port is just a reference to the queue */
++    jq_lock();
++    int i = jq_find(jq);
++    if (i < 0) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_SRCH; }
++    if (s_q[i].shutdown) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_STAT; }
++    s_q[i].shutdown = 1;
++    u64 pending = s_q[i].tail - s_q[i].head;
++    jq_wake();
++    jq_unlock();
++    fprintf(stderr, "[cellSpursJq] ShutdownJobQueue(0x%08X): %llu job(s) still queued, draining\n",
++            jq, (unsigned long long)pending);
+     return CELL_OK;
+ }
+ 
+-s32 cellSpursJobQueuePort2Destroy(CellSpursJobQueuePort* port)
++/* Guest at 0x00874164: (jq, &exitCode). Waits for the worker to exit. */
++s32 cellSpursJoinJobQueue(u32 jq, u32 exitCode)
+ {
+-    (void)port;
++    jq_lock();
++    int i = jq_find(jq);
++    if (i < 0) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_SRCH; }
++    JqQueue* q = &s_q[i];
++    if (!q->shutdown) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_STAT; }
++    while (!q->worker_exited) jq_wait_ms(1000);
++    for (int p = 0; p < CELL_SPURS_JQ_MAX_PORTS; p++)
++        if (s_p[p].in_use && s_p[p].q == i) s_p[p].in_use = 0;   /* orphaned ports */
++#ifdef _WIN32
++    HANDLE th = q->thread;
++#endif
++    q->in_use = 0;
++    jq_unlock();
++#ifdef _WIN32
++    if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
++#else
++    pthread_join(q->thread, NULL);
++#endif
++    if (exitCode) vm_write32(exitCode, 0);
++    fprintf(stderr, "[cellSpursJq] JoinJobQueue(0x%08X): joined, exitCode=0\n", jq);
+     return CELL_OK;
+ }
+ 
+-s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
+-                                   const void* job, u32 jobSize,
+-                                   u32 tag, CellSpursJobId* id)
++/* ---------------------------------------------------------------------------
++ * Port2
++ * -----------------------------------------------------------------------*/
++
++/* Guest at 0x008744B4: r3 = port (fresh 0x80-byte block), r4 = job queue.
++ * The port block itself is opaque to the title; the port is keyed by its EA. */
++s32 cellSpursJobQueuePort2Create(u32 port, u32 jq)
+ {
+-    port = GUEST_PTR(port, CellSpursJobQueuePort*);
+-    if (!port) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-    CellSpursJobQueue jq = *port;
+-    return jq_push_host((const u32*)&jq, job, jobSize, tag, id);
++    if (!port || !jq) {
++        fprintf(stderr, "[cellSpursJq] Port2Create(port=0x%08X jq=0x%08X): null -> NULL_POINTER\n", port, jq);
++        return (s32)CELL_SPURS_JOB_ERROR_NULL_POINTER;
++    }
++    jq_lock();
++    int qi = jq_find(jq);
++    if (qi < 0) {
++        jq_unlock();
++        fprintf(stderr, "[cellSpursJq] Port2Create(port=0x%08X): jq 0x%08X was never created -> SRCH\n", port, jq);
++        return (s32)CELL_SPURS_JOB_ERROR_SRCH;
++    }
++    int pi = jq_find_port(port);
++    if (pi < 0)
++        for (int i = 0; i < CELL_SPURS_JQ_MAX_PORTS; i++)
++            if (!s_p[i].in_use) { pi = i; break; }
++    if (pi < 0) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_NOMEM; }
++    s_p[pi].in_use = 1;
++    s_p[pi].port_ea = port;
++    s_p[pi].q = qi;
++    s_p[pi].pushed = s_p[pi].done = 0;
++    jq_unlock();
++    fprintf(stderr, "[cellSpursJq] Port2Create(port=0x%08X jq=0x%08X) -> port slot %d\n", port, jq, pi);
++    return CELL_OK;
+ }
+ 
+-s32 cellSpursJobQueueSendSignal(CellSpursJobQueue* jq, CellSpursJobId id)
++/* Waits for the port's outstanding jobs (they reference the port), then frees it. */
++s32 cellSpursJobQueuePort2Destroy(u32 port)
+ {
+-    (void)jq; (void)id;
+-    /* No-op: jobs are already complete */
++    jq_lock();
++    int pi = jq_find_port(port);
++    if (pi < 0) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_SRCH; }
++    while (s_p[pi].in_use && s_p[pi].done < s_p[pi].pushed) jq_wait_ms(1000);
++    u64 n = s_p[pi].pushed;
++    s_p[pi].in_use = 0;
++    jq_unlock();
++    fprintf(stderr, "[cellSpursJq] Port2Destroy(port=0x%08X): %llu job(s) pushed through it, all finished\n",
++            port, (unsigned long long)n);
+     return CELL_OK;
+ }
+ 
+-s32 cellSpursJobQueueWait(CellSpursJobQueue* jq, CellSpursJobId id)
++/* Guest at 0x00874644: r3 = port, r4 = job descriptor, r5 = descriptor size
++ * (passed through from the caller), r6 = 0 (tag), r7 = 1 (blocking). The size
++ * is used when it is a plausible descriptor size, else the queue's
++ * maxSizeJobDescriptor. */
++s32 _cellSpursJobQueuePort2PushJobBody(u32 port, u32 job, u32 sizeDesc,
++                                       u32 tag, u32 isBlocking)
+ {
+-    jq = GUEST_PTR(jq, CellSpursJobQueue*);
+-    if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-
+-    u32 slot = *jq;
+-    if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
+-        return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+-
+-    const JqState* q = &s_queues[slot];
+-
+-    /*
+-     * If no jobs have ever been submitted, treat as an error —
+-     * nothing can complete if nothing was pushed.
+-     */
+-    if (q->submitCount == 0)
+-        return (s32)CELL_SPURS_JQ_ERROR_JOB_NOT_FOUND;
+-
+-    if (!jq_is_completed(q, id))
+-        return (s32)CELL_SPURS_JQ_ERROR_JOB_NOT_FOUND;
++    jq_lock();
++    int pi = jq_find_port(port);
++    int qi = pi >= 0 ? s_p[pi].q : -1;
++    u32 max_desc = qi >= 0 ? s_q[qi].max_size_desc : 256;
++    jq_unlock();
++    if (pi < 0) {
++        static int n = 0;
++        if (n < 4) { n++;
++            fprintf(stderr, "[cellSpursJq] Port2PushJobBody(port=0x%08X job=0x%08X): unknown port -> SRCH\n",
++                    port, job); }
++        return (s32)CELL_SPURS_JOB_ERROR_SRCH;
++    }
++    u32 sd = (sizeDesc >= 64 && sizeDesc <= 1024 && !(sizeDesc & 15)) ? sizeDesc : max_desc;
++    u64 seq = 0;
++    s32 rc = jq_push(qi, pi, job, sd, tag, isBlocking != 0, &seq);
++    { static int n = 0;
++      /* First 12, then every power-of-two sequence number, so a long run
++       * still shows how many jobs went through and how far the worker got. */
++      if (n < 12 || (seq && !(seq & (seq - 1)))) { n++;
++          jq_lock();
++          unsigned long long done = s_q[qi].done, ran = s_q[qi].ran, miss = s_q[qi].missed;
++          jq_unlock();
++          fprintf(stderr, "[cellSpursJq] Port2PushJobBody(port=0x%08X job=0x%08X size=0x%X tag=%u blocking=%u) "
++                  "-> rc=0x%08X seq=%llu (queue done=%llu ran=%llu MISS=%llu)\n", port, job, sizeDesc,
++                  tag, isBlocking, (u32)rc, (unsigned long long)seq, done, ran, miss); } }
++    return rc;
++}
+ 
++/* Guest at 0x00874084: r3 = port, r4 = 0. Blocks until every job pushed
++ * through the port so far has finished. A non-zero flag is taken as
++ * non-blocking: BUSY if jobs are still outstanding. */
++s32 cellSpursJobQueuePort2Sync(u32 port, u32 flag)
++{
++    jq_lock();
++    int pi = jq_find_port(port);
++    if (pi < 0) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_SRCH; }
++    u64 target = s_p[pi].pushed;
++    u64 start_done = s_p[pi].done;
++    if (flag && s_p[pi].done < target) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_BUSY; }
++    unsigned waited_s = 0;
++    while (s_p[pi].in_use && s_p[pi].done < target) {
++        if (!jq_wait_ms(1000) && ++waited_s % 5 == 0)
++            fprintf(stderr, "[cellSpursJq] Port2Sync(port=0x%08X) still waiting after %us: done=%llu of %llu\n",
++                    port, waited_s, (unsigned long long)s_p[pi].done, (unsigned long long)target);
++    }
++    int qi = s_p[pi].q;
++    u64 ran = s_q[qi].ran, missed = s_q[qi].missed;
++    jq_unlock();
++    { static int n = 0;
++      if (n < 12) { n++;
++          fprintf(stderr, "[cellSpursJq] Port2Sync(port=0x%08X) returned: waited for %llu job(s), port total %llu "
++                  "(queue: %llu ran, %llu MISS)\n", port,
++                  (unsigned long long)(target - start_done), (unsigned long long)target,
++                  (unsigned long long)ran, (unsigned long long)missed); } }
+     return CELL_OK;
+ }
+ 
+-s32 cellSpursJobQueueTryWait(CellSpursJobQueue* jq, CellSpursJobId id)
++/* ---------------------------------------------------------------------------
++ * Legacy entry points of the earlier stub
++ * -----------------------------------------------------------------------*/
++s32 cellSpursCreateJobQueue(u32 spurs, u32 jq, u32 attr, u32 buffer, u32 bufferSize)
+ {
+-    jq = GUEST_PTR(jq, CellSpursJobQueue*);
+-    if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
++    (void)buffer; (void)bufferSize;
++    return jq_create(spurs, jq, attr, "cellSpursCreateJobQueue");
++}
+ 
+-    u32 slot = *jq;
+-    if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
+-        return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
++s32 cellSpursDestroyJobQueue(u32 jq)
++{
++    s32 rc = cellSpursShutdownJobQueue(jq);
++    if (rc != CELL_OK) return rc;
++    return cellSpursJoinJobQueue(jq, 0);
++}
+ 
+-    const JqState* q = &s_queues[slot];
++s32 cellSpursJobQueuePush(u32 jq, u32 job, u32 jobSize, u32 tag, u32 id)
++{
++    jq_lock(); int qi = jq_find(jq); u32 md = qi >= 0 ? s_q[qi].max_size_desc : 256; jq_unlock();
++    if (qi < 0) return (s32)CELL_SPURS_JOB_ERROR_SRCH;
++    u64 seq = 0;
++    s32 rc = jq_push(qi, -1, job, jobSize ? jobSize : md, tag, 1, &seq);
++    if (rc == CELL_OK && id) vm_write32(id, (u32)seq);
++    return rc;
++}
+ 
+-    /* No jobs submitted yet — return BUSY */
+-    if (q->submitCount == 0)
+-        return (s32)CELL_SPURS_JQ_ERROR_BUSY;
++s32 cellSpursJobQueuePushJob(u32 jq, u32 job, u32 tag, u32 id)
++{
++    return cellSpursJobQueuePush(jq, job, 256, tag, id);
++}
+ 
+-    if (!jq_is_completed(q, id))
+-        return (s32)CELL_SPURS_JQ_ERROR_BUSY;
++s32 cellSpursJobQueuePort2PushSync(u32 port, u32 job, u32 jobSize, u32 tag, u32 id)
++{
++    s32 rc = _cellSpursJobQueuePort2PushJobBody(port, job, jobSize, tag, 1);
++    if (rc != CELL_OK) return rc;
++    if (id) vm_write32(id, 0);
++    return cellSpursJobQueuePort2Sync(port, 0);
++}
+ 
++s32 cellSpursJobQueueSendSignal(u32 jq, u32 id)
++{
++    static int once = 0;
++    if (!once) { once = 1;
++        fprintf(stderr, "[cellSpursJq] not done: SendSignal(jq=0x%08X id=%u) -- job signals are not "
++                "modelled, returning CELL_OK\n", jq, id); }
+     return CELL_OK;
+ }
+ 
+-s32 cellSpursJobQueueGetCount(CellSpursJobQueue* jq, u32* count)
++/* id = the sequence number Push returned. */
++s32 cellSpursJobQueueWait(u32 jq, u32 id)
+ {
+-    jq = GUEST_PTR(jq, CellSpursJobQueue*);
+-    if (!jq || !count) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
++    jq_lock();
++    int qi = jq_find(jq);
++    if (qi < 0) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_SRCH; }
++    if (!id || id > s_q[qi].tail) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_INVAL; }
++    while (s_q[qi].in_use && s_q[qi].done < id) jq_wait_ms(1000);
++    jq_unlock();
++    return CELL_OK;
++}
+ 
+-    u32 slot = *jq;
+-    if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
+-        return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
++s32 cellSpursJobQueueTryWait(u32 jq, u32 id)
++{
++    jq_lock();
++    int qi = jq_find(jq);
++    s32 rc = qi < 0 ? (s32)CELL_SPURS_JOB_ERROR_SRCH
++           : (!id || id > s_q[qi].tail) ? (s32)CELL_SPURS_JOB_ERROR_INVAL
++           : s_q[qi].done < id ? (s32)CELL_SPURS_JOB_ERROR_BUSY : CELL_OK;
++    jq_unlock();
++    return rc;
++}
+ 
+-    vm_write32((u32)(uintptr_t)count, s_queues[slot].jobCount);
++s32 cellSpursJobQueueGetCount(u32 jq, u32 count)
++{
++    if (!count) return (s32)CELL_SPURS_JOB_ERROR_NULL_POINTER;
++    jq_lock();
++    int qi = jq_find(jq);
++    u32 n = qi >= 0 ? (u32)(s_q[qi].tail - s_q[qi].done) : 0;
++    jq_unlock();
++    if (qi < 0) return (s32)CELL_SPURS_JOB_ERROR_SRCH;
++    vm_write32(count, n);
+     return CELL_OK;
+ }
+ 
+-s32 cellSpursJobQueueSemaphoreTryAcquire(CellSpursJobQueue* jq)
++s32 cellSpursJobQueueSemaphoreTryAcquire(u32 jq)
+ {
+-    (void)jq;
++    static int once = 0;
++    if (!once) { once = 1;
++        fprintf(stderr, "[cellSpursJq] not done: SemaphoreTryAcquire(jq=0x%08X) -- job queue semaphores "
++                "are not modelled, returning CELL_OK\n", jq); }
+     return CELL_OK;
+ }
+diff --git a/libs/spurs/cellSpursJq.h b/libs/spurs/cellSpursJq.h
+index 667fc3b..5096ffc 100644
+--- a/libs/spurs/cellSpursJq.h
++++ b/libs/spurs/cellSpursJq.h
+@@ -1,9 +1,15 @@
+ /*
+- * ps3recomp - cellSpursJq HLE
++ * ps3recomp - cellSpursJq HLE (sysmodule 0x0050)
+  *
+- * SPURS Job Queue — advanced SPU job dispatch built on cellSpurs.
+- * Provides job queue creation, enqueue, dequeue, and synchronization.
+- * Stub — management APIs work, no actual SPU execution.
++ * SPURS Job Queue. A queue owns a host worker thread that pops job descriptors
++ * pushed through ports, in push order, and runs each one through the shared
++ * SPURS job dispatch (spu_workload_dispatch_job: fingerprint the job binary,
++ * stage local store the way jm2 does, enter the lifted entry). Port2Sync blocks
++ * until every job pushed through that port has finished.
++ *
++ * All pointer arguments arrive as raw 32-bit guest EAs through the generic HLE
++ * adapter (r3..r10), so every entry point takes u32 EAs and reads or writes
++ * guest memory big-endian through vm_read and vm_write.
+  */
+ 
+ #ifndef PS3RECOMP_CELL_SPURS_JQ_H
+@@ -16,96 +22,76 @@
+ extern "C" {
+ #endif
+ 
+-/* Error codes */
+-#define CELL_SPURS_JQ_ERROR_NOT_INITIALIZED     0x80410A01
+-#define CELL_SPURS_JQ_ERROR_ALREADY_INITIALIZED 0x80410A02
+-#define CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT    0x80410A03
+-#define CELL_SPURS_JQ_ERROR_OUT_OF_MEMORY       0x80410A04
+-#define CELL_SPURS_JQ_ERROR_BUSY                0x80410A05
+-#define CELL_SPURS_JQ_ERROR_JOB_NOT_FOUND       0x80410A06
+-#define CELL_SPURS_JQ_ERROR_QUEUE_FULL          0x80410A07
+-#define CELL_SPURS_JQ_ERROR_QUEUE_EMPTY         0x80410A08
+-#define CELL_SPURS_JQ_ERROR_AGAIN               0x80410A09
+-#define CELL_SPURS_JQ_ERROR_ABORT               0x80410A0A
+-
+-/* Job types */
+-#define CELL_SPURS_JQ_JOB_TYPE_DEFAULT  0
+-#define CELL_SPURS_JQ_JOB_TYPE_MEMORY   1
+-#define CELL_SPURS_JQ_JOB_TYPE_GUARD    2
+-
+-/* Job priority */
+-#define CELL_SPURS_JQ_PRIORITY_HIGH     0
+-#define CELL_SPURS_JQ_PRIORITY_NORMAL   8
+-#define CELL_SPURS_JQ_PRIORITY_LOW      15
+-
+-/* Limits */
++/* SPURS job error codes (the job queue shares the 0x80410A00 job range). */
++#define CELL_SPURS_JOB_ERROR_AGAIN          0x80410A01
++#define CELL_SPURS_JOB_ERROR_INVAL          0x80410A02
++#define CELL_SPURS_JOB_ERROR_NOSYS          0x80410A03
++#define CELL_SPURS_JOB_ERROR_NOMEM          0x80410A04
++#define CELL_SPURS_JOB_ERROR_SRCH           0x80410A05
++#define CELL_SPURS_JOB_ERROR_BUSY           0x80410A0A
++#define CELL_SPURS_JOB_ERROR_STAT           0x80410A0F
++#define CELL_SPURS_JOB_ERROR_ALIGN          0x80410A10
++#define CELL_SPURS_JOB_ERROR_NULL_POINTER   0x80410A11
++
++/* Limits of this implementation. */
+ #define CELL_SPURS_JQ_MAX_QUEUES    16
+-#define CELL_SPURS_JQ_MAX_JOBS      256
+-
+-/* Opaque handle types */
+-typedef u32 CellSpursJobQueue;
+-typedef u32 CellSpursJobQueueHandle;
+-typedef u32 CellSpursJobId;
+-
+-/* Job descriptor */
+-typedef struct CellSpursJob256 {
+-    u64 header;
+-    u64 dmaList[7];
+-    u64 workArea;
+-    u64 eaJobBinary;
+-    u32 sizeDmaList;
+-    u32 sizeJobBinary;
+-    u32 sizeWorkArea;
+-    u32 reserved[3];
+-} CellSpursJob256;
+-
+-typedef struct CellSpursJob128 {
+-    u64 header;
+-    u64 dmaList[3];
+-    u64 workArea;
+-    u64 eaJobBinary;
+-    u32 sizeDmaList;
+-    u32 reserved;
+-} CellSpursJob128;
+-
+-/* Job queue attributes */
+-typedef struct CellSpursJobQueueAttribute {
+-    u32 maxJobs;
+-    u32 maxGrab;
+-    u8  priorities[8]; /* per-SPU priority */
+-    u32 flags;
+-    u32 reserved[4];
+-} CellSpursJobQueueAttribute;
+-
+-/* Job queue port (for connecting event queues) */
+-typedef u32 CellSpursJobQueuePort;
+-
+-/* Functions */
+-s32 cellSpursJobQueueAttributeInitialize(CellSpursJobQueueAttribute* attr);
+-s32 cellSpursJobQueueAttributeSetMaxGrab(CellSpursJobQueueAttribute* attr, u32 maxGrab);
+-
+-s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
+-                            const CellSpursJobQueueAttribute* attr,
+-                            void* buffer, u32 bufferSize);
+-s32 cellSpursDestroyJobQueue(CellSpursJobQueue* jq);
+-
+-s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
+-                          u32 jobSize, u32 tag, CellSpursJobId* id);
+-s32 cellSpursJobQueuePushJob(CellSpursJobQueue* jq, const CellSpursJob256* job,
+-                             u32 tag, CellSpursJobId* id);
+-
+-s32 cellSpursJobQueuePort2Create(CellSpursJobQueue* jq, CellSpursJobQueuePort* port);
+-s32 cellSpursJobQueuePort2Destroy(CellSpursJobQueuePort* port);
+-s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
+-                                   const void* job, u32 jobSize,
+-                                   u32 tag, CellSpursJobId* id);
+-
+-s32 cellSpursJobQueueSendSignal(CellSpursJobQueue* jq, CellSpursJobId id);
+-s32 cellSpursJobQueueWait(CellSpursJobQueue* jq, CellSpursJobId id);
+-s32 cellSpursJobQueueTryWait(CellSpursJobQueue* jq, CellSpursJobId id);
+-
+-s32 cellSpursJobQueueGetCount(CellSpursJobQueue* jq, u32* count);
+-s32 cellSpursJobQueueSemaphoreTryAcquire(CellSpursJobQueue* jq);
++#define CELL_SPURS_JQ_MAX_PORTS     64
++#define CELL_SPURS_JQ_RING          1024   /* in-flight jobs per queue */
++
++/* Guest attribute block written by cellSpursJobQueueAttributeInitialize and
++ * read back by _cellSpursCreateJobQueue. The layout is this runtime's own (all
++ * fields big-endian u32), not Sony's: the attribute is opaque to the title,
++ * which only ever passes it from Initialize/Set* to Create. 0x40 bytes. */
++enum {
++    JQA_MAGIC              = 0x00,   /* 'JQAT' */
++    JQA_MAX_GRAB           = 0x04,
++    JQA_MAX_JOBS_ON_A_SPU  = 0x08,
++    JQA_MAX_SIZE_JOB_DESC  = 0x0C,
++    JQA_SUBMIT_ENTRY_LOCK  = 0x10,
++    JQA_DO_BUSY_WAITING    = 0x14,
++    JQA_IS_HALT_ON_ERROR   = 0x18,
++    JQA_IS_JOBTYPE_MEMCHK  = 0x1C,
++    JQA_SIZE               = 0x40,
++};
++#define JQA_MAGIC_VALUE 0x4A514154u
++
++/* ---- attribute ---------------------------------------------------------- */
++s32 cellSpursJobQueueAttributeInitialize(u32 attr);
++s32 cellSpursJobQueueAttributeSetMaxGrab(u32 attr, u32 maxGrab);
++s32 cellSpursJobQueueAttributeSetGrabParameters(u32 attr, u32 maxNumJobsOnASpu, u32 maxGrab);
++s32 cellSpursJobQueueAttributeSetMaxSizeJobDescriptor(u32 attr, u32 size);
++s32 cellSpursJobQueueAttributeSetSubmitWithEntryLock(u32 attr, u32 enable);
++s32 cellSpursJobQueueAttributeSetDoBusyWaiting(u32 attr, u32 enable);
++s32 cellSpursJobQueueAttributeSetIsHaltOnError(u32 attr, u32 enable);
++s32 cellSpursJobQueueAttributeSetIsJobTypeMemoryCheck(u32 attr, u32 enable);
++
++/* ---- queue -------------------------------------------------------------- */
++/* r3..r10 as the guest passes them (verified at 0x008743C4); numSpus and the
++ * priority table follow on the stack and are not read. */
++s32 _cellSpursCreateJobQueue(u32 jqRevision, u32 sdkVersion, u32 spurs, u32 jq,
++                             u32 attr, u32 arg6, u32 buffer, u32 depth);
++s32 cellSpursShutdownJobQueue(u32 jq);
++s32 cellSpursJoinJobQueue(u32 jq, u32 exitCode);
++
++/* ---- port2 -------------------------------------------------------------- */
++s32 cellSpursJobQueuePort2Create(u32 port, u32 jq);
++s32 cellSpursJobQueuePort2Destroy(u32 port);
++s32 _cellSpursJobQueuePort2PushJobBody(u32 port, u32 job, u32 sizeDesc,
++                                       u32 tag, u32 isBlocking);
++s32 cellSpursJobQueuePort2Sync(u32 port, u32 flag);
++
++/* ---- legacy entry points of the earlier stub (not Sony names; kept so a
++ * title that bound them keeps linking, now backed by the real queue) ------- */
++s32 cellSpursCreateJobQueue(u32 spurs, u32 jq, u32 attr, u32 buffer, u32 bufferSize);
++s32 cellSpursDestroyJobQueue(u32 jq);
++s32 cellSpursJobQueuePush(u32 jq, u32 job, u32 jobSize, u32 tag, u32 id);
++s32 cellSpursJobQueuePushJob(u32 jq, u32 job, u32 tag, u32 id);
++s32 cellSpursJobQueuePort2PushSync(u32 port, u32 job, u32 jobSize, u32 tag, u32 id);
++s32 cellSpursJobQueueSendSignal(u32 jq, u32 id);
++s32 cellSpursJobQueueWait(u32 jq, u32 id);
++s32 cellSpursJobQueueTryWait(u32 jq, u32 id);
++s32 cellSpursJobQueueGetCount(u32 jq, u32 count);
++s32 cellSpursJobQueueSemaphoreTryAcquire(u32 jq);
+ 
+ #ifdef __cplusplus
+ }

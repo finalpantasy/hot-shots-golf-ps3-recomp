@@ -8,6 +8,10 @@ A native Windows port of the PS3 game Hot Shots Golf: World Invitational (US, `N
 
 The title screen, drawn by the port and captured 2026-11-17. The dark squares at the top left are a rendering bug.
 
+![A golf hole from the attract demo: waterfall, bunkers, trees and the hole HUD](docs/images/demo-hole-2026-11-17.png)
+
+The attract demo that follows the title, captured the same day. The course geometry and HUD draw. The lighting is too dark, the sky and part of the ground are missing, and stray light-blue triangles appear.
+
 ## Status
 
 Updated 2026-11-17.
@@ -22,6 +26,7 @@ Updated 2026-11-17.
 | Rendering | Works up to the title screen, with a few wrong squares in the sky. 8 to 20 FPS there |
 | Intro movie | Skipped. The player reports the movie as finished because there is no video decoder |
 | Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
+| Course scene | The attract demo loads a hole and draws it with wrong lighting and missing parts. Its SPU job queue works but the one job it pushes is not lifted yet |
 | Menus after the title, gameplay, audio | Not verified |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).

@@ -108,3 +108,10 @@ The game reaches its title screen ("New Game", "HSG Info") in about a minute. Se
 A scripted Cross press (`PAD_SCRIPT`) on "New Game" is accepted: the game writes save `NPUA80864` (five data files), looks for saves of the previous game (`BCUS98115`), and loads the next scene. That scene has not been looked at yet.
 
 Open: `cellOskExtUtility` imports `0x7C95FEB8` and `0x09565B21` are unresolved and are called after "New Game". The title runs at 8 to 20 FPS. A few squares in the title sky draw black or gray.
+
+## 2026-11-17 update 9: a course draws
+
+Left alone at the title, the game starts its attract demo, loads a course and draws a hole with its HUD. See `docs/images/demo-hole-2026-11-17.png`. The picture is wrong in several ways: lighting is too dark, the sky and part of the ground are black, and stray light-blue triangles appear.
+
+- `cellSpursJq` (the SPURS job queue) is implemented: queues, ports, push, sync, shutdown and join, with one worker thread per queue that runs jobs through the existing SPU job dispatch. The demo pushes about 32 jobs a frame. All of them use one SPU binary at `0x00CAB400` (9536 bytes, fingerprint `B24195A9C86BC758`) that is not lifted yet, so each is logged as not run. `cellSpursJobQueuePort2Sync` has not been called at runtime, so its wait is untested.
+- A job chain parked on a closed guard now waits until shutdown. It gave up after 20 seconds, which ended chains during the course load.

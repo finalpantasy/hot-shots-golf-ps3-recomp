@@ -302,3 +302,21 @@ Chain shutdown fix verified: build `build/stop-c1a9d00d/`, `boot-fix-1.02-stop-1
 ### Exact next action
 
 Add timed captures to the scratch `ghost_shot.py`, run 150 s with Cross presses, view the frames after New Game.
+
+## 2026-11-17 run 11: course demo reached, job queue missing
+
+- 145 s boot with no effective input (`boot-fix-1.02-ng-1.log`, capture `docs/images/demo-hole-2026-11-17.png`): after the title the attract demo loads a course and draws the hole HUD (hole 5, par 4, 394 y, "Back to Title", "DEMO"). The 3D view is dark green ground with one object; camera or lighting is wrong or the scene is incomplete.
+- Unresolved in that load: seven `cellSpursJq` NIDs (`_cellSpursCreateJobQueue` and attribute setters). Worker `a9895e8f5ee5e7f9c` (Opus, reason: SPURS job-queue semantics plus guest ABI reading) owns `libs/spurs/cellSpursJq.*`, patch `0023`.
+- `jg_wait` gave up on a guard closed for 20 s ("chain gives up" in the log). Changed to wait until shutdown. In tree, not yet verified by a boot; the worker's builds include it.
+- Coordinator does not edit `libs/spurs/**` while the worker runs.
+
+## 2026-11-17 run 12: job queue in, course geometry draws
+
+- Worker `a9895e8f5ee5e7f9c` finished: `libs/spurs/cellSpursJq.*` rewritten, patch `0023`. NID table regenerated with `--all` (11 new registrations). Verified call shapes are in the worker's notes in `cellSpursJq.c`. Not verified: Port2Sync wait (never called in 150 s), meaning of Create's r8 and stack arguments, PushJobBody r6/r7.
+- Evidence `boot-fix-1.02-jq-1.log`: `seq=4096 (queue done=4067 ran=0 MISS=4067)`; 0 `bctr to NULL`, 0 `null-call`, 0 `garbage vcall`; 1 unresolved NID `0x7C95FEB8` (cellOskExtUtility). Capture: hole 7 demo with waterfall, bunkers, trees.
+- Job `0x00CAB400` (9536 bytes, `B24195A9C86BC758`) is the only one the queue pushes and is a dispatch MISS. Worker `aa354238187c29d59` (Sonnet) owns `tools/spu_*` and `port/spu/**` to lift it.
+- Sky squares at the title: frame capture `work/runtime/rsxcap-title/frame_12` (RSX_CAP) shows three 6-vertex quads, ops 255 to 257, fp `0x014F0381`, texture 1024x512 fmt 0x88 at `0xC87B3200`, blend key `0x522118B` (alpha blend). Cause not found. The game renders to a 1600x1080 target.
+
+### Exact next action
+
+When the lift worker reports: check the course capture again (lighting, sky, triangles may depend on the job), then commit and push.

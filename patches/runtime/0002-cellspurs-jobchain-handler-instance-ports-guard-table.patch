@@ -1,5 +1,5 @@
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index b09220e..28691bc 100644
+index b09220e..dd15fc0 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -859,7 +859,28 @@ static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
@@ -203,7 +203,7 @@ index b09220e..28691bc 100644
  
      s_jobguards[i].ea         = ea;
      s_jobguards[i].count      = notify_count;
-@@ -2890,11 +2952,19 @@ s32 cellSpursJobGuardReset(u64 guard_ea)
+@@ -2890,11 +2952,23 @@ s32 cellSpursJobGuardReset(u64 guard_ea)
   * chain then gives up this pass rather than spinning the walker thread
   * forever). An unknown guard opens immediately -- a chain guarded by something
   * we never saw initialised must not deadlock the walker. */
@@ -218,12 +218,26 @@ index b09220e..28691bc 100644
  {
      int i = jg_find(ea);
      if (i < 0) return 1;
-     for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
+-    for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
++    /* A closed guard is a chain with nothing to do, however long that lasts:
++     * Hot Shots Golf leaves a chain parked on its guard through a whole
++     * course load. Giving up after 20 s ended the walk and the jobs queued
++     * later never ran. Only a shutdown ends the wait. */
++    for (;;) {
 +        if (t_jc_stop && *t_jc_stop) return 0;     /* chain shut down */
          if (s_jobguards[i].pending >= s_jobguards[i].reset) {
              /* Consume exactly one release worth of credits, so notifies that
               * arrived during the previous lap still count. */
-@@ -2945,8 +3015,30 @@ static u64 spurs_event_data3_probe(void)
+@@ -2910,8 +2984,6 @@ static int jg_wait(u32 ea)
+         usleep(1000);
+ #endif
+     }
+-    printf("[cellSpurs] guard 0x%08X still closed after 20 s -- chain gives up\n", ea);
+-    return 0;
+ }
+ 
+ /* Tell the application a lap of chain work is done.
+@@ -2945,8 +3017,30 @@ static u64 spurs_event_data3_probe(void)
      return (u64)(unsigned)v;
  }
  
@@ -254,7 +268,7 @@ index b09220e..28691bc 100644
      /* Carry the job's mailbox answer in the completion event. On hardware the
       * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
       * synthetic payload means the caller reads back zero for whatever it
-@@ -2985,7 +3077,14 @@ static void jc_signal_done(u32 jc_ea, int job_index)
+@@ -2985,7 +3079,14 @@ static void jc_signal_done(u32 jc_ea, int job_index)
          d3 = g_spurs_job_mbox_intr; (void)d3;
          g_spurs_job_mbox_valid = 0;
      }
@@ -269,7 +283,7 @@ index b09220e..28691bc 100644
          int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
                                              SPURS_EVENT_PORT, jc_ea, d2,
                                              d3_probe_valid
-@@ -3012,9 +3111,16 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+@@ -3012,9 +3113,16 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
       * a malformed chain is spinning through commands WITHOUT running a job, so
       * count that instead and reset it whenever real work happens. */
      int idle = 0;
@@ -286,7 +300,7 @@ index b09220e..28691bc 100644
          u32 op  = (u32)(cmd & 7);
          u32 ext = (u32)(cmd & 127);
  
-@@ -3031,6 +3137,19 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+@@ -3031,6 +3139,19 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
              jc_signal_done(jc_ea, idx);
              pc += 8; continue;
          }
@@ -306,7 +320,7 @@ index b09220e..28691bc 100644
          if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
          if (op == 3) { pc = (u32)(cmd & ~7ull); continue; }   /* NEXT     */
          if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
-@@ -3061,6 +3180,10 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+@@ -3061,6 +3182,10 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
      printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
             "job(s) -- malformed?\n",
             jc_ea, jobs);
@@ -317,7 +331,7 @@ index b09220e..28691bc 100644
  }
  
  static DWORD WINAPI jc_thread(LPVOID p)
-@@ -3074,8 +3197,10 @@ static DWORD WINAPI jc_thread(LPVOID p)
+@@ -3074,8 +3199,10 @@ static DWORD WINAPI jc_thread(LPVOID p)
       * Confirms timing-vs-never before committing to the async rewrite. */
      { const char* d = getenv("SPURS_JC_DELAY");
        if (d && *d) Sleep((unsigned)atoi(d)); }
@@ -328,7 +342,7 @@ index b09220e..28691bc 100644
      s_jobchains[slot].running = 0;
      /* Tell the application the chain is done. Without this the walk finishes
       * in silence and a thread waiting on the attached queue never runs again. */
-@@ -3112,6 +3237,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
+@@ -3112,6 +3239,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
          if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
          /* Coalesce: a chain already being walked must not start twice. */
          if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
@@ -336,7 +350,7 @@ index b09220e..28691bc 100644
              HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
              if (th) CloseHandle(th);
              else s_jobchains[i].running = 0;
-@@ -3146,7 +3272,15 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
+@@ -3146,7 +3274,15 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
      if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
      for (int i = 0; i < MAX_JOBCHAINS; i++) {
          if (s_jobchains[i].jc_ea == (u32)jc_ea) {
@@ -353,7 +367,7 @@ index b09220e..28691bc 100644
              return CELL_OK;
          }
      }
-@@ -3188,6 +3322,47 @@ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
+@@ -3188,6 +3324,47 @@ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
      return CELL_OK;
  }
  
