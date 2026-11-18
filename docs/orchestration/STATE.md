@@ -281,3 +281,5 @@ When both workers report: rebuild, run 5 boots of 30 s, view the captures, then 
 - The game now shows the JAPAN Studio logo and starts its intro movie through `cellSail` (`PlayerBoot`), where it stalls on unresolved imports. Worker `ab6124b51bf7bd01e` (Opus, `sail-worker`) owns `libs/codec/cellSail.*`, patch `0021`.
 - `sgxbus.c(934) : failed to regist module` came back in 1 of 3 runs. Cause found: `cellSpursShutdownJobChain` cleared `running` without stopping the walker thread, so the next `RunJobChain` started a second walker on the same chain. Fix in tree (stop flag checked in the guard wait and the command loop; `Join` waits for the thread). Verification runs: `boot-fix-1.02-stop-1..5.log`.
 - Boot speed varies from 2 to 63 FPS between runs while workers load the machine. Not investigated.
+
+Chain shutdown fix verified: build `build/stop-c1a9d00d/`, `boot-fix-1.02-stop-1..5.log`, 5 of 5 runs with 0 `failed to regist module`, 0 `bctr to NULL`, 0 `null-call`, 0 `887A0005`. Patch `0002` re-exported.

@@ -1,5 +1,5 @@
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index b09220e..eacc729 100644
+index b09220e..2a87a8c 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -859,7 +859,28 @@ static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
@@ -116,7 +116,15 @@ index b09220e..eacc729 100644
      ReleaseSRWLockExclusive(&s_spurs_queue_lock);
      printf("[cellSpurs] DetachLv2EventQueue(port=%u)\n", port);
      return CELL_OK;
-@@ -2797,7 +2836,12 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
+@@ -2575,6 +2614,7 @@ static struct {
+     u16 max_grab;
+     int run_count;
+     volatile long running;   /* 1 while a host thread walks this chain */
++    volatile long stop;      /* Shutdown asked the walker to leave */
+ } s_jobchains[MAX_JOBCHAINS];
+ 
+ static void jc_dump_commands(const char* tag, u32 ea, int max_words)
+@@ -2797,7 +2837,12 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
   * what makes "run this job when I say so" mean anything.
   * -----------------------------------------------------------------------*/
  
@@ -130,7 +138,7 @@ index b09220e..eacc729 100644
  static struct {
      u32 ea;          /* guest CellSpursJobGuard address (128-byte aligned) */
      u32 count;       /* notifications still outstanding                    */
-@@ -2807,10 +2851,18 @@ static struct {
+@@ -2807,10 +2852,18 @@ static struct {
      int active;
  } s_jobguards[MAX_JOBGUARDS];
  
@@ -151,7 +159,7 @@ index b09220e..eacc729 100644
      return -1;
  }
  
-@@ -2828,9 +2880,13 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
+@@ -2828,9 +2881,13 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
      if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
  
      int i = jg_find(ea);
@@ -168,7 +176,27 @@ index b09220e..eacc729 100644
  
      s_jobguards[i].ea         = ea;
      s_jobguards[i].count      = notify_count;
-@@ -2945,8 +3001,30 @@ static u64 spurs_event_data3_probe(void)
+@@ -2890,11 +2947,19 @@ s32 cellSpursJobGuardReset(u64 guard_ea)
+  * chain then gives up this pass rather than spinning the walker thread
+  * forever). An unknown guard opens immediately -- a chain guarded by something
+  * we never saw initialised must not deadlock the walker. */
++/* The stop flag of the chain this host thread walks (NULL off a walker). */
++#if defined(_MSC_VER)
++static __declspec(thread) volatile long* t_jc_stop;
++#else
++static __thread volatile long* t_jc_stop;
++#endif
++
+ static int jg_wait(u32 ea)
+ {
+     int i = jg_find(ea);
+     if (i < 0) return 1;
+     for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
++        if (t_jc_stop && *t_jc_stop) return 0;     /* chain shut down */
+         if (s_jobguards[i].pending >= s_jobguards[i].reset) {
+             /* Consume exactly one release worth of credits, so notifies that
+              * arrived during the previous lap still count. */
+@@ -2945,8 +3010,30 @@ static u64 spurs_event_data3_probe(void)
      return (u64)(unsigned)v;
  }
  
@@ -199,7 +227,51 @@ index b09220e..eacc729 100644
      /* Carry the job's mailbox answer in the completion event. On hardware the
       * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
       * synthetic payload means the caller reads back zero for whatever it
-@@ -3188,6 +3266,47 @@ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
+@@ -3014,6 +3101,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+     int idle = 0;
+     for (;; idle++) {
+         if (idle > 4096) break;
++        if (t_jc_stop && *t_jc_stop) return;         /* chain shut down */
+         u64 cmd = vm_read64(pc);
+         u32 op  = (u32)(cmd & 7);
+         u32 ext = (u32)(cmd & 127);
+@@ -3074,8 +3162,10 @@ static DWORD WINAPI jc_thread(LPVOID p)
+      * Confirms timing-vs-never before committing to the async rewrite. */
+     { const char* d = getenv("SPURS_JC_DELAY");
+       if (d && *d) Sleep((unsigned)atoi(d)); }
++    t_jc_stop = &s_jobchains[slot].stop;
+     jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
+                s_jobchains[slot].size_desc);
++    t_jc_stop = NULL;
+     s_jobchains[slot].running = 0;
+     /* Tell the application the chain is done. Without this the walk finishes
+      * in silence and a thread waiting on the attached queue never runs again. */
+@@ -3112,6 +3202,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
+         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
+         /* Coalesce: a chain already being walked must not start twice. */
+         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
++            s_jobchains[i].stop = 0;
+             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
+             if (th) CloseHandle(th);
+             else s_jobchains[i].running = 0;
+@@ -3146,7 +3237,15 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
+     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
+     for (int i = 0; i < MAX_JOBCHAINS; i++) {
+         if (s_jobchains[i].jc_ea == (u32)jc_ea) {
+-            s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
++            /* Ask the walker to leave and let Join wait for it. Clearing
++             * `running` here instead left the walker alive (parked in its
++             * guard wait for up to 20 s) while the next Run started a second
++             * one on the same chain. Hot Shots Golf's sgx sound setup shuts
++             * down and re-creates its "soc-job" chain nine times; a stale
++             * walker then ran a job against the next query's descriptor and
++             * the module registration failed in about one boot in three
++             * ("sgxbus.c(934) : failed to regist module"). */
++            s_jobchains[i].stop = 1;
+             return CELL_OK;
+         }
+     }
+@@ -3188,6 +3287,47 @@ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
      return CELL_OK;
  }
  
