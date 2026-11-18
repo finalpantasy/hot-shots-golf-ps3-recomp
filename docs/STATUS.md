@@ -155,3 +155,11 @@ Open: the sampler table fills at 2048 entries in a round, after which new sample
 The wait was in the job chain walker. Once per frame the main thread waits for a counter job that sits behind about 100 jobs of one SPU program (`0x00CB1F80`, about 10 ms each). The chain alternates job and guard entries, and the walker ran every job one at a time. That was the stall. It now hands jobs to 4 parallel lanes (patch `0028`; `JC_PARALLEL=1` restores the old order, up to 8 lanes). Only sync, end, abort, flush and job-list entries wait for earlier jobs. No public source was found that says whether a guard entry waits for earlier jobs on hardware, so that part is a reading, not a checked fact.
 
 The round now gets past "Now Loading" to the first tee: the golfer, the ball and the shot HUD are drawn (`docs/images/tee-shot-2026-11-18.png`). Two things are wrong. The course behind them is nearly black, and the game runs at about 3.5 frames per second with 7600 to 8700 draws per frame. The renderer is still idle for most of each frame, so the limit is the same SPU job, not drawing. No swing input has been sent yet.
+
+## 2026-11-18 update 16: lifted SPU code was built without optimization
+
+The pipeline runs clang with `--driver-mode=cl`. In that mode clang ignores `-O2` ("argument unused during compilation"), so the lifted SPU jobs were compiled with no optimization and the slow scalar helper versions. `port/CMakeLists.txt` now passes `/clang:-O2` and `-msse4.1` for those sources. Job `0x00CB1F80` went from about 11.7 ms to 0.22 ms per run, and the round went from about 3.3 to about 15 rendered frames per second (36 to 38 in the hole fly-through). The job queue still reports 131040 of 131040 done with 0 misses. Job output was not compared byte for byte.
+
+The same ignored flag means the runtime library and the lifted PPU code are also built without optimization. That is the next thing to fix and measure.
+
+The course is still drawn wrong in the round: the fly-through shows the sky and mountains above a flat cyan plane where the terrain should be.

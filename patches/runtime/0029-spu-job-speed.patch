@@ -1,0 +1,146 @@
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -132,6 +132,10 @@
+ static SPU_TLS jmp_buf s_spu_halt_env;
+ static SPU_TLS int     s_spu_halt_armed = 0;
+ 
++/* SPURS_JOB_PROF counters (spurs_job.c reads them around each job run):
++ * indirect branches resolved and MFC commands issued on this host thread. */
++SPU_TLS uint64_t g_spu_prof_ib, g_spu_prof_dma_n, g_spu_prof_dma_bytes;
++
+ /* Call right after a setjmp returned 0. On 64-bit Windows longjmp unwinds every
+  * host frame between it and its setjmp (RtlUnwindEx, a function-table lookup
+  * and a virtual unwind per frame), several microseconds per jump; with the
+@@ -1012,6 +1016,7 @@
+          * not the plain GET/PUT the DMA engine would do. */
+         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
+             return;
++        if (channel == MFC_Cmd) { g_spu_prof_dma_n++; g_spu_prof_dma_bytes += ctx->mfc_size; }
+         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
+         /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
+          * DMA completes synchronously, so the instant the program arms tag
+@@ -2692,6 +2697,7 @@
+      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
+      * masking is a no-op for already-valid targets. */
+     ctx->pc &= SPU_LS_MASK;
++    g_spu_prof_ib++;
+     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
+      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
+      * enforce the preserve-all-registers hardware contract here -- the first
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -42,6 +42,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <stddef.h>
+ #include "ps3emu/log_first.h"
+ #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
+ 
+@@ -156,10 +157,80 @@
+ SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
+ void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
+ 
++/* SPURS_JOB_PROF=1: per job binary, where a run's host time goes -- setup
++ * (descriptor, local store fill), the lifted run, and teardown -- with the
++ * run's trampoline steps, indirect branches and MFC commands. One line per
++ * binary every 2 s. Off: one cached load per job. */
++#ifdef _WIN32
++#include <windows.h>
++static uint64_t sjp_now_ns(void)
++{
++    static LARGE_INTEGER f; LARGE_INTEGER c;
++    if (!f.QuadPart) QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
++}
++#else
++#include <time.h>
++static uint64_t sjp_now_ns(void)
++{
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++#endif
++extern SPURS_JOB_TLS uint64_t g_spu_prof_ib, g_spu_prof_dma_n, g_spu_prof_dma_bytes;
++typedef struct {
++    uint32_t bin; uint32_t n;
++    uint64_t setup, run, tear, steps, ib, dma, dmab;
++} SjpBin;
++static int sjp_on(void)
++{
++    static int v = -1;
++    if (v < 0) v = ps3_env_once("SPURS_JOB_PROF") ? 1 : 0;
++    return v;
++}
++static void sjp_add(uint32_t bin, uint64_t setup, uint64_t run, uint64_t tear,
++                    uint64_t steps, uint64_t ib, uint64_t dma, uint64_t dmab)
++{
++#ifdef _WIN32
++    static SRWLOCK lk = SRWLOCK_INIT;
++    AcquireSRWLockExclusive(&lk);
++#endif
++    static SjpBin b[16]; static int nb; static uint64_t t_last;
++    int i = 0;
++    while (i < nb && b[i].bin != bin) i++;
++    if (i == nb && nb < 16) { b[nb].bin = bin; nb++; }
++    if (i < nb) {
++        SjpBin* s = &b[i];
++        s->n++; s->setup += setup; s->run += run; s->tear += tear;
++        s->steps += steps; s->ib += ib; s->dma += dma; s->dmab += dmab;
++    }
++    uint64_t now = sjp_now_ns();
++    if (!t_last) t_last = now;
++    if (now - t_last >= 2000000000ull) {
++        t_last = now;
++        for (int k = 0; k < nb; k++) {
++            SjpBin* s = &b[k];
++            if (!s->n) continue;
++            double n = (double)s->n;
++            fprintf(stderr, "[jobprof] bin 0x%08X: %u job(s) per job: setup %.0f us, run %.0f us,"
++                    " teardown %.0f us | steps %.0f, ib %.0f, dma %.0f (%.0f B)\n",
++                    s->bin, s->n, s->setup / n * 1e-3, s->run / n * 1e-3, s->tear / n * 1e-3,
++                    s->steps / n, s->ib / n, s->dma / n, s->dmab / n);
++            memset(&s->n, 0, sizeof *s - offsetof(SjpBin, n));
++        }
++    }
++#ifdef _WIN32
++    ReleaseSRWLockExclusive(&lk);
++#endif
++}
++
+ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                       uint32_t job_ea, uint32_t job_desc_size)
+ {
+     if (!entry || !job_ea) return -1;
++    const uint64_t sjp_t0 = sjp_on() ? sjp_now_ns() : 0;
++    uint64_t sjp_t1 = 0, sjp_t2 = 0, sjp_ib = 0, sjp_dma = 0, sjp_dmab = 0;
+ 
+     /* ---- descriptor ---------------------------------------------------- */
+     uint32_t ea_bin   = (uint32_t)(g64(job_ea + JH_EA_BINARY) & ~1ull);
+@@ -394,7 +465,16 @@
+      * and trips its parameter guard, which HALTS -- ending the run. So the
+      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
+      * noise, not a failure: the job's real work finished before the jump. */
++    if (sjp_t0) {
++        sjp_ib = g_spu_prof_ib; sjp_dma = g_spu_prof_dma_n; sjp_dmab = g_spu_prof_dma_bytes;
++        sjp_t1 = sjp_now_ns();
++    }
+     spu_run_with_halt(entry, &ctx);
++    if (sjp_t0) {
++        sjp_t2 = sjp_now_ns();
++        sjp_ib = g_spu_prof_ib - sjp_ib; sjp_dma = g_spu_prof_dma_n - sjp_dma;
++        sjp_dmab = g_spu_prof_dma_bytes - sjp_dmab;
++    }
+ 
+     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
+      * the SPU printf service, NOT query results -- value 0x83C0 from the sound
+@@ -455,5 +535,8 @@
+     spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
+     { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
+     free(ls);
++    if (sjp_t0)
++        sjp_add(ea_bin, sjp_t1 - sjp_t0, sjp_t2 - sjp_t1, sjp_now_ns() - sjp_t2,
++                ctx.steps, sjp_ib, sjp_dma, sjp_dmab);
+     return 0;
+ }

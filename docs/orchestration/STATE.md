@@ -436,3 +436,14 @@ Two workers, serialized by BUILD.lock: (1) why job `0x00CB1F80` costs 10 ms per 
 Workers started 03:25 (both Opus; reasons: SPU lifter and SPURS timing across systems; shader and RSX state diagnosis):
 - `afb1e7562b35a3ce0` owns `libs/spurs/**`, `runtime/spu/**`, `tools/spu*`, lifted SPU output; output `0029-spu-job-speed.patch`.
 - `aef6cb937ffc4a2cd` owns `libs/video/**`; output `0029` or `0030-rsx-course-lighting.patch`.
+
+## 2026-11-18 run 24: SPU code was unoptimized
+
+- Worker `afb1e7562b35a3ce0` finished. clang under `--driver-mode=cl` ignores `-O1/-O2/-O3` (coordinator re-checked with `-###`: only `/O2` or `/clang:-O2` reach cc1; `-ffp-contract=off` and `-std=` are ignored too, `-fwrapv`, `-fno-strict-aliasing`, `-w`, `-msse4.1` are honored). `port/CMakeLists.txt` now gives SPU sources `/clang:-O2;-msse4.1`.
+- Job `0x00CB1F80`: 11.1 to 11.8 ms to 218 to 252 us. Round: about 3.2 to about 15 rendered frames/s; `done=131040 ran=131040 MISS=0`. Logs `boot-fix-1.02-jprof1-1.log` (before), `boot-fix-1.02-spuo2b-1.log` (after). Patch `0029-spu-job-speed.patch` adds `SPURS_JOB_PROF=1` timers (off by default).
+- Not verified: byte compare of job output; draws per frame rose from 7600 to about 28000 in the round, cause unknown; presented-frame counter still 0; fly-through shows a flat cyan plane instead of terrain.
+- Open: runtime library (`-O2` ignored) and lifted PPU code (`-O3` ignored) are built at -O0. Coordinator is timing one PPU file at `/clang:-O1` before changing flags; the change waits for the rendering worker `aef6cb937ffc4a2cd` so its builds are not disturbed.
+
+### Exact next action
+
+When the rendering worker reports: commit its patch, then turn on optimization for the runtime and PPU code, full rebuild, boot, compare.

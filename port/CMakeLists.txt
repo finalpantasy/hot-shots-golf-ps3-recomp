@@ -208,8 +208,23 @@ if(SPU_SOURCES)
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT)
-    if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+    # Under clang's cl driver (CMAKE_C_COMPILER_ARG1=--driver-mode=cl, which
+    # this port's pipeline uses) a plain "-O2" is ignored with "argument unused
+    # during compilation" and the TU compiles at /Od: every SPU helper
+    # (spu_a, spu_shufb, spu_ls_read128, ...) stayed an out-of-line call with
+    # its operands spilled to the stack. /clang: hands the flag to the clang
+    # driver itself. -msse4.1 selects the helpers' SSE4.1 forms (SPU_X86 in
+    # spu_helpers.h, bit-identical to the scalar _ref forms); the runtime's own
+    # probe for it fails under the cl driver, so it never reached these TUs.
+    if(CMAKE_C_COMPILER_ARG1 MATCHES "driver-mode=cl")
+        set_source_files_properties(${SPU_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "/clang:-O2;-msse4.1")
+    elseif(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        set(_spu_opts "-O2")
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|amd64")
+            list(APPEND _spu_opts "-msse4.1")
+        endif()
+        set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "${_spu_opts}")
     endif()
 endif()
 
