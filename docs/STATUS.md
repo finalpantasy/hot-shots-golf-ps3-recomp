@@ -78,7 +78,7 @@ Six SPURS jobs are lifted and registered. The runtime now finds base-install fil
 
 ## 2026-11-17 update 5: first game frame
 
-Two fixes in the GCM code stopped the GPU device loss: the default command buffer is now selected correctly, and the 1600x1080 display buffer is scaled into the 1280x720 window. The game then finishes its graphics system setup and draws its autosave notice. See `docs/images/first-frame-2026-11-17.png`. Only the blue channel is shown.
+Two fixes in the GCM code stopped the GPU device loss: the default command buffer is now selected correctly, and the 1600x1080 display buffer is scaled into the 1280x720 window. The game then finishes its graphics system setup and draws its autosave notice. Only the blue channel is shown.
 
 The frame does not appear on every boot. In two of four 20 second runs a game thread called through an unset function table and the window stayed black. 13 SPURS jobs are lifted, and two of them have been seen running. No menu, input, audio or gameplay yet.
 
@@ -86,6 +86,12 @@ The frame does not appear on every boot. In two of four 20 second runs a game th
 
 The black boots came from the SPURS runtime sending an invented job-completion event next to the real one the sound job posts. The game used the invented counter as a table index and called through unrelated memory. The runtime now sends no invented event for a job chain whose jobs report for themselves. Four of four boots are clean, and the sound module registration error is gone.
 
-`cellFsReadWithOffset` was missing and is now implemented. The game leaves the autosave notice, shows "Auto-loading..." (`docs/images/auto-loading-2026-11-17.png`) and starts loading the title menu, course background and avatar archives.
+`cellFsReadWithOffset` was missing and is now implemented. The game leaves the autosave notice, shows "Auto-loading..." and starts loading the title menu, course background and avatar archives.
 
 Still open: only the blue channel is shown, one SPURS job used during the title load is not lifted, and the movie player imports (`cellSail`) are not implemented.
+
+## 2026-11-17 update 7: correct colors, intro movie reached
+
+The blue-only picture is fixed. The RSX vertex code ignored vertex arrays with stride 0, which the game uses for its 2D color values, so red and green came out as zero. See `docs/images/autosave-notice-2026-11-17.png`.
+
+The SPURS job used by the title load is lifted (14 jobs, no dispatch misses). The game now shows the JAPAN Studio logo and starts its intro movie, where it stops: the movie player library (`cellSail`) is a stub. There is no video decoder in the port yet.

@@ -1,0 +1,21 @@
+diff --git a/libs/video/rsx_vertex_fetch.c b/libs/video/rsx_vertex_fetch.c
+index 7d08c22..8980aa8 100644
+--- a/libs/video/rsx_vertex_fetch.c
++++ b/libs/video/rsx_vertex_fetch.c
+@@ -39,7 +39,15 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
+     out[3] = st->vertex_data4f[idx][3];
+ 
+     const rsx_vertex_attrib* a = &st->vertex_attribs[idx];
+-    if (!a->enabled || a->stride == 0 || !vm_base) return;
++    /* An ENABLED array with stride 0 is not off: every vertex reads the same
++     * one element at the array offset (RPCS3 RSXDrawCommands.cpp,
++     * attribute_stride == 0 -> single_vertex). Hot Shots Golf WI feeds its 2D
++     * pass's colour (attribute 3) and colour scale (attribute 8) that way;
++     * taking the (0,0,0,1) constant register instead left only blue on every
++     * pixel of the first screen. RSX_STRIDE0_CONST=1 restores the old reading. */
++    static int s_stride0_const = -1;
++    if (s_stride0_const < 0) s_stride0_const = getenv("RSX_STRIDE0_CONST") ? 1 : 0;
++    if (!a->enabled || !vm_base || (a->stride == 0 && s_stride0_const)) return;
+ 
+     /* Vertex frequency divisor (instancing). An ordinary array
+      * (rsx_vertex_freq_plain: freq 0, or 1 with DIVIDE) is per-vertex.

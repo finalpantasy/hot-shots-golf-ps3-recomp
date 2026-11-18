@@ -225,7 +225,7 @@ Worker `aa95d6ef8ed237dce` (finished) lifted 7 more SPURS jobs, 13 in total (`to
 
 Evidence:
 
-- Build `build/gcm-4198df92/`, log `boot-fix-1.02-gcm-3.log`: `887A0005` 0 (was 10), FIFO walker circling 0 (was 8), `=== SGX system initialize` reached and completed, window title `draws: 5`. The capture `docs/images/first-frame-2026-11-17.png` is the game's autosave notice over a course background. It is the first guest frame. Only the blue channel is shown.
+- Build `build/gcm-4198df92/`, log `boot-fix-1.02-gcm-3.log`: `887A0005` 0 (was 10), FIFO walker circling 0 (was 8), `=== SGX system initialize` reached and completed, window title `draws: 5`. The capture the first capture (since replaced) is the game's autosave notice over a course background. It is the first guest frame. Only the blue channel is shown.
 - Build `build/frame1-3d6db76d/` (13 jobs plus both fixes), log `boot-fix-1.02-frame1.log`: `887A0005` 0, FIFO walker 0, SGX initialize completed, `dispatch MISS` 0, 4 job entries. The capture is black. Thread 11 called a null pointer 5 times from `func_00936F24+0x19FE` and then 393 times from `func_007625E8+0x2C9`, each through `r12=0x48000084` (a code word used as a function descriptor), followed by garbage virtual calls.
 
 The black result is intermittent. Same markers per log: `gcm-2` 400 `bctr to NULL` (bad), `gcm-3` 0 (good), `codex-4` 0, `frame1` 400 (bad). Two of four runs fail, so the cause is a race and not the 7 new jobs alone. In the bad runs `r5` and `r28` hold `0x1218EA80`, the `soc-job` job chain.
@@ -261,15 +261,23 @@ Run 7's first two attempts did not work: the SPU user-event hook consumes the in
 
 Also added `cellFsReadWithOffset` (`sys_fs` NID `0x0D5B4A14`) in `runtime/ppu/ppu_fs.cpp`, patch `0010-ppufs-read-with-offset.patch`. The game reads its `.xb` archives with it.
 
-Evidence, build `build/evt3-7c4f6c46/`, logs `boot-fix-1.02-evt3-1..4.log`: 4 of 4 runs have 0 `bctr to NULL`, 0 `null-call`, 0 `887A0005`, and `sgxbus.c(934) : failed to regist module` is gone. The game leaves the autosave notice, shows "Auto-loading..." (`docs/images/auto-loading-2026-11-17.png`, still blue only), then opens `title.US_01.xb`, `coursebg_menu.xb` and the avatar archives.
+Evidence, build `build/evt3-7c4f6c46/`, logs `boot-fix-1.02-evt3-1..4.log`: 4 of 4 runs have 0 `bctr to NULL`, 0 `null-call`, 0 `887A0005`, and `sgxbus.c(934) : failed to regist module` is gone. The game leaves the autosave notice, shows "Auto-loading...", then opens `title.US_01.xb`, `coursebg_menu.xb` and the avatar archives.
 
 ### Next blockers
 
 1. Job `0xCAD980` (fingerprint `79D3C33093353269`, 17904 bytes) is dispatched 24 times in 20 s and is not lifted. Worker `ae1d90fb014b205b9` (Opus) owns `tools/spu_*` and `port/spu/**` for this.
-2. Blue-only frame: worker `a815d8ff935f4a9cb` (Opus), patch `0009`.
+2. Blue-only frame: worker `a815d8ff935f4a9cb` (Opus), patch `0020` (`0009` is the peripheral handlers patch).
 3. `cellSail` imports unresolved: `0x018281A8` `cellSailGraphicsAdapterGetFrame2`, `0x44A20E79` `cellSailGraphicsAdapterUpdateAvSync`, `0x5F7C7A6F` `cellSailPlayerSetParameter`, `0x1C9D5E5A` (not named). Passed to Codex by mailbox.
 4. The new chain `0x12E74800` still gets invented events on queue 1 (`d2` counts 0 to `0x1D`); correct only if its jobs never post their own.
 
 ### Exact next action
 
 When both workers report: rebuild, run 5 boots of 30 s, view the captures, then update docs and push.
+
+## 2026-11-17 run 9: colors fixed, 14 jobs, intro movie reached
+
+- Blue-only frame fixed by worker `a815d8ff935f4a9cb` (finished). Cause: `libs/video/rsx_vertex_fetch.c` treated an enabled vertex array with stride 0 as disabled and used the constant (0,0,0,1). RPCS3 reads element 0 for every vertex. The game's 2D pass sends color and color scale that way, so red and green were multiplied by 0. Patch `0020-rsx-vertex-stride0-single-element.patch`; `RSX_STRIDE0_CONST=1` restores the old behavior. Build `build/blue-414d453c/`, capture `docs/images/autosave-notice-2026-11-17.png`. Not checked: the game samples its 1600x1080 offscreen target with remap `0xAA6C` and the D3D12 backend ignores remap on that path (`rsx_d3d12_backend.c:5013`).
+- Job `0xCAD980` lifted by worker `ae1d90fb014b205b9` (finished): 14 jobs, `dispatch MISS` 0 in `boot-fix-1.02-jobs14-1..3.log`. The "data inside code" was a 5-entry switch table the tool already handles.
+- The game now shows the JAPAN Studio logo and starts its intro movie through `cellSail` (`PlayerBoot`), where it stalls on unresolved imports. Worker `ab6124b51bf7bd01e` (Opus, `sail-worker`) owns `libs/codec/cellSail.*`, patch `0021`.
+- `sgxbus.c(934) : failed to regist module` came back in 1 of 3 runs. Cause found: `cellSpursShutdownJobChain` cleared `running` without stopping the walker thread, so the next `RunJobChain` started a second walker on the same chain. Fix in tree (stop flag checked in the guard wait and the command loop; `Join` waits for the thread). Verification runs: `boot-fix-1.02-stop-1..5.log`.
+- Boot speed varies from 2 to 63 FPS between runs while workers load the machine. Not investigated.

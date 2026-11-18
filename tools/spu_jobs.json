@@ -304,6 +304,34 @@
         "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
         "Earlier-phase dump, not yet seen in the newest log. Code ends at 0x9060; shuffle masks from 0x9060. EA from the dump's unique match in the EBOOT."
       ]
+    },
+    {
+      "ea": "0x00CAD980",
+      "size": "0x45F0",
+      "fingerprint": "79D3C33093353269",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x60",
+          "0x4068"
+        ]
+      ],
+      "extra_entries": [
+        "0x138",
+        "0x16C"
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_79D3C33093353269_17904.bin",
+      "evidence": [
+        "Dispatched 24+ times while loading the title menu: '[spurs-job] dispatch MISS fp=0x79D3C33093353269 size=17904' in work/runtime/logs/boot-fix-1.02-evt3-4.log. Runtime dump is byte-identical to the EBOOT at file offset 0xC9D980.",
+        "JOBCRT layout, same crt as 0x00CB3580: 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0xE0); 0x20-0x60 data (0xA5 fill, 'JOBCRT Ver14', bss end 0x45B0 at 0x3C, bss start 0x4330 at 0x40).",
+        "0x60-0x4068: code. Ends with 'bi $r0' at 0x4064; 0x4068-0x4070 are stop 0 padding; 0x4070 starts the printf strings ('\n_exit() has been called', 'Memory error occurred', chlib source paths), then 'JOBCRT Ver' key at 0x4290, data, bss 0x4330-0x45B0 and the '%SPURS JOB INFO%' trailer at 0x45C0. Every lqr/stqr in the code addresses 0x0-0x40 or 0x40B0 and up, never inside 0x60-0x4068.",
+        "The only data inside 0x60-0x4068 is a 5-entry inline switch table at 0x2C14-0x2C28 (words 0x14,0x30C,0x7DC,0x454,0x58C; targets 0x2C28,0x2F20,0x33F0,0x3068,0x31A0): ila $r21,0x2C14 at 0x2AF0, a $r5,$r21,$r126 at 0x2B18, clgti $r8,$r10,4 at 0x2B88, lqx/rotqby/a at 0x2B94-0x2BA0, bi $r2 at 0x2C10. The tool finds and subtracts it (compiler bound check); this is the 'data inside code at 0x2C18' an earlier pass stopped at. The two zero words at 0x3948 follow br 0x38C8; lnop and are alignment padding.",
+        "Every other in-code ila to a code address (0x80, 0x150, 0x1818, 0x2260, 0x2AF0, 0x3750, 0x37E0, 0x3A28, 0x3B10, 0x3BE4) is the PIC base idiom (ila rX,next; brsl $r126,next). extra_entries: 0x138 is _exit() (ila $r4,0x4070 then printf and stopd), reached by no direct branch; 0x16C is the epilogue after the stopd at 0x168. The second stopd at 0x3AF0 (memory-error abort) has its epilogue 0x3AF4 seeded by find_spu_functions."
+      ]
     }
   ]
 }

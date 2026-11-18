@@ -91,3 +91,19 @@ The Windows executable starts the fixed 1.02 profile when it finds the startup f
 | Distribution | The Windows executable contains the lifted code and links to Windows system DLLs. The tarball gate applies if a release ships an AppImage. |
 
 
+
+### Item 5 results
+
+Changed `port/main.cpp`, `port/cli_options.h`, `port/cli_options.cpp`, and `docs/CLI.md`. Setup and guest dispatch use one executable.
+
+| Check | Evidence |
+|---|---|
+| Locked build | `build-fix-1.02-codex-5.log` ends with `[done] build`. |
+| Missing files | `first-run-codex-5.log` records exit 1 for the exe-only and missing-SFO cases, with no runtime folders created. |
+| Default launch | The same log records dispatch with no flags for both adjacent layouts, an empty alternate launch directory, and empty isolated AppData and temp directories. Both guest runs hit the 20-second cap. |
+| Overrides | A relative `--build-dir` and an explicit `PS3_GAME` layout dispatched the guest. The HDD0 flag took precedence over the environment variable. |
+| Distribution | `llvm-readobj --coff-imports` on the tested executable lists Windows system DLLs. No AppImage exists in the build tree. |
+
+The tests used the hidden desktop. An interactive Explorer launch and system DLL or driver registry writes remain unverified.
+
+
