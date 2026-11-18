@@ -149,3 +149,9 @@ Profiling (`RSX_PROF=1`) found two costs in the renderer. The D3D12 debug layer 
 The 1 frame per second in a real round is not render time. The renderer is idle for more than 2 of every 2.3 seconds and 95 percent of process time is in waits, so the game is blocked on something once per frame. That is being traced now.
 
 Open: the sampler table fills at 2048 entries in a round, after which new sampler states fall back to defaults. Large flat cyan water surfaces appear in one capture.
+
+## 2026-11-18 update 15: the round reaches the first tee
+
+The wait was in the job chain walker. Once per frame the main thread waits for a counter job that sits behind about 100 jobs of one SPU program (`0x00CB1F80`, about 10 ms each). The chain alternates job and guard entries, and the walker ran every job one at a time. That was the stall. It now hands jobs to 4 parallel lanes (patch `0028`; `JC_PARALLEL=1` restores the old order, up to 8 lanes). Only sync, end, abort, flush and job-list entries wait for earlier jobs. No public source was found that says whether a guard entry waits for earlier jobs on hardware, so that part is a reading, not a checked fact.
+
+The round now gets past "Now Loading" to the first tee: the golfer, the ball and the shot HUD are drawn (`docs/images/tee-shot-2026-11-18.png`). Two things are wrong. The course behind them is nearly black, and the game runs at about 3.5 frames per second with 7600 to 8700 draws per frame. The renderer is still idle for most of each frame, so the limit is the same SPU job, not drawing. No swing input has been sent yet.

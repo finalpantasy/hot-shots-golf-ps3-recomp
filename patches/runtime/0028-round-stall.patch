@@ -1,0 +1,612 @@
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -556,6 +556,32 @@
+     }
+ }
+ 
++/* Host thread name (ps3_thread_name / SetThreadDescription) for the per-tid
++ * lines, so "tid 174188" reads as "spurs jq 0" or "spu <group>:1". */
++static const char* samp_tid_name(uint32_t tid, char* out, size_t cap)
++{
++    typedef HRESULT (WINAPI *get_desc_fn)(HANDLE, PWSTR*);
++    static get_desc_fn get_desc; static int looked = 0;
++    if (!looked) {
++        get_desc = (get_desc_fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"),
++                                                      "GetThreadDescription");
++        looked = 1;
++    }
++    out[0] = 0;
++    if (!get_desc) return out;
++    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
++    if (!h) return out;
++    PWSTR w = nullptr;
++    if (SUCCEEDED(get_desc(h, &w)) && w) {
++        size_t i = 0;
++        for (; w[i] && i + 1 < cap; i++) out[i] = (char)(w[i] < 128 ? w[i] : '?');
++        out[i] = 0;
++        LocalFree(w);
++    }
++    CloseHandle(h);
++    return out;
++}
++
+ static void samp_report(void)
+ {
+     fprintf(stderr, "[samp] %llu samples, %llu in guest code (%.1f%%)\n",
+@@ -587,17 +613,21 @@
+         for (int k = 0; k < SAMP_TIDS; k++)
+             if (s_tid_ct[k] > best) { best = s_tid_ct[k]; bi = k; }
+         if (bi < 0 || !best) break;
+-        fprintf(stderr, "[samp] guest-tid %u: %llu samples (%5.1f%% of guest)\n",
++        char nm[64];
++        fprintf(stderr, "[samp] guest-tid %u: %llu samples (%5.1f%% of guest) '%s'\n",
+                 s_tid_id[bi], (unsigned long long)best,
+-                s_samp_guest ? 100.0 * (double)best / (double)s_samp_guest : 0.0);
++                s_samp_guest ? 100.0 * (double)best / (double)s_samp_guest : 0.0,
++                samp_tid_name(s_tid_id[bi], nm, sizeof nm));
+         s_tid_ct[bi] = 0;
+     }
+     for (int k = 0; k < SAMP_TIDS2; k++) {
+         uint64_t tot = s_t2_guest[k] + s_t2_ntdll[k] + s_t2_other[k];
+         if (tot < 20) continue;
+-        fprintf(stderr, "[samp] tid %-6u guest=%-5llu ntdll=%-5llu other=%-5llu\n",
++        char nm[64];
++        fprintf(stderr, "[samp] tid %-6u guest=%-5llu ntdll=%-5llu other=%-5llu '%s'\n",
+                 s_t2_id[k], (unsigned long long)s_t2_guest[k],
+-                (unsigned long long)s_t2_ntdll[k], (unsigned long long)s_t2_other[k]);
++                (unsigned long long)s_t2_ntdll[k], (unsigned long long)s_t2_other[k],
++                samp_tid_name(s_t2_id[k], nm, sizeof nm));
+     }
+     for (int rank = 0; rank < 25; rank++) {
+         uint64_t best = 0; int bi = -1;
+@@ -823,6 +853,10 @@
+ 
+ void ps3_sampler_start(void)
+ {
++    /* Called from boot_main and from ppu_run (a port's own main may not call
++     * it); start once. */
++    static volatile LONG s_started = 0;
++    if (InterlockedExchange(&s_started, 1)) return;
+     ppu_poke_start();                     /* independent of PS3_SAMPLE */
+     const char* e = getenv("PS3_SAMPLE");
+     if (!e) return;
+@@ -3490,7 +3524,12 @@
+                     (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+                     (unsigned)ctx->lr);
+             fflush(stderr); } }
+-        static int s_sbp = -1; if (s_sbp < 0) s_sbp = getenv("PS3_SCBLOCK_PROF") ? 1 : 0;
++        /* PS3_SCBLOCK_PROF=1 logs the first 40 syscalls that block >= 150 ms;
++         * PS3_SCBLOCK_PROF=<n> (n > 1) logs the first n, so a late stall (a
++         * round minutes into the run) is not past the cap. */
++        static int s_sbp = -1, s_sbp_cap = 40;
++        if (s_sbp < 0) { const char* e = getenv("PS3_SCBLOCK_PROF"); s_sbp = e ? 1 : 0;
++                         if (e && atoi(e) > 1) s_sbp_cap = atoi(e); }
+         if (s_sbp) {
+             static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
+             uint32_t _a3=(uint32_t)ctx->gpr[3], _a4=(uint32_t)ctx->gpr[4], _a5=(uint32_t)ctx->gpr[5];
+@@ -3499,14 +3538,19 @@
+             ULONGLONG _dt = GetTickCount64() - _t0;
+             uint32_t _rv=(uint32_t)ctx->gpr[3];
+             if (num < 1024) { s_acc[num]+=_dt; s_cnt[num]++; }
+-            if (_dt >= 150 || (num==130 && _dt >= 8)) {
+-                static int _bn=0; if (PS3_LOG_FIRST(_bn, 40)) {
++            /* PS3_SCBLOCK_FROM=<s>: no [BLOCK] lines before <s> seconds into the
++             * run, so the cap is spent on the stall being studied. */
++            static ULONGLONG s_sbp_from = (ULONGLONG)-1, s_sbp_t0 = 0;
++            if (s_sbp_from == (ULONGLONG)-1) { const char* e = getenv("PS3_SCBLOCK_FROM");
++                s_sbp_from = e ? (ULONGLONG)atoi(e) * 1000ull : 0; s_sbp_t0 = _t0; }
++            if ((_dt >= 150 || (num==130 && _dt >= 8)) && _t0 - s_sbp_t0 >= s_sbp_from) {
++                static int _bn=0; if (PS3_LOG_FIRST(_bn, s_sbp_cap)) {
+                 void* ra=__builtin_return_address(0);
+                 uintptr_t tgt=(uintptr_t)ra; uint32_t bg=0; uintptr_t bh=0;
+                 for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
+-                fprintf(stderr,"[BLOCK] syscall %llu blocked %llums  caller=func_%08X+0x%llX  queue=%08X evbuf=%08X timeout=%08X -> ret=%08X tid=%u\n",
++                fprintf(stderr,"[BLOCK] syscall %llu blocked %llums  caller=func_%08X+0x%llX  queue=%08X evbuf=%08X timeout=%08X -> ret=%08X tid=%u glr=0x%08X t=%llums\n",
+                     (unsigned long long)num,(unsigned long long)_dt,bg,(unsigned long long)(tgt-bh),
+-                    _a3,_a4,_a5,_rv,(unsigned)ctx->thread_id);
++                    _a3,_a4,_a5,_rv,(unsigned)ctx->thread_id,(unsigned)ctx->lr,(unsigned long long)_t0);
+                 }
+             }
+             if (s_win==0) s_win=_t0;
+@@ -4087,6 +4131,11 @@
+      * killed run loses at most one interval (runtime/platform/ps3_stdio.h).
+      * PS3_STDIO_UNBUFFERED=1 restores the old unbuffered stdout. */
+     ps3_stdio_init();
++#ifdef _WIN32
++    /* PS3_SAMPLE=<ms>: the guest-PC sampler, for ports whose main does not
++     * start it (no-op when unset or already started). */
++    if (getenv("PS3_SAMPLE")) ps3_sampler_start();   /* defined above */
++#endif
+ 
+     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
+     uint32_t code = 0, toc = 0;
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -197,6 +197,37 @@
+             pt_win = now;
+           } } } }
+ 
++    /* PS3_WAIT_EPISODE=<lr-hex>: time each spin episode from this return
++     * address (calls closer than 5 ms apart are one episode) and print the
++     * ones that lasted >= 20 ms with their length and the r0/r9 the loop
++     * compared on its last pass (Hot Shots Golf's chlib Spu wait at
++     * 0x00871EA4 compares done=r0 with issued=r9, with a 1 s timeout). One
++     * spinning thread per lr is assumed. */
++    { static long s_we = -1;
++      if (s_we < 0) { const char* e = getenv("PS3_WAIT_EPISODE");
++                      s_we = e ? (long)strtoul(e, 0, 16) : 0; }
++      if (s_we && (uint32_t)ctx->lr == (uint32_t)s_we) {
++        extern unsigned long long ps3_qpc_us(void);
++        static unsigned long long ep_t0, ep_last; static unsigned ep_calls;
++        static uint32_t ep_r0, ep_r9, ep_r0_first, ep_r9_first; static int ep_n = 0;
++        unsigned long long now = ps3_qpc_us();
++        if (ep_last && now - ep_last > 5000) {
++            unsigned long long d = ep_last - ep_t0;
++            if (d >= 20000 && ep_n < 400) {
++                ep_n++;
++                fprintf(stderr, "[wait-ep] lr=0x%08X tid=%u %llums %u calls: start r0=%u r9=%u, "
++                        "end r0=%u r9=%u%s\n", (uint32_t)s_we, (unsigned)ctx->thread_id,
++                        d / 1000, ep_calls, ep_r0_first, ep_r9_first, ep_r0, ep_r9,
++                        d >= 990000 ? " (TIMEOUT?)" : "");
++            }
++            ep_last = 0;
++        }
++        if (!ep_last) { ep_t0 = now; ep_calls = 0;
++                        ep_r0_first = (uint32_t)ctx->gpr[0]; ep_r9_first = (uint32_t)ctx->gpr[9]; }
++        ep_last = now; ep_calls++;
++        ep_r0 = (uint32_t)ctx->gpr[0]; ep_r9 = (uint32_t)ctx->gpr[9];
++      } }
++
+     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
+      * address, dump the registers and the object they point at. A poll loop
+      * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2036,13 +2036,39 @@
+         return;
+     if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
+     LARGE_INTEGER now; QueryPerformanceCounter(&now);
+-    LONGLONG min_gap = s_freq.QuadPart / 5000;          /* ~200us */
++    /* GCM_REF_PACE_US=<us>: the per-fence visibility (default 200). */
++    static LONGLONG s_gap = -1;
++    if (s_gap < 0) { const char* e = getenv("GCM_REF_PACE_US");
++                     long us = e ? atol(e) : 200; if (us < 0) us = 200;
++                     s_gap = s_freq.QuadPart * us / 1000000; }
++    LONGLONG min_gap = s_gap;
+     int dry = 0;
+     if (now.QuadPart - s_last_pub >= min_gap) {
+         gcm_ref_publish_one();
+         s_last_pub = now.QuadPart;
+         dry = (s_ref_qhead == s_ref_qtail);
+     }
++    /* GCM_REFPROF=1: every ~2 s, how many ref polls, fences drained and
++     * published, and the deepest backlog a poller sat behind. A deep backlog
++     * means a cellGcmFinish-style equality waiter pays pace x backlog. */
++    { static int on = -1; if (on < 0) on = getenv("GCM_REFPROF") ? 1 : 0;
++      if (on) {
++          static LONGLONG t0; static unsigned long long polls, pub0, push0; static u32 maxq;
++          extern volatile long long g_gcm_ref_pub_count;
++          u32 q = s_ref_qtail - s_ref_qhead;
++          polls++; if (q > maxq) maxq = q;
++          if (!t0) { t0 = now.QuadPart; pub0 = (unsigned long long)g_gcm_ref_pub_count; push0 = s_ref_qtail; }
++          if (now.QuadPart - t0 >= s_freq.QuadPart * 2) {
++              fprintf(stderr, "[refprof] %.1fs: %llu polls, %llu fences drained, %llu published, "
++                      "backlog now %u max %u, last published 0x%X\n",
++                      (double)(now.QuadPart - t0) / (double)s_freq.QuadPart, polls,
++                      (unsigned long long)(s_ref_qtail - (u32)push0) & 0xFFFFFFFFull,
++                      (unsigned long long)g_gcm_ref_pub_count - pub0, q, maxq,
++                      s_ref_q[(s_ref_qhead - 1u) % GCM_REF_QLEN]);
++              t0 = now.QuadPart; polls = 0; maxq = 0;
++              pub0 = (unsigned long long)g_gcm_ref_pub_count; push0 = s_ref_qtail;
++          }
++      } }
+     ReleaseSRWLockExclusive(&s_ref_pub_lock);
+     if (dry && s_gcm_kick_ev)
+         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -3101,10 +3101,315 @@
+     }
+ }
+ 
++/* JC_PROF=1: every ~2 s per walked chain: jobs run and their host time, how
++ * jobs are grouped between non-JOB commands (a "run" is a stretch of
++ * consecutive JOB commands; on hardware those run in parallel across SPUs),
++ * and time spent parked or behind a guard. */
++typedef struct {
++    u64 t0, job_ns, park_ns, guard_ns;
++    u32 jobs, runs, cur_run, max_run, syncs;
++    u32 bin[8], bin_n[8]; u64 bin_ns[8]; int nbin;   /* per job binary EA (inline runs) */
++    u32 pool_jobs; u64 pool_busy_ns, barrier_ns;    /* parallel lanes */
++    u32 brk[128];             /* command (low 7 bits) that ended a lone job's batch */
++} JcProf;
++static int jc_prof_on(void)
++{
++    static int v = -1;
++    if (v < 0) v = getenv("JC_PROF") ? 1 : 0;
++    return v;
++}
++static u64 jc_now_ns(void)
++{
++    static LARGE_INTEGER f; LARGE_INTEGER c;
++    if (!f.QuadPart) QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (u64)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
++}
++static void jc_prof_end_run(JcProf* p)
++{
++    if (!p->cur_run) return;
++    p->runs++;
++    if (p->cur_run > p->max_run) p->max_run = p->cur_run;
++    p->cur_run = 0;
++}
++static void jc_prof_maybe_print(JcProf* p, u32 jc_ea)
++{
++    u64 now = jc_now_ns();
++    if (!p->t0) { p->t0 = now; return; }
++    if (now - p->t0 < 2000000000ull) return;
++    fprintf(stderr, "[jcprof] chain 0x%08X %.1fs: %u job(s) %.0f ms busy, %u run(s) "
++            "(avg %.1f max %u jobs/run), %u sync(s), parked %.0f ms, guard %.0f ms\n",
++            jc_ea, (now - p->t0) * 1e-9, p->jobs, p->job_ns * 1e-6, p->runs,
++            p->runs ? (double)p->jobs / p->runs : 0.0, p->max_run, p->syncs,
++            p->park_ns * 1e-6, p->guard_ns * 1e-6);
++    if (p->pool_jobs)
++        fprintf(stderr, "[jcprof]   lanes: %u job(s) %.0f ms busy, %.0f ms at barriers\n",
++                p->pool_jobs, p->pool_busy_ns * 1e-6, p->barrier_ns * 1e-6);
++    for (int k = 0; k < 128; k++)
++        if (p->brk[k])
++            fprintf(stderr, "[jcprof]   barrier cmd 0x%02X (op %d): %u held job(s) run inline\n",
++                    k, k & 7, p->brk[k]);
++    for (int k = 0; k < p->nbin; k++)
++        fprintf(stderr, "[jcprof]   bin 0x%08X: %u job(s) %.0f ms\n",
++                p->bin[k], p->bin_n[k], p->bin_ns[k] * 1e-6);
++    memset(p, 0, sizeof *p);
++    p->t0 = now;
++}
++
++/* ---------------------------------------------------------------------------
++ * Parallel job lanes
++ *
++ * On hardware a job chain is executed by up to maxContention SPUs at once: each
++ * SPU's job manager grabs the next JOB command(s) and runs them, so the jobs
++ * between two SYNCs run concurrently and in no defined order. NEXT, RESET_PC
++ * and CALL only move the read pointer; SYNC/LWSYNC (and a GUARD, END or ABORT)
++ * are what make a later job wait for the earlier ones.
++ *
++ * The walker used to run every job inline, one after another. Hot Shots Golf's
++ * course load feeds its chlib Spu chain (0x11041700, maxContention 5) one job
++ * per NEXT and its main thread waits (func_00871E30: done counter at +0x300 vs
++ * issued at +0x304, 1 s timeout) for a counter job queued behind a SYNC; with a
++ * ~9 ms lifted job run serially the main thread sat in that wait ~90 ms at a
++ * time, about 2.7 s of every 2.9 s frame, and the round showed "Now Loading"
++ * at ~1 FPS. Jobs now go to a small per-walker pool of lanes; the walker waits
++ * for them only at a barrier command.
++ *
++ * A job that is followed straight by a barrier still runs inline on the walker
++ * thread (held as `pending` until the next command shows whether a second job
++ * joins it), so chains of the form JOB SYNC JOB SYNC (the sgx "soc-job" sound
++ * chains) keep their exact old timing and thread.
++ *
++ * Each lane has its own SPU number (cellSpursGetCurrentSpuId): titles key
++ * per-SPU buffers on it. Lane 0 = 0 (what the walker uses inline), the others
++ * 2, 3, ... -- 1 is the job queue worker's (cellSpursJq.c).
++ *
++ * JC_PARALLEL=<lanes> (default 4, max 8); JC_PARALLEL=0 or 1 runs every job
++ * inline as before.
++ * -----------------------------------------------------------------------*/
++#define JC_LANES_MAX 8
++#define JC_POOL_Q    256
++extern void spurs_job_set_spu_num(uint32_t n);
++
++typedef struct JcPool {
++    SRWLOCK lock;
++    CONDITION_VARIABLE cv_work, cv_done;
++    struct { u32 job_ea; int idx; } q[JC_POOL_Q];
++    unsigned qh, qt;
++    int outstanding;          /* submitted and not yet finished */
++    int quit;
++    int nlanes;
++    HANDLE th[JC_LANES_MAX];
++    u32 jc_ea, size_desc;
++    u64 busy_ns;              /* lane time spent in jobs (JC_PROF) */
++} JcPool;
++
++typedef struct { JcPool* pool; int lane; } JcLaneArg;
++static JcLaneArg s_jc_lane_args[MAX_JOBCHAINS * JC_LANES_MAX];
++static volatile long s_jc_lane_arg_next;
++
++static int jc_parallel_lanes(void)
++{
++    static int v = -1;
++    if (v < 0) {
++        const char* e = getenv("JC_PARALLEL");
++        v = e ? atoi(e) : 4;
++        if (v < 1) v = 1;
++        if (v > JC_LANES_MAX) v = JC_LANES_MAX;
++        fprintf(stderr, "[cellSpurs] job chain lanes: %d (JC_PARALLEL=%s)\n", v, e ? e : "unset");
++    }
++    return v;
++}
++
++static DWORD WINAPI jc_lane_main(LPVOID p)
++{
++    JcLaneArg* a = (JcLaneArg*)p;
++    JcPool* pl = a->pool;
++    const int lane = a->lane;
++    ps3_thread_name("spurs jc lane %d", lane);
++    spurs_job_set_spu_num(lane == 0 ? 0u : (u32)lane + 1u);
++    for (;;) {
++        AcquireSRWLockExclusive(&pl->lock);
++        while (pl->qh == pl->qt && !pl->quit)
++            SleepConditionVariableSRW(&pl->cv_work, &pl->lock, INFINITE, 0);
++        if (pl->qh == pl->qt) { ReleaseSRWLockExclusive(&pl->lock); break; }
++        u32 job = pl->q[pl->qh % JC_POOL_Q].job_ea;
++        int idx = pl->q[pl->qh % JC_POOL_Q].idx;
++        pl->qh++;
++        WakeAllConditionVariable(&pl->cv_done);          /* queue space */
++        ReleaseSRWLockExclusive(&pl->lock);
++
++        u64 t0 = jc_prof_on() ? jc_now_ns() : 0;
++        { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = pl->jc_ea; }
++        jc_run_one_job(job, idx, pl->size_desc);
++        /* Signal here, on the lane: the job's mailbox answer is in this
++         * thread's TLS (g_spurs_job_mbox*), as it is on the walker inline. */
++        jc_signal_done(pl->jc_ea, idx);
++        u64 d = t0 ? jc_now_ns() - t0 : 0;
++
++        AcquireSRWLockExclusive(&pl->lock);
++        pl->busy_ns += d;
++        pl->outstanding--;
++        WakeAllConditionVariable(&pl->cv_done);
++        ReleaseSRWLockExclusive(&pl->lock);
++    }
++    return 0;
++}
++
++static JcPool* jc_pool_create(u32 jc_ea, u32 size_desc, int nlanes)
++{
++    JcPool* pl = (JcPool*)calloc(1, sizeof *pl);
++    if (!pl) return NULL;
++    InitializeSRWLock(&pl->lock);
++    InitializeConditionVariable(&pl->cv_work);
++    InitializeConditionVariable(&pl->cv_done);
++    pl->jc_ea = jc_ea; pl->size_desc = size_desc;
++    for (int i = 0; i < nlanes; i++) {
++        long k = InterlockedIncrement(&s_jc_lane_arg_next) - 1;
++        JcLaneArg* a = &s_jc_lane_args[(unsigned long)k % (MAX_JOBCHAINS * JC_LANES_MAX)];
++        a->pool = pl; a->lane = i;
++        /* Lifted SPU code recurses on the host stack, as on the walker. */
++        pl->th[i] = CreateThread(NULL, 64u << 20, jc_lane_main, a,
++                                 STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
++        if (!pl->th[i]) break;
++        pl->nlanes++;
++    }
++    if (!pl->nlanes) { free(pl); return NULL; }
++    return pl;
++}
++
++/* Submit one job to the lanes, blocking while the queue is full. */
++static void jc_pool_submit(JcPool* pl, u32 job, int idx)
++{
++    AcquireSRWLockExclusive(&pl->lock);
++    while (pl->qt - pl->qh >= JC_POOL_Q)
++        SleepConditionVariableSRW(&pl->cv_done, &pl->lock, INFINITE, 0);
++    pl->q[pl->qt % JC_POOL_Q].job_ea = job;
++    pl->q[pl->qt % JC_POOL_Q].idx = idx;
++    pl->qt++;
++    pl->outstanding++;
++    WakeAllConditionVariable(&pl->cv_work);
++    ReleaseSRWLockExclusive(&pl->lock);
++}
++
++static void jc_pool_wait_idle(JcPool* pl)
++{
++    AcquireSRWLockExclusive(&pl->lock);
++    while (pl->outstanding > 0)
++        SleepConditionVariableSRW(&pl->cv_done, &pl->lock, INFINITE, 0);
++    ReleaseSRWLockExclusive(&pl->lock);
++}
++
++static void jc_pool_destroy(JcPool* pl)
++{
++    if (!pl) return;
++    jc_pool_wait_idle(pl);
++    AcquireSRWLockExclusive(&pl->lock);
++    pl->quit = 1;
++    WakeAllConditionVariable(&pl->cv_work);
++    ReleaseSRWLockExclusive(&pl->lock);
++    for (int i = 0; i < pl->nlanes; i++)
++        if (pl->th[i]) { WaitForSingleObject(pl->th[i], INFINITE); CloseHandle(pl->th[i]); }
++    free(pl);
++}
++
++/* Walker-side state for one jc_execute. */
++typedef struct {
++    int lanes;            /* 1 = serial */
++    JcPool* pool;
++    u32 jc_ea, size_desc;
++    u32 pending_job;      /* a job not started yet (0 = none) */
++    int pending_idx;
++    int batch_open;       /* jobs submitted to the lanes since the last barrier */
++    JcProf* prof;         /* JC_PROF counters of the walker (NULL = off) */
++    u64 busy_seen;        /* pool->busy_ns already added to prof */
++} JcPar;
++
++/* Fold the lanes' busy time into the walker's JC_PROF window. */
++static void jc_par_prof_sync(JcPar* jp)
++{
++    if (!jp->prof || !jp->pool) return;
++    u64 b = jp->pool->busy_ns;            /* racy read; profiling only */
++    jp->prof->pool_busy_ns += b - jp->busy_seen;
++    jp->busy_seen = b;
++}
++
++static void jc_par_run_inline(JcPar* jp, u32 job, int idx)
++{
++    { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jp->jc_ea; }
++    jc_run_one_job(job, idx, jp->size_desc);
++    jc_signal_done(jp->jc_ea, idx);
++}
++
++static void jc_par_submit(JcPar* jp, u32 job, int idx)
++{
++    if (!jp->pool) jp->pool = jc_pool_create(jp->jc_ea, jp->size_desc, jp->lanes);
++    if (!jp->pool) { jc_par_run_inline(jp, job, idx); return; }
++    jc_pool_submit(jp->pool, job, idx);
++    jp->batch_open = 1;
++    if (jp->prof) jp->prof->pool_jobs++;
++}
++
++/* A JOB command: run it inline (serial), hold it (it may be alone before the
++ * next barrier, so the walker runs it itself), or hand it to the lanes. */
++static void jc_par_job(JcPar* jp, u32 job, int idx)
++{
++    if (jp->lanes <= 1) { jc_par_run_inline(jp, job, idx); return; }
++    if (jp->batch_open) { jc_par_submit(jp, job, idx); return; }
++    if (!jp->pending_job) { jp->pending_job = job; jp->pending_idx = idx; return; }
++    /* Second job before any barrier: this stretch runs in parallel. */
++    jc_par_submit(jp, jp->pending_job, jp->pending_idx);
++    jp->pending_job = 0;
++    jc_par_submit(jp, job, idx);
++}
++
++/* Start a held job without waiting (the chain is about to park: the PPU will
++ * append more while it runs). */
++static void jc_par_release(JcPar* jp)
++{
++    if (!jp->pending_job) return;
++    u32 job = jp->pending_job; int idx = jp->pending_idx;
++    jp->pending_job = 0;
++    if (jp->batch_open || jp->lanes > 1) jc_par_submit(jp, job, idx);
++    else jc_par_run_inline(jp, job, idx);
++}
++
++/* A barrier: every job before it has finished when this returns. */
++static void jc_par_barrier(JcPar* jp)
++{
++    if (jp->pending_job) {
++        u32 job = jp->pending_job; int idx = jp->pending_idx;
++        jp->pending_job = 0;
++        if (jp->batch_open) jc_par_submit(jp, job, idx);
++        else jc_par_run_inline(jp, job, idx);
++    }
++    if (jp->batch_open && jp->pool) {
++        u64 t0 = jp->prof ? jc_now_ns() : 0;
++        jc_pool_wait_idle(jp->pool);
++        if (jp->prof) jp->prof->barrier_ns += jc_now_ns() - t0;
++    }
++    jp->batch_open = 0;
++}
++
++static void jc_execute_body(u32 entry_ea, u32 jc_ea, u32 size_desc, JcPar* jp);
++
+ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+ {
++    JcPar jp; memset(&jp, 0, sizeof jp);
++    jp.lanes = jc_parallel_lanes();
++    jp.jc_ea = jc_ea; jp.size_desc = size_desc;
++    jc_execute_body(entry_ea, jc_ea, size_desc, &jp);
++    jp.prof = NULL;                   /* the body's counters are gone */
++    jc_par_barrier(&jp);             /* whatever is still queued finishes */
++    jc_pool_destroy(jp.pool);
++}
++
++static void jc_execute_body(u32 entry_ea, u32 jc_ea, u32 size_desc, JcPar* jp)
++{
+     u32 pc = entry_ea, ret_pc = 0;
+     int jobs = 0;
++    JcProf prof; memset(&prof, 0, sizeof prof);
++    const int pon = jc_prof_on();
++    if (pon) jp->prof = &prof;
+     /* Bound IDLE steps, not total steps. A SPURS job chain is frequently a
+      * SERVICE LOOP -- guard, job, sync, next, repeat -- and is meant to run for
+      * the lifetime of the subsystem. A flat cap on total commands therefore
+@@ -3127,29 +3432,68 @@
+         u32 ext = (u32)(cmd & 127);
+ 
+         if (cmd != 0 && op == 0) {                    /* JOB */
+-            { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
+             int idx = jobs++;
+-            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
+-            idle = 0;                    /* real work: the chain is healthy */
+-            /* Signal per JOB, not per lap. The application waits once for each
+-             * unit of work it queued -- this title notified the guard 7 times
+-             * and sat in event_queue_receive 30 times -- so batching the
++            u64 pj0 = pon ? jc_now_ns() : 0;
++            /* Runs it inline, holds it, or hands it to a lane (see JcPar).
++             * Signal per JOB, not per lap -- the application waits once for
++             * each unit of work it queued (this title notified the guard 7
++             * times and sat in event_queue_receive 30 times), so batching the
+              * completion into one event per pass leaves it waiting for
+-             * completions that, from its point of view, never arrive. */
+-            jc_signal_done(jc_ea, idx);
++             * completions that, from its point of view, never arrive. The
++             * signal is sent by whoever runs the job, right after it. */
++            jc_par_job(jp, (u32)(cmd & ~7ull), idx);
++            if (pon) { u64 d = jc_now_ns() - pj0;   /* inline jobs only */
++                       prof.job_ns += d; prof.jobs++; prof.cur_run++;
++                       u32 bin = (u32)(vm_read64((u32)(cmd & ~7ull)) & ~7ull);
++                       int k = 0;
++                       for (; k < prof.nbin; k++) if (prof.bin[k] == bin) break;
++                       if (k == prof.nbin && k < 8) { prof.bin[k] = bin; prof.nbin++; }
++                       if (k < 8) { prof.bin_ns[k] += d; prof.bin_n[k]++; }
++                       jc_par_prof_sync(jp);
++                       jc_prof_maybe_print(&prof, jc_ea); }
++            idle = 0;                    /* real work: the chain is healthy */
+             pc += 8; continue;
+         }
++        /* Barrier commands: every earlier job finishes first. NEXT, RESET_PC,
++         * CALL and RET only move the read pointer, and a NOP is nothing.
++         * GUARD is not a barrier either: it holds back what comes AFTER it
++         * until the PPU notifies, while jobs already dispatched keep running
++         * on their SPUs (completion is only awaited by SYNC/LWSYNC). Hot Shots
++         * Golf's Spu.cpp chain is JOB, GUARD, JOB, GUARD ... with the guard
++         * notified ahead, and the main thread waits (func_00871E30) for a
++         * counter job after a SYNC behind ~100 of those ~9 ms jobs; treating
++         * GUARD as a barrier ran them one at a time. */
++        if (cmd != 0 && op != 1 && op != 3 && op != 4 &&
++            !(op == 7 && ext == (7 | (14 << 3))) &&
++            !(op == 7 && ext == (7 | (1 << 3)))) {
++            if (pon && jp->pending_job && !jp->batch_open) prof.brk[ext]++;
++            jc_par_barrier(jp);
++        }
+         /* A NEXT or RESET_PC that targets its own slot is the chain parking:
+          * the PPU appends work by overwriting that slot with a jump to a new
+          * list. On hardware the job manager keeps re-reading it. Poll the slot
+          * instead of counting it as idle, or the chain dies after 4096 reads
+          * and every later job the title queues is never run. */
++        if (pon && cmd != 0) {
++            jc_prof_end_run(&prof);
++            if (op == 2) prof.syncs++;
++        }
+         if ((op == 1 || op == 3) && (u32)(cmd & ~7ull) == pc) {
+             unsigned spins = 0;
++            u64 pp0 = pon ? jc_now_ns() : 0;
++            /* Start a held job before parking; what is already on the lanes
++             * keeps running while the PPU appends (parking is not a barrier). */
++            jc_par_release(jp);
+             while (vm_read64(pc) == cmd) {
+                 if (t_jc_stop && *t_jc_stop) return;
+                 if (++spins < 200) SwitchToThread(); else Sleep(1);
++                if (pon && (spins & 255) == 0) {
++                    u64 n = jc_now_ns(); prof.park_ns += n - pp0; pp0 = n;
++                    jc_par_prof_sync(jp);
++                    jc_prof_maybe_print(&prof, jc_ea);
++                }
+             }
++            if (pon) prof.park_ns += jc_now_ns() - pp0;
+             idle = 0; continue;
+         }
+         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
+@@ -3172,7 +3516,11 @@
+         }
+         if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
+             u32 g_ea = (u32)(cmd & ~127ull);
++            u64 pg0 = pon ? jc_now_ns() : 0;
++            /* A held job starts now: it must not wait on the guard. */
++            jc_par_release(jp);
+             if (!jg_wait(g_ea)) return;                  /* still closed */
++            if (pon) prof.guard_ns += jc_now_ns() - pg0;
+             pc += 8; continue;
+         }
+         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /

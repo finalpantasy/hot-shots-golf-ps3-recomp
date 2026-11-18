@@ -420,3 +420,15 @@ On the worker's report: verify FPS in the demo and the round, commit `0027`, the
 ### Exact next action
 
 On the worker's report: verify the round gets past "Now Loading", commit, then send swing input.
+
+## 2026-11-18 run 23: round reaches the tee, patch 0028
+
+- Worker `a85b98713035368ac` finished. Cause: main thread (tid 1) spins in `func_00871E30` (`sys_timer_usleep(1)`) until the counter at obj+0x304 equals obj+0x300; the counter job sits behind a SYNC with about 100 jobs of binary `0x00CB1F80` (9 to 10 ms each) on chain `0x11041700`, and the walker ran them serially.
+- Fix in `libs/spurs/cellSpurs.c`: parallel lanes (default 4, `JC_PARALLEL=1` serial, max 8). SYNC, END, ABORT, FLUSH, JOBLIST wait for earlier jobs; NEXT, RESET_PC, CALL, RET, GUARD and parking do not. Closed guards still wait until shutdown.
+- Patches: `0028-round-stall.patch` (`ppu_loader.cpp`, `sys_timer.c`, `cellGcmSys.c` GCM_REF_PACE_US/GCM_REFPROF hunk, `cellSpurs.c`; base HEAD+0002 for cellSpurs, HEAD+0008+0027 for cellGcmSys) and `0023` re-exported with JQ_PROF.
+- Result: 1.0 FPS to about 3.5 FPS (7 to 8 rendered frames per 2 s, 7600 to 8700 draws), wait episodes 890 ms to 165 ms, tee shot reached at about 470 s wall time. Capture `docs/images/tee-shot-2026-11-18.png`. Last marker line: `bctr=0 nullcall=0 regist=0 stars=0 unresNID=0 unresCall=0 garbage=0 887A=0 lines=18834`.
+- Not verified: GUARD semantics on hardware; why RSX_PROF's presented-frame counter reads 0; black course background; `JC_PARALLEL=5`; swing input; patch replay by Codex.
+
+### Exact next action
+
+Two workers, serialized by BUILD.lock: (1) why job `0x00CB1F80` costs 10 ms per run; (2) black course in the round and the presented-frame counter. Then swing input.

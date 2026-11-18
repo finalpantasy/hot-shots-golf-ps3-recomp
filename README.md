@@ -12,6 +12,8 @@ The title screen, drawn by the port and captured 2026-11-17. The dark squares at
 
 ![The Challenge course select screen showing Maple Leaf Golf Club, reached with scripted button presses](docs/images/course-select-2026-11-18.png)
 
+![The first tee of a round: the golfer, the ball and the shot HUD are drawn, the course behind them is nearly black](docs/images/tee-shot-2026-11-18.png)
+
 The attract demo that follows the title, captured the same day. The course geometry and HUD draw. The lighting is too dark, the sky and part of the ground are missing, and stray light-blue triangles appear.
 
 ## Status
@@ -31,7 +33,7 @@ Updated 2026-11-17.
 | Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout. Terrain is too dark |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
 | Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course", at 13 to 25 FPS |
-| Playing a round | The round loads and the game runs, but at about 1 frame per second with "Now Loading" still on screen. Not playable |
+| Playing a round | The round loads and reaches the first tee with the character, ball and shot HUD drawn. The course behind them is nearly black and it runs at about 3.5 frames per second. No swing has been made. Not playable |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 

@@ -1,8 +1,8 @@
 diff --git a/libs/spurs/cellSpursJq.c b/libs/spurs/cellSpursJq.c
-index ffb6e54..2756966 100644
+index ffb6e54..4a83a3d 100644
 --- a/libs/spurs/cellSpursJq.c
 +++ b/libs/spurs/cellSpursJq.c
-@@ -1,273 +1,626 @@
+@@ -1,273 +1,675 @@
  /*
   * ps3recomp - cellSpursJq HLE implementation
   *
@@ -84,6 +84,32 @@ index ffb6e54..2756966 100644
 +    return pthread_cond_timedwait(&s_cv, &s_lock, &ts) == ETIMEDOUT ? 0 : 1;
 +}
 +#endif
++
++/* JQ_PROF=1: every ~2 s the worker prints how long it ran jobs and how long the
++ * guest sat blocked in a full-queue push or a Sync, so a slow frame can be
++ * attributed to job run time versus a missing wakeup. */
++static int jq_prof_on(void)
++{
++    static int v = -1;
++    if (v < 0) v = getenv("JQ_PROF") ? 1 : 0;
++    return v;
++}
++static double jq_now_ms(void)
++{
++#ifdef _WIN32
++    static LARGE_INTEGER f;
++    LARGE_INTEGER c;
++    if (!f.QuadPart) QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
++#else
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++#endif
++}
++/* Guarded by s_lock. */
++static double s_prof_t0, s_prof_run_ms, s_prof_run_max, s_prof_push_ms, s_prof_sync_ms;
++static unsigned s_prof_jobs, s_prof_push_waits, s_prof_syncs;
  
 -/* Internal state */
 +/* ---------------------------------------------------------------------------
@@ -249,9 +275,26 @@ index ffb6e54..2756966 100644
 +        JqJob j = q->ring[q->head % CELL_SPURS_JQ_RING];
 +        jq_unlock();
 +
++        double t_run = jq_prof_on() ? jq_now_ms() : 0.0;
 +        int rc = jq_run_job(q, &j);
 +
 +        jq_lock();
++        if (jq_prof_on()) {
++            double now = jq_now_ms(), d = now - t_run;
++            s_prof_run_ms += d; s_prof_jobs++;
++            if (d > s_prof_run_max) s_prof_run_max = d;
++            if (!s_prof_t0) s_prof_t0 = now;
++            if (now - s_prof_t0 >= 2000.0) {
++                fprintf(stderr, "[cellSpursJq] prof %.1fs: %u job(s) run %.0f ms (avg %.2f max %.2f) | "
++                        "guest blocked: push %u wait(s) %.0f ms, sync %u call(s) %.0f ms | queued %llu\n",
++                        (now - s_prof_t0) / 1000.0, s_prof_jobs, s_prof_run_ms,
++                        s_prof_jobs ? s_prof_run_ms / s_prof_jobs : 0.0, s_prof_run_max,
++                        s_prof_push_waits, s_prof_push_ms, s_prof_syncs, s_prof_sync_ms,
++                        (unsigned long long)(q->tail - q->head));
++                s_prof_t0 = now; s_prof_run_ms = s_prof_run_max = s_prof_push_ms = s_prof_sync_ms = 0;
++                s_prof_jobs = s_prof_push_waits = s_prof_syncs = 0;
++            }
++        }
 +        q->head++;
 +        q->done++;
 +        if (rc > 0) q->ran++; else if (rc == 0) q->missed++; else q->skipped++;
@@ -341,10 +384,13 @@ index ffb6e54..2756966 100644
 +
 +    jq_lock();
 +    JqQueue* q = &s_q[qslot];
++    double t_wait = 0.0;
 +    while (q->in_use && !q->shutdown && q->tail - q->head >= CELL_SPURS_JQ_RING) {
 +        if (!blocking) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_AGAIN; }
++        if (jq_prof_on() && !t_wait) t_wait = jq_now_ms();
 +        jq_wait_ms(1000);
 +    }
++    if (t_wait) { s_prof_push_ms += jq_now_ms() - t_wait; s_prof_push_waits++; }
 +    if (!q->in_use || q->shutdown) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_STAT; }
 +    JqJob* j = &q->ring[q->tail % CELL_SPURS_JQ_RING];
 +    j->job_ea = job;
@@ -685,11 +731,14 @@ index ffb6e54..2756966 100644
 +    u64 start_done = s_p[pi].done;
 +    if (flag && s_p[pi].done < target) { jq_unlock(); return (s32)CELL_SPURS_JOB_ERROR_BUSY; }
 +    unsigned waited_s = 0;
++    double t_sync = jq_prof_on() ? jq_now_ms() : 0.0;
++    if (jq_prof_on()) s_prof_syncs++;
 +    while (s_p[pi].in_use && s_p[pi].done < target) {
 +        if (!jq_wait_ms(1000) && ++waited_s % 5 == 0)
 +            fprintf(stderr, "[cellSpursJq] Port2Sync(port=0x%08X) still waiting after %us: done=%llu of %llu\n",
 +                    port, waited_s, (unsigned long long)s_p[pi].done, (unsigned long long)target);
 +    }
++    if (t_sync) s_prof_sync_ms += jq_now_ms() - t_sync;
 +    int qi = s_p[pi].q;
 +    u64 ran = s_q[qi].ran, missed = s_q[qi].missed;
 +    jq_unlock();
