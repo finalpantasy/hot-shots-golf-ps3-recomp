@@ -432,3 +432,7 @@ On the worker's report: verify the round gets past "Now Loading", commit, then s
 ### Exact next action
 
 Two workers, serialized by BUILD.lock: (1) why job `0x00CB1F80` costs 10 ms per run; (2) black course in the round and the presented-frame counter. Then swing input.
+
+Workers started 03:25 (both Opus; reasons: SPU lifter and SPURS timing across systems; shader and RSX state diagnosis):
+- `afb1e7562b35a3ce0` owns `libs/spurs/**`, `runtime/spu/**`, `tools/spu*`, lifted SPU output; output `0029-spu-job-speed.patch`.
+- `aef6cb937ffc4a2cd` owns `libs/video/**`; output `0029` or `0030-rsx-course-lighting.patch`.
