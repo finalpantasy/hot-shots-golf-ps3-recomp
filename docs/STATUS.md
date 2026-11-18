@@ -179,3 +179,13 @@ Scripted Cross presses in the round start the swing gauge and the club moves. Th
 Scripted presses were held for 40 pad polls each, so presses close together read as one long press and the swing was cancelled. `PAD_SCRIPT_HOLD` now sets the hold length (patch `0032`). With 5-poll presses in groups of three, the game plays shots: the gauge runs, the ball is hit, a "Replay" prompt appears, and the remaining distance goes from 316 to 292 to 237 yards with the club changing from the driver to a 3 iron. Captures are `docs/images/round-tee-2026-11-18.png` and `docs/images/round-second-shot-2026-11-18.png`.
 
 Still wrong: the close-up with the big ball has a black background, and one capture of it had a white background with purple grass. No real controller has been tried.
+
+## 2026-11-18 update 19: a hole is finished, scene drawn in full
+
+Patch `0031` fixes three rendering faults. The tee close-up was black because the game copies the previous frame from a display buffer the backend never filled; draws that sample a display buffer now read a copy of the backbuffer (`RSX_DISP_TEX`, on by default). Water, bunker rims and the ground were flat cyan because the shadow pass filled the vertex buffer and the 2048-draw limit, so the main pass was cut off. The vertex buffer now holds 1,572,864 vertices (768 MB, halved if the allocation fails) and the draw limit is 4096. The same overflow left frames with nothing to present; presented frames now match the game's flips within 2 per 2-second window.
+
+With the whole scene drawn, views with 1800 to 2300 draws run at 19 to 32 FPS and lighter views at 40 to 60 FPS.
+
+A scripted round (boot `swing3`, 440 seconds) finished hole 1, a par 4, at +4, showed the leaderboard and started hole 2. Captures are `docs/images/round-leaderboard-2026-11-18.png`, `docs/images/round-swing-2026-11-18.png` and `docs/images/tee-closeup-2026-11-18.png`.
+
+Still wrong: the grass block under the ball is often drawn as a large stretched shape, in green, gray or black and white, covering the swing gauge. A few close-up frames are black because a depth restore reads zero. 8 draws were dropped in one run. The 768 MB buffer has not been tried on a machine with little memory. No real controller has been tried.

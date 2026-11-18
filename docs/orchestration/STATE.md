@@ -469,3 +469,14 @@ Rendering worker on the tee close-up background and cyan surfaces; coordinator r
 ### Exact next action
 
 On the rendering worker's report: check captures, commit 0031, re-run the swing script to see the close-up. Then: finish a hole by script, compile `ppu_recomp_063.cpp` at -O1 outside the build cap if allowed, refresh the handoff.
+
+## 2026-11-18 run 27: hole 1 finished, patch 0031
+
+- Worker `ac91f4a86f53392c4` (Opus) finished. `0031-rsx-scene-persist.patch` (`libs/video`, base HEAD + 0005/0008/0024/0026/0027/0030): `RSX_DISP_TEX` (display-buffer samples read a backbuffer copy), vertex buffer 1,572,864 vertices (768 MB), draw limit 4096, `batch_room` early offscreen flush. Its captures: scratchpad `persist\`.
+- Boot `swing3` (same script as `swing2`, 41 triples, 440 s): hole 1 par 4 finished +4, leaderboard, hole 2 tee. Marker all zero, 20368 log lines. Strip: scratchpad `swing3-strip.png`.
+- Open faults: lie block under the ball drawn as a large stretched shape (present before 0031 per the worker); black close-up frames from a zero depth restore; 8 dropped draws in 2 batches; heavy views 19 to 32 FPS.
+- Not verified: 768 MB buffer on low-memory machines; same-course FPS against the old build; real controller.
+
+### Exact next action
+
+Start a rendering worker on the stretched lie block and the black depth-restore frames (owns `libs/video/**`, output `0033`). Tell Codex to add 0031 and 0032 to the patch replay and expose `RSX_DISP_TEX`, `PAD_SCRIPT_HOLD`, `JC_PARALLEL`, `RSX_SHADER_CACHE` as CLI flags. Refresh the handoff.

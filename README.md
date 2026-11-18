@@ -18,6 +18,8 @@ The title screen, drawn by the port and captured 2026-11-17. The dark squares at
 
 ![The round after two scripted shots: a bunker, a waterfall and the course from the ball position](docs/images/round-second-shot-2026-11-18.png)
 
+![The leaderboard after the first hole of a scripted round](docs/images/round-leaderboard-2026-11-18.png)
+
 The attract demo that follows the title, captured the same day. The course geometry and HUD draw. The lighting is too dark, the sky and part of the ground are missing, and stray light-blue triangles appear.
 
 ## Status
@@ -31,13 +33,13 @@ Updated 2026-11-17.
 | Build a native executable | Done: one 276 MB `.exe`, no extra DLLs |
 | Boot | Runs to the title screen in about a minute. Both SPURS instances start and game archives load |
 | SPU jobs | 16 jobs lifted. No job seen so far is missing; the last one lifted has not run yet |
-| Rendering | The title, menus and course draw. The title runs at about 60 FPS and course scenes at 18 to 50 FPS |
+| Rendering | The title, menus and course draw. The title runs at about 60 FPS and course scenes at 19 to 60 FPS |
 | Intro movie | Skipped. The player reports the movie as finished because there is no video decoder |
 | Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
-| Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout, lit terrain with tree shadows. Some water and bunker edges are flat cyan |
+| Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout, lit terrain with tree shadows. |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
 | Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course" |
-| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots: the swing gauge runs, the ball is hit and the remaining distance drops from 316 to 292 to 237 yards. The tee close-up has a black background and one capture shows wrong colors. Not tested with a real controller |
+| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots: the swing gauge runs, the ball is hit and the first hole (par 4) is finished at +4, the leaderboard shows, and hole 2 starts. The grass block under the ball is often drawn as a large stretched shape that covers the swing gauge, and a few close-up frames are black. Not tested with a real controller |
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 
 ## What is in this repository
