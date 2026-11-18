@@ -277,3 +277,9 @@ A/B on one build with the switches off, then on: title 1.68 to 1.12 cores and 1,
 Each vertex used to take 256 bytes, 16 slots whatever the shader read. Patch `0042` stores only the attributes the vertex program reads, about 115 bytes per vertex on a course, and the vertex buffer grows in steps to at most 384 MB instead of 768 MB. Each SPU job also builds its 256 KB local store in place instead of in a separate zeroed buffer. Switches: `RSX_VB_PACK=0`, `RSX_VB_PACK_CAP_MB=<n>`, `RSX_VB_PACK_STATS=1`, `SPU_JOB_REUSE=0`.
 
 A/B over a 450-second scripted round on one build, packing off, then on: course private memory 1,886 to 1,494 MB, working set 1,626 to 1,223 MB, peak private 1,920 to 1,615 MB, title 1,177 to 1,010 MB. CPU and FPS did not change (about 2.3 cores and 32 FPS on the course). Hole 1 and hole 2 render the same either way; the runs are not frame-identical, so this is a visual match, not a pixel match.
+
+## 2026-11-18 update 30: offline imports from Codex (patch 0043)
+
+Patch `0043` applies three of Codex's proposals: seven offline `sceNpTus` imports, five `cellSsl` getters, and syscall 988 returning `CELL_ENOSYS` for a null buffer instead of reading address zero. Only the `cellL10n.c` half of the UCS-2 proposal is in; its registrations belong in `port/stubs.cpp`, which Codex owns.
+
+Four 400-second scripted rounds ran on the patched build. Three ran the full time with every marker at zero; two of those reached hole 3 or later. One exited silently at about 255 seconds on hole 1, with no crash line in the log and no Windows error event. An unpatched run did not exit. The cause is unknown, so this exit is an open question, not a known regression.

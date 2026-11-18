@@ -1,0 +1,378 @@
+--- a/libs/font/cellL10n.c
++++ b/libs/font/cellL10n.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include "cellL10n.h"
++#include "../../runtime/ppu/ppu_memory.h"
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -551,3 +552,78 @@
+                           (u32)dst_code, dst, out_len, dst_len);
+     return rc;
+ }
++
++/* The PS3 bulk conversion exports have a separate status enum from the
++ * host-side codec helpers above. Lengths are guest-endian and count units. */
++enum {
++    L10N_CONVERSION_OK = 0,
++    L10N_SOURCE_ILLEGAL = 1,
++    L10N_DESTINATION_EXHAUSTED = 2,
++};
++
++static int l10n_guest_span(u32 address, u64 size)
++{
++    return size == 0 || (address && size <= (1ull << 32) - address);
++}
++
++static s32 l10n_conversion_stop(u32 src_len, u32 dst_len, u32 remaining,
++                                u32 written, s32 status)
++{
++    vm_write32(src_len, remaining);
++    vm_write32(dst_len, written);
++    return status;
++}
++
++s32 UCS2stoUTF8s(u32 src, u32 src_len, u32 dst, u32 dst_len)
++{
++    if (!l10n_guest_span(src_len, 4) || !l10n_guest_span(dst_len, 4))
++        return L10N_SOURCE_ILLEGAL;
++
++    const u32 count = vm_read32(src_len);
++    if (!l10n_guest_span(src, (u64)count * 2))
++        return l10n_conversion_stop(src_len, dst_len, count, 0, L10N_SOURCE_ILLEGAL);
++    const u32 capacity = dst && count ? vm_read32(dst_len) : UINT32_MAX;
++    u32 written = 0;
++    for (u32 i = 0; i < count; ++i) {
++        u8 bytes[3];
++        const u16 codepoint = vm_read16(src + i * 2);
++        const u32 size = (u32)encode_utf8(codepoint, bytes, sizeof(bytes));
++        if (size == 0)
++            return l10n_conversion_stop(src_len, dst_len, count - i, written, L10N_SOURCE_ILLEGAL);
++        if (size > capacity - written || (dst && !l10n_guest_span(dst, (u64)written + size)))
++            return l10n_conversion_stop(src_len, dst_len, count - i, written, L10N_DESTINATION_EXHAUSTED);
++        if (dst)
++            vm_memcpy_to(dst + written, bytes, size);
++        written += size;
++    }
++    vm_write32(dst_len, written);
++    return L10N_CONVERSION_OK;
++}
++
++s32 UTF8stoUCS2s(u32 src, u32 src_len, u32 dst, u32 dst_len)
++{
++    if (!l10n_guest_span(src_len, 4) || !l10n_guest_span(dst_len, 4))
++        return L10N_SOURCE_ILLEGAL;
++
++    const u32 count = vm_read32(src_len);
++    if (!l10n_guest_span(src, count))
++        return l10n_conversion_stop(src_len, dst_len, count, 0, L10N_SOURCE_ILLEGAL);
++    const u8* bytes = GUEST_PTR(src, const u8*);
++    const u32 capacity = dst && count ? vm_read32(dst_len) : UINT32_MAX;
++    u32 written = 0;
++    u32 consumed = 0;
++    while (consumed < count) {
++        u32 codepoint;
++        const u32 size = (u32)decode_utf8(bytes + consumed, count - consumed, &codepoint);
++        if (size == 0 || codepoint > 0xFFFF)
++            return l10n_conversion_stop(src_len, dst_len, count - consumed, written, L10N_SOURCE_ILLEGAL);
++        if (written == capacity || (dst && !l10n_guest_span(dst, ((u64)written + 1) * 2)))
++            return l10n_conversion_stop(src_len, dst_len, count - consumed, written, L10N_DESTINATION_EXHAUSTED);
++        if (dst)
++            vm_write16(dst + written * 2, (u16)codepoint);
++        ++written;
++        consumed += size;
++    }
++    vm_write32(dst_len, written);
++    return L10N_CONVERSION_OK;
++}
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3380,13 +3380,20 @@
+         ctx->gpr[3] = 0;
+         return;
+     }
+-    case 988:     /* sys_tty_write — canonical LV2 number (psdevwiki); some CRTs
+-                   * use this instead of 403. Same ABI. */
++    case 988:     /* Some CRTs also use this number for TTY writes. */
+     case 403: {   /* sys_tty_write(s32 ch, cptr buf, u32 len, ptr pwritelen) */
+         uint32_t ch   = (uint32_t)ctx->gpr[3];
+         uint32_t buf  = (uint32_t)ctx->gpr[4];
+         uint32_t len  = (uint32_t)ctx->gpr[5];
+         uint32_t pwl  = (uint32_t)ctx->gpr[6];
++        if (num == 988 && !buf) {
++            /* The two-argument PPU exception operation has no TTY buffer. */
++            static int logged = 0;
++            if (PS3_LOG_FIRST(logged, 8))
++                fprintf(stderr, "[ppu] syscall 988 PPU exception operation %u is unavailable\n", ch);
++            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003u; /* CELL_ENOSYS */
++            return;
++        }
+         uint32_t wlen = len;
+         if (wlen > 0x4000u) {   /* guard against garbage len (divergence dumps memory) */
+             static int n = 0;
+--- a/libs/network/sceNpTus.c
++++ b/libs/network/sceNpTus.c
+@@ -7,6 +7,8 @@
+  */
+ 
+ #include "sceNpTus.h"
++#include "sceNp.h"
++#include "np_psnr.h"
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdlib.h>
+@@ -17,7 +19,42 @@
+  * Internal state
+  * -----------------------------------------------------------------------*/
+ 
+-static int s_initialized = 0;
++static _Atomic int s_initialized = 0;
++
++enum {
++    TUS_TITLE_BASE = 0x7001,
++    TUS_TITLE_COUNT = 32,
++    TUS_COMMUNICATION_ID_SIZE = 12,
++    TUS_VARIABLE_SIZE = 120,
++    TUS_TRY_SET_OPTION_SIZE = 16,
++};
++
++#define TUS_COMM_INVALID_ARGUMENT 0x8002a104u
++#define TUS_COMM_TOO_MANY_OBJECTS 0x8002a107u
++#define TUS_COMM_INSUFFICIENT_ARGUMENT 0x8002a1a1u
++#define TUS_COMM_INVALID_ID 0x8002a1a3u
++#define TUS_COMM_INVALID_ONLINE_ID 0x8002a1a4u
++#define TUS_COMM_INVALID_ALIGNMENT 0x8002a1acu
++#define TUS_COMM_TOO_MANY_SLOT_IDS 0x8002a1b1u
++
++typedef struct {
++    int in_use;
++    u8 communication_id[TUS_COMMUNICATION_ID_SIZE];
++    SceNpCommunicationPassphrase passphrase;
++} TusTitleContext;
++
++static TusTitleContext s_title_ctx[TUS_TITLE_COUNT];
++static atomic_flag s_title_lock = ATOMIC_FLAG_INIT;
++
++static void lock_title_contexts(void)
++{
++    while (atomic_flag_test_and_set_explicit(&s_title_lock, memory_order_acquire)) {}
++}
++
++static void unlock_title_contexts(void)
++{
++    atomic_flag_clear_explicit(&s_title_lock, memory_order_release);
++}
+ 
+ typedef struct {
+     int in_use;
+@@ -78,7 +115,10 @@
+         }
+     }
+ 
++    lock_title_contexts();
+     s_initialized = 0;
++    memset(s_title_ctx, 0, sizeof(s_title_ctx));
++    unlock_title_contexts();
+     return CELL_OK;
+ }
+ 
+@@ -334,3 +374,128 @@
+     (void)reqId;
+     return CELL_OK;
+ }
++
++s32 sceNpTusCreateTitleCtx(const void* communicationId, const SceNpCommunicationPassphrase* passphrase,
++                          const SceNpId* selfNpId)
++{
++    lock_title_contexts();
++    s32 result = (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
++    if (s_initialized) {
++        result = (s32)TUS_COMM_INSUFFICIENT_ARGUMENT;
++        if (communicationId && passphrase && selfNpId) {
++            result = (s32)TUS_COMM_TOO_MANY_OBJECTS;
++            for (s32 i = 0; i < TUS_TITLE_COUNT; ++i) {
++                TusTitleContext* ctx = &s_title_ctx[i];
++                if (ctx->in_use)
++                    continue;
++                vm_memcpy_from(ctx->communication_id, GUEST_EA(communicationId), sizeof(ctx->communication_id));
++                vm_memcpy_from(&ctx->passphrase, GUEST_EA(passphrase), sizeof(ctx->passphrase));
++                ctx->in_use = 1;
++                result = TUS_TITLE_BASE + i;
++                break;
++            }
++        }
++    }
++    unlock_title_contexts();
++    return result;
++}
++
++s32 sceNpTusDestroyTitleCtx(s32 titleCtxId)
++{
++    const u32 index = (u32)titleCtxId - TUS_TITLE_BASE;
++    lock_title_contexts();
++    s32 result = (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
++    if (s_initialized) {
++        result = (s32)TUS_COMM_INVALID_ID;
++        if (index < TUS_TITLE_COUNT && s_title_ctx[index].in_use) {
++            memset(&s_title_ctx[index], 0, sizeof(s_title_ctx[index]));
++            result = CELL_OK;
++        }
++    }
++    unlock_title_contexts();
++    return result;
++}
++
++s32 sceNpTusCreateTransactionCtx(s32 titleCtxId)
++{
++    if (!s_initialized)
++        return (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
++    if (!np_psnr_enabled())
++        return (s32)TUS_COMM_INVALID_ONLINE_ID;
++    const u32 index = (u32)titleCtxId - TUS_TITLE_BASE;
++    lock_title_contexts();
++    const int valid = s_initialized && index < TUS_TITLE_COUNT && s_title_ctx[index].in_use;
++    unlock_title_contexts();
++    return valid ? (s32)CELL_ENOSYS : (s32)TUS_COMM_INVALID_ID;
++}
++
++s32 sceNpTusDestroyTransactionCtx(s32 transId)
++{
++    (void)transId;
++    if (!s_initialized)
++        return (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
++    return (s32)TUS_COMM_INVALID_ID;
++}
++
++static s32 validate_tus_slot_ids(const u32* slotIds, s32 count)
++{
++    if (count > SCE_NP_TUS_MAX_SLOT_NUM)
++        return (s32)TUS_COMM_TOO_MANY_SLOT_IDS;
++    for (s32 i = 0; i < count; ++i) {
++        if ((s32)vm_read32(GUEST_EA(slotIds) + (u32)i * 4) < 0)
++            return (s32)TUS_COMM_INVALID_ARGUMENT;
++    }
++    return CELL_OK;
++}
++
++static s32 tus_async_network_error(const SceNpId* targetNpId)
++{
++    if (!s_initialized)
++        return (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
++    if (!targetNpId)
++        return (s32)TUS_COMM_INSUFFICIENT_ARGUMENT;
++    return np_psnr_enabled() ? (s32)TUS_COMM_INVALID_ID : (s32)TUS_COMM_INVALID_ONLINE_ID;
++}
++
++s32 sceNpTusSetMultiSlotVariableAsync(s32 transId, const SceNpId* targetNpId, const u32* slotIds,
++                                     const s64* variables, s32 count, const void* option)
++{
++    (void)transId;
++    if (!slotIds || !variables)
++        return (s32)TUS_COMM_INSUFFICIENT_ARGUMENT;
++    if (count <= 0 || option)
++        return (s32)TUS_COMM_INVALID_ARGUMENT;
++    const s32 status = validate_tus_slot_ids(slotIds, count);
++    return status ? status : tus_async_network_error(targetNpId);
++}
++
++s32 sceNpTusGetMultiSlotVariableAsync(s32 transId, const SceNpId* targetNpId, const u32* slotIds,
++                                     void* variables, u32 variableSize, s32 count, const void* option)
++{
++    (void)transId;
++    if (!slotIds || !variables)
++        return (s32)TUS_COMM_INSUFFICIENT_ARGUMENT;
++    if (count <= 0 || option)
++        return (s32)TUS_COMM_INVALID_ARGUMENT;
++    if (variableSize != (u64)count * TUS_VARIABLE_SIZE)
++        return (s32)TUS_COMM_INVALID_ALIGNMENT;
++    const s32 status = validate_tus_slot_ids(slotIds, count);
++    return status ? status : tus_async_network_error(targetNpId);
++}
++
++s32 sceNpTusTryAndSetVariableAsync(s32 transId, const SceNpId* targetNpId, s32 slotId, s32 operation,
++                                   s64 value, void* variable, u32 variableSize, const void* option)
++{
++    (void)transId;
++    (void)operation;
++    (void)value;
++    if (!s_initialized)
++        return (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
++    if (!variable)
++        return (s32)TUS_COMM_INSUFFICIENT_ARGUMENT;
++    if (slotId < 0)
++        return (s32)TUS_COMM_INVALID_ARGUMENT;
++    if (variableSize != TUS_VARIABLE_SIZE || (option && vm_read32(GUEST_EA(option)) != TUS_TRY_SET_OPTION_SIZE))
++        return (s32)TUS_COMM_INVALID_ALIGNMENT;
++    return tus_async_network_error(targetNpId);
++}
+--- a/libs/network/cellSsl.c
++++ b/libs/network/cellSsl.c
+@@ -136,3 +136,39 @@
+ 
+     return CELL_OK;
+ }
++
++/* The offline backend never creates a peer certificate. Check the public ABI
++ * parameters without reading a guest handle or modifying failed outputs. */
++static s32 ssl_no_peer_certificate(const void* certificate, int has_output)
++{
++    if (!s_ssl_initialized)
++        return (s32)CELL_SSL_ERROR_NOT_INITIALIZED;
++    if (certificate && !has_output)
++        return (s32)CELL_SSL_ERROR_NO_BUFFER;
++    return (s32)CELL_SSL_ERROR_INVALID_CERTIFICATE;
++}
++
++s32 cellSslCertGetRsaPublicKeyModulus(const void* certificate, const u8** data, u64* length)
++{
++    return ssl_no_peer_certificate(certificate, data && length);
++}
++
++s32 cellSslCertGetRsaPublicKeyExponent(const void* certificate, const u8** data, u64* length)
++{
++    return ssl_no_peer_certificate(certificate, data && length);
++}
++
++s32 cellSslCertGetSubjectName(const void* certificate, const void** name)
++{
++    return ssl_no_peer_certificate(certificate, name != NULL);
++}
++
++s32 cellSslCertGetIssuerName(const void* certificate, const void** name)
++{
++    return ssl_no_peer_certificate(certificate, name != NULL);
++}
++
++s32 cellSslCertGetMd5Fingerprint(const void* certificate, u8* fingerprint, u32* length)
++{
++    return ssl_no_peer_certificate(certificate, fingerprint && length);
++}
+--- a/libs/network/cellSsl.h
++++ b/libs/network/cellSsl.h
+@@ -18,8 +18,10 @@
+ /* ---------------------------------------------------------------------------
+  * Error codes
+  * -----------------------------------------------------------------------*/
+-#define CELL_SSL_ERROR_NOT_INITIALIZED       0x80720101
+-#define CELL_SSL_ERROR_ALREADY_INITIALIZED   0x80720102
++#define CELL_SSL_ERROR_NOT_INITIALIZED       0x80740001
++#define CELL_SSL_ERROR_ALREADY_INITIALIZED   0x80740002
++#define CELL_SSL_ERROR_NO_BUFFER             0x80740004
++#define CELL_SSL_ERROR_INVALID_CERTIFICATE   0x80740005
+ #define CELL_SSL_ERROR_INVALID_ARG           0x80720103
+ #define CELL_SSL_ERROR_NO_MEMORY             0x80720104
+ #define CELL_SSL_ERROR_HANDSHAKE_FAILED      0x80720105
+@@ -43,6 +45,11 @@
+ s32 cellSslCertGetPublicKey(CellSslCertId certId, u8* key, u32* keySize);
+ s32 cellSslCertGetNotBefore(CellSslCertId certId, u64* time);
+ s32 cellSslCertGetNotAfter(CellSslCertId certId, u64* time);
++s32 cellSslCertGetRsaPublicKeyModulus(const void* certificate, const u8** data, u64* length);
++s32 cellSslCertGetRsaPublicKeyExponent(const void* certificate, const u8** data, u64* length);
++s32 cellSslCertGetSubjectName(const void* certificate, const void** name);
++s32 cellSslCertGetIssuerName(const void* certificate, const void** name);
++s32 cellSslCertGetMd5Fingerprint(const void* certificate, u8* fingerprint, u32* length);
+ 
+ /* Entropy / RNG */
+ s32 cellSslGetRandomNumber(u8* buf, u32 size);
