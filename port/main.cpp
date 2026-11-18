@@ -82,6 +82,7 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
  * into guest RAM and register their exports. stubs.cpp has the empty version
  * a game with no lifted PRX wants. */
 void     ps3_load_prx_modules(void);
+void     ps3_register_peripheral_imports(void);
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 int      cellGame_init_from_paramsfo(const char* sfo_path);   /* cellGame.c: 0 ok, -1 failed */
@@ -541,6 +542,8 @@ int main(int argc, char** argv)
     // cellSaveData uses the older variable for the same save tree.
     cli_setenv("PS3_GAMEDATA_ROOT", rp.savedata.c_str());
     cli_setenv("PS3_DEV_FLASH", firmware.c_str());
+    cli_setenv("PS3_CAMERA", "0");
+    cli_setenv("PS3_HTTP_OFFLINE", "1");
     cli_setenv("PS3_VERBOSE", std::to_string(rp.verbose).c_str());
     if (rp.verbose > 0)
         fprintf(stderr, "[boot] Verbose runtime logging enabled (PS3_VERBOSE=%d)\n", rp.verbose);
@@ -593,6 +596,7 @@ int main(int argc, char** argv)
     ppu_recomp_register();   /* lifted function table -> address map */
     ps3_load_prx_modules();  /* this game's lifted system PRX, if it has any */
     ppu_hle_init();          /* firmware import NID -> HLE handlers */
+    ps3_register_peripheral_imports();
     ppu_sysprx_register();   /* boot-critical CRT */
     ppu_fs_register();       /* cellFs over the game directory */
     lv2_init_syscalls();     /* the lv2 syscall table */

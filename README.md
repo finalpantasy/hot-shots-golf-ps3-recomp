@@ -2,7 +2,11 @@
 
 A native Windows port of the PS3 game Hot Shots Golf: World Invitational (US, `NPUA80864`, known as Everybody's Golf 6 outside North America), made by statically recompiling the PS3 executable to x86-64 with [ps3recomp](https://github.com/sp00nznet/ps3recomp). No emulator runs underneath it.
 
-**It is not playable yet.** The build compiles, starts, opens a D3D12 window and runs the game's boot code. It does not show a single frame of the game. Nothing here will let you play golf today.
+**It is not playable yet.** The build compiles, starts, opens a D3D12 window, runs the game's boot code and draws the first screen, the autosave notice. It gets no further. Nothing here will let you play golf today.
+
+![First frame: the autosave notice, drawn in blue only](docs/images/first-frame-2026-11-17.png)
+
+The first frame the port has drawn, captured 2026-11-17. Only the blue channel is shown, and the frame appears on about half of the boots.
 
 ## Status
 
@@ -14,8 +18,8 @@ Updated 2026-11-17.
 | Lift PPU code to C++ | Done: 33,221 functions |
 | Build a native executable | Done: one 446 MB `.exe`, no extra DLLs |
 | Boot | Runs. Both SPURS instances start and base game files are found |
-| SPU jobs | 6 jobs lifted, 2 seen running. At least 4 more are not lifted |
-| Rendering | Not working. With the base game files loaded, the RSX command stream is misread and the GPU device is lost. No game frame has been shown |
+| SPU jobs | 13 jobs lifted, 2 seen running. 2 known jobs are not lifted |
+| Rendering | First frame drawn: the autosave notice. Only the blue channel is shown, and about half of the boots stay black |
 | Menu, gameplay, audio, saves | Not reached |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).

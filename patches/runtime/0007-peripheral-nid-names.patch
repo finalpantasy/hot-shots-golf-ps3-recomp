@@ -1,0 +1,24 @@
+diff --git a/tools/nid_database.py b/tools/nid_database.py
+index a52e592..efbedc0 100644
+--- a/tools/nid_database.py
++++ b/tools/nid_database.py
+@@ -470,6 +471,19 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
+     ("sceNp", "sceNpBasicGetEvent"),                         # 0xe035f7d6 x4
+     ("sceNp", "sceNpBasicRegisterContextSensitiveHandler"),  # 0x4026eac5 x3
+     ("sceNp", "sceNpDrmIsAvailable"),                        # 0xad218faf x4
++    ("cellHttp", "cellHttpClientSetSslCallback"),
++    ("cellHttp", "cellHttpClientSetRecvTimeout"),
++    ("cellHttp", "cellHttpClientSetSendTimeout"),
++    ("cellHttp", "cellHttpClientSetUserAgent"),
++    ("cellHttp", "cellHttpClientSetConnTimeout"),
++    ("sceNp", "sceNpCustomMenuRegisterActions"),
++    ("sceNp", "sceNpCustomMenuActionSetActivation"),
++    ("cellFont", "cellFontEndLibrary"),
++    ("cellFont", "cellFontRenderSurfaceInit"),
++    ("cellFontFT", "cellFontInitLibraryFreeTypeWithRevision"),
++    ("libgem", "cellGemGetImageState"),
++    ("cellCamera", "cellCameraGetBufferInfoEx"),
++    ("sys_crashdump", "sys_crash_dump_set_user_log_area"),
+ ]
+ 
+ # ---------------------------------------------------------------------------

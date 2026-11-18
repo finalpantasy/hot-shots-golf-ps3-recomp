@@ -4,7 +4,7 @@ Updated 2026-11-17.
 
 - role: pinned-lead-orchestrator
 - owner: Claude (model `claude-fable-5-2`), Claude desktop Code tab session, taken over from the 2026-11-17 orchestrator handoff
-- active workers: none now. Three subagent workers ran on 2026-11-17 and are finished: `aa95d6ef8ed237dce` (Opus, SPURS job lift), `a6bda65c18d1ed768` (Sonnet, cellSpurs handler), `adb1a583227ccef48` (Sonnet, CLI flags and title ID). Each owned a disjoint file set. The orchestrator ran every build and boot.
+- active workers (2026-11-17, end of day): none. Finished: `aa95d6ef8ed237dce` (Opus, SPURS job lifts, 13 jobs), `a26eab669c91f3810` (Opus, GCM FIFO fix, patch `0008`), `a6bda65c18d1ed768` (Sonnet, cellSpurs handler), `adb1a583227ccef48` (Sonnet, CLI flags and title ID). Codex works from `CODEX-GOAL.md`.
 - ownership transfers: none since takeover.
 
 ## Milestone
@@ -213,3 +213,32 @@ Reading: the window-mode change is not the cause. With the base files visible th
 ### Exact next action
 
 Trace blocker 1. In parallel, a worker lifts the four jobs in blocker 2.
+
+## 2026-11-17 run 6: first guest frame, 13 jobs lifted
+
+Worker `a26eab669c91f3810` (finished) found two causes for the device loss, both in `external/ps3recomp/libs/video/` and exported as `patches/runtime/0008-gcm-fifo-default-ctx-repoint.patch`:
+
+- `cellGcmSetDefaultCommandBuffer` did not point `gCellGcmCurrentContext` back at the default context, so the FIFO walker read a stale buffer. `GCM_DEFAULT_CTX_REPOINT=0` restores the old behavior for comparison.
+- `scanout_auto_present` copied the 1600x1080 display buffer into the 1280x720 back buffer without scaling. `guest_fb_present` still has the same unclamped copy and is not fixed.
+
+Worker `aa95d6ef8ed237dce` (finished) lifted 7 more SPURS jobs, 13 in total (`tools/spu_jobs.json`). Not lifted: `0xCB1F80` (never dispatched) and `0xCAD980` (data inside code at `0x2C18`).
+
+Evidence:
+
+- Build `build/gcm-4198df92/`, log `boot-fix-1.02-gcm-3.log`: `887A0005` 0 (was 10), FIFO walker circling 0 (was 8), `=== SGX system initialize` reached and completed, window title `draws: 5`. The capture `docs/images/first-frame-2026-11-17.png` is the game's autosave notice over a course background. It is the first guest frame. Only the blue channel is shown.
+- Build `build/frame1-3d6db76d/` (13 jobs plus both fixes), log `boot-fix-1.02-frame1.log`: `887A0005` 0, FIFO walker 0, SGX initialize completed, `dispatch MISS` 0, 4 job entries. The capture is black. Thread 11 called a null pointer 5 times from `func_00936F24+0x19FE` and then 393 times from `func_007625E8+0x2C9`, each through `r12=0x48000084` (a code word used as a function descriptor), followed by garbage virtual calls.
+
+The black result is intermittent. Same markers per log: `gcm-2` 400 `bctr to NULL` (bad), `gcm-3` 0 (good), `codex-4` 0, `frame1` 400 (bad). Two of four runs fail, so the cause is a race and not the 7 new jobs alone. In the bad runs `r5` and `r28` hold `0x1218EA80`, the `soc-job` job chain.
+
+Seen in every run since SGX initialize was reached: `*** sgxbus.c(934) : failed to regist module`, printed right after the `soc-job` chain is created and run. Also `[hle] unresolved NID 0xA03EF587` (`libgem`, Codex's list) and `open FAIL` for `default.csv` (2).
+
+### Next blockers
+
+1. Thread 11 race: find what `func_00936F24` reads at `r9=0x1219BAC0` and who should have written it. Start with the `soc-job` chain and the `failed to regist module` message, since both involve `0x1218EA80`.
+2. Blue-only frame: red and green are zero in the presented image. Check the surface format and channel order in the scanout copy and the swap chain format in `rsx_d3d12_backend.c`.
+3. Seven newest jobs have not been seen running. Only two images entered in `frame1` (`494131663`, `311961058`).
+4. `spurs_port_queue` still returns the first instance's binding.
+
+### Exact next action
+
+Run `build/frame1-3d6db76d/` five times for 20 s each and record good or bad per run, to get the failure rate. Then trace `func_00936F24` around `+0x19FE` in `generated/fix-1.02/recompiled` to find the object whose function table is unset.

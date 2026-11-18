@@ -1,0 +1,129 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index f073f32..f4b042f 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -4559,13 +4559,38 @@ void cellGcmSetDefaultCommandBuffer(void)
+      * With the repoint: **0 overflows**, and the command packets reaching the
+      * draw engine go from 12,756 to 15,097 over the same five minutes. Still
+      * one title's evidence, so still opt-in -- but it is no longer unmeasured,
+-     * and a port whose title manages its own segments should try it. */
+-    if (getenv("GCM_DEFAULT_CTX_REPOINT") && s_gcm_ctx_out_ea && s_gcm_context_ea) {
+-        vm_write32(s_gcm_context_ea + 0x8, vm_read32(s_gcm_context_ea + 0x0));
++     * and a port whose title manages its own segments should try it.
++     *
++     * The repoint is now the default; the rewind is not. Hot Shots Golf WI
++     * builds command lists with libgcm_cmd's cellGcmSetCurrentBuffer, which
++     * points gCellGcmCurrentContext (0x018DAA18) at a static user context
++     * (0x018DAA08, begin=0x14A00220, callback 0) in its own mapped memory, then
++     * calls this entry to go back and CALL the list from the default ring.
++     * Left on the user context, its next cellGcmFlush published `put` inside
++     * the list (io 0x00600654) while `get` was in the default ring, the walker
++     * crossed 2 MB of zeroes looking for it ("FIFO walker circling"), resynced
++     * into the middle of the list and decoded pointers as commands; the D3D12
++     * device was removed at the first pipeline built from that state.
++     * RPCS3's cellGcmSetDefaultCommandBuffer writes the default context's
++     * address into the pointer _cellGcmInitBody was given and touches nothing
++     * else, so `current` keeps where the title left it: rewinding it would
++     * put new commands over ones `get` has not reached yet.
++     *
++     * GCM_DEFAULT_CTX_REPOINT=0 restores the old no-op; =1 keeps the
++     * repoint-plus-rewind measured on VF5. */
++    const char* rp = getenv("GCM_DEFAULT_CTX_REPOINT");
++    const int repoint = !(rp && rp[0] == '0');
++    const int rewind  = rp && rp[0] == '1';
++    if (repoint && s_gcm_ctx_out_ea && s_gcm_context_ea) {
++        if (rewind)
++            vm_write32(s_gcm_context_ea + 0x8, vm_read32(s_gcm_context_ea + 0x0));
++        const u32 was = vm_read32(s_gcm_ctx_out_ea);
+         vm_write32(s_gcm_ctx_out_ea, s_gcm_context_ea);
+-        printf("[cellGcmSys] SetDefaultCommandBuffer: repointed "
+-               "gCellGcmCurrentContext@0x%08X -> 0x%08X\n",
+-               s_gcm_ctx_out_ea, s_gcm_context_ea);
++        static int n = 0;
++        if (was != s_gcm_context_ea && PS3_LOG_FIRST(n, 4))
++            printf("[cellGcmSys] SetDefaultCommandBuffer: repointed "
++                   "gCellGcmCurrentContext@0x%08X 0x%08X -> 0x%08X%s\n",
++                   s_gcm_ctx_out_ea, was, s_gcm_context_ea, rewind ? " (rewound)" : "");
+     }
+ }
+ 
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 854739e..6fab695 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -4461,15 +4461,26 @@ static void scanout_auto_present(u32 fi)
+         return;
+     extern u8* vm_base;
+     if (!vm_base) return;
+-    const u32 up_pitch = (gw * 4u + 255u) & ~255u;   /* 256-byte rows */
++    /* The copy into the backbuffer is 1:1, and a source footprint larger than
++     * the backbuffer is an invalid CopyTextureRegion: the command list then
++     * fails to close and executing it removes the device
++     * (DXGI_ERROR_INVALID_CALL). Hot Shots Golf WI registers 1600x1080
++     * display buffers against a 1280x720 backbuffer and shows a few flips with
++     * no draws while loading, so its first one did exactly that. Shrink a
++     * buffer that does not fit (nearest sample, as scanout scales to the video
++     * mode); one that fits is copied unchanged, as before. */
++    const u32 dw = gw > s_d3d.width  ? s_d3d.width  : gw;
++    const u32 dh = gh > s_d3d.height ? s_d3d.height : gh;
++    if (!dw || !dh) return;
++    const u32 up_pitch = (dw * 4u + 255u) & ~255u;   /* 256-byte rows */
+     static ID3D12Resource* up = NULL;
+     static u32 up_w = 0, up_h = 0;
+-    if (!up || up_w != gw || up_h != gh) {
++    if (!up || up_w != dw || up_h != dh) {
+         if (up) { up->lpVtbl->Release(up); up = NULL; }
+         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+         D3D12_RESOURCE_DESC bd = {0};
+         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+-        bd.Width  = (u64)up_pitch * gh; bd.Height = 1;
++        bd.Width  = (u64)up_pitch * dh; bd.Height = 1;
+         bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+         bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+@@ -4478,7 +4489,7 @@ static void scanout_auto_present(u32 fi)
+                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                 &IID_ID3D12Resource, (void**)&up)))
+             return;
+-        up_w = gw; up_h = gh;
++        up_w = dw; up_h = dh;
+     }
+     /* RSX local memory is mapped at guest 0xC0000000. The guest is a
+      * big-endian PPC title: its 32-bit pixels land as A,R,G,B bytes, so
+@@ -4488,17 +4499,18 @@ static void scanout_auto_present(u32 fi)
+     { const u8* srow = vm_base + 0xC0000000u + off;
+       void* m = NULL; D3D12_RANGE nr = {0, 0};
+       if (FAILED(up->lpVtbl->Map(up, 0, &nr, &m)) || !m) return;
+-      for (u32 y = 0; y < gh; y++) {
+-          const u8* s = srow + (size_t)y * gpitch;
++      for (u32 y = 0; y < dh; y++) {
++          const u8* s = srow + (size_t)((u64)y * gh / dh) * gpitch;
+           u8* dp = (u8*)m + (size_t)y * up_pitch;
+-          for (u32 x = 0; x < gw; x++) {
+-              dp[x*4+0] = s[x*4+1];
+-              dp[x*4+1] = s[x*4+2];
+-              dp[x*4+2] = s[x*4+3];
++          for (u32 x = 0; x < dw; x++) {
++              const u8* p = s + (size_t)((u64)x * gw / dw) * 4u;
++              dp[x*4+0] = p[1];
++              dp[x*4+1] = p[2];
++              dp[x*4+2] = p[3];
+               dp[x*4+3] = 0xFF;
+           }
+       }
+-      D3D12_RANGE wr = {0, (SIZE_T)up_pitch * gh};
++      D3D12_RANGE wr = {0, (SIZE_T)up_pitch * dh};
+       up->lpVtbl->Unmap(up, 0, &wr); }
+ 
+     D3D12_RESOURCE_BARRIER gb = {0};
+@@ -4515,8 +4527,8 @@ static void scanout_auto_present(u32 fi)
+     sl.pResource = up; sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+     sl.PlacedFootprint.Offset = 0;
+     sl.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
+-    sl.PlacedFootprint.Footprint.Width    = gw;
+-    sl.PlacedFootprint.Footprint.Height   = gh;
++    sl.PlacedFootprint.Footprint.Width    = dw;
++    sl.PlacedFootprint.Footprint.Height   = dh;
+     sl.PlacedFootprint.Footprint.Depth    = 1;
+     sl.PlacedFootprint.Footprint.RowPitch = up_pitch;
+     s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dl, 0, 0, 0, &sl, NULL);

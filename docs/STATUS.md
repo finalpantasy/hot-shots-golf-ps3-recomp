@@ -75,3 +75,9 @@ Two ps3recomp SPURS bugs are fixed: port bindings shared across instances, and a
 ## 2026-11-17 update 4: six SPURS jobs lifted, base files found, GCM FIFO bug exposed
 
 Six SPURS jobs are lifted and registered. The runtime now finds base-install files for this PSN title. With those files visible the game takes a different early path and the RSX command stream is misparsed, which removes the D3D12 device. That FIFO bug is the current first blocker. Evidence and the A/B run: `docs/orchestration/STATE.md`.
+
+## 2026-11-17 update 5: first game frame
+
+Two fixes in the GCM code stopped the GPU device loss: the default command buffer is now selected correctly, and the 1600x1080 display buffer is scaled into the 1280x720 window. The game then finishes its graphics system setup and draws its autosave notice. See `docs/images/first-frame-2026-11-17.png`. Only the blue channel is shown.
+
+The frame does not appear on every boot. In two of four 20 second runs a game thread called through an unset function table and the window stayed black. 13 SPURS jobs are lifted, and two of them have been seen running. No menu, input, audio or gameplay yet.
