@@ -30,8 +30,8 @@ Updated 2026-11-17.
 | Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
 | Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout. Terrain is too dark |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
-| Menus | Scripted Cross presses go from the title through the clubhouse menu to the Challenge course select at 22 to 25 FPS |
-| Playing a round | Not verified |
+| Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course", at 13 to 25 FPS |
+| Playing a round | The round loads and the game runs, but at about 1 frame per second with "Now Loading" still on screen. Not playable |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 

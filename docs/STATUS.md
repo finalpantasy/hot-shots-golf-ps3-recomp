@@ -137,3 +137,7 @@ Open: course terrain is too dark. The shot screen has a black background behind 
 ## 2026-11-18 update 12: menus
 
 Scripted Cross presses (`PAD_SCRIPT` on frame counts) go from the title through the clubhouse menu ("Single Player", "Challenge") to the Challenge course select, which lists Maple Leaf Golf Club. Text, portraits and the 3D clubhouse draw at 22 to 25 FPS. Log `boot-fix-1.02-play-1.log`: 0 unresolved imports, 0 NULL calls. Starting a round is the next thing to try.
+
+## 2026-11-18 update 13: a round starts loading
+
+More scripted presses pick the course, the character (Yuna) and the shot type, and confirm "Go to Course". The round then loads: course sound files open, the job queue runs (4064 jobs, 0 misses), and the frame has 1143 draws. It runs at about 1 frame per second with "Now Loading" still on screen for the 150 seconds watched. Frame rate falls as draw count rises everywhere (277 draws: 20 to 36 FPS; 394: 13; 600 to 900: 9 to 14), so frame time in the renderer is the next thing to fix.

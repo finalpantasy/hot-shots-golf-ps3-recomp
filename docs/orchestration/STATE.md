@@ -397,3 +397,13 @@ Send input after Continue to learn what that scene is (menu or round), and look 
 ### Exact next action
 
 Add presses after flip 4750 to pick the course and start a round; a run is capped at 10 minutes, so the round start must fit in about 430 s.
+
+## 2026-11-18 run 21: round loads at 1 FPS
+
+- `boot-fix-1.02-round-1.log` (560 s): course select, character select (Yuna, Novice), shot type, confirmation with "Go to Course", then 40 s black at 394 draws, then "Now Loading" at the cap. Capture `docs/images/character-select-2026-11-18.png` (not in the README yet).
+- `boot-fix-1.02-round2-1.log` (560 s, Cross every 120 flips from 2500, 17 of 25 fired): round loading from 380 s; from 410 s 1118 to 1243 draws at 1.05 FPS with "Now Loading" on screen. Log shows `soc-job` chain, `course01.sgh/.sgb`, voice `ca00.sgb`, job queue `seq=4096 done=4064 ran=4064 MISS=0`. `bctr=0 nullcall=0 unresNID=0 887A=0`.
+- Worker `a488a7d74f9958cfa` (Opus, reason: profiling the D3D12 backend) owns `libs/video/**`, patch `0027`: where frame time goes at high draw counts. Coordinator edits nothing there.
+
+### Exact next action
+
+On the worker's report: verify FPS in the demo and the round, commit `0027`, then retry the round and send swing input.
