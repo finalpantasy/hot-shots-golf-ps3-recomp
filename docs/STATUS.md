@@ -195,3 +195,11 @@ Still wrong: the grass block under the ball is often drawn as a large stretched 
 The small picture of the ball's lie (grass or sand under the ball) was drawn stretched across the whole screen. The game draws it at 1277,777, 323 by 258 pixels on a 1600 by 1080 surface. That rectangle failed the bounds check against our 1280 by 720 backbuffer, so the draw fell back to a full-screen viewport. Draws to the display now scale their viewport from the guest surface size to the backbuffer (patch `0033`, `RSX_VP_SCALE=0` turns it off). Close-up frame rate is unchanged at 14 to 21 FPS. Capture: `docs/images/round-address-2026-11-18.png`.
 
 Still wrong: whole frames come out black in about 2 of every 6 to 14 shots. The depth surface at `0x034C0000` was checked and is handled correctly, so it is not the only cause. In some runs the picture stops updating on the hole 1 intro while the game keeps running; this happened before `0033` too.
+
+## 2026-11-18 update 21: audio checked from a recording
+
+`AUDIO_WAV=<path>` now writes the final mix as a 32-bit float stereo 48 kHz WAV, with the header updated every 2 seconds so a killed run still leaves a readable file (patch `0034`). The device stays muted while recording.
+
+A 150-second attract run gave 148.5 seconds of audio, so it keeps pace with real time. Music starts at 5.5 seconds. Level is RMS 0.048, peak 0.47, with no clipping and no clicks: the largest jump between samples is 0.196. Left and right are balanced (energy ratio 1.05, correlation 0.86). The spectrum shows harmonic music, not a tone or buzz. The 25 strongest peaks sit within 5.3 cents of musical pitches; a 44.1 versus 48 kHz mix-up would put them about 147 cents off. There is a 5-second silent gap at 32 to 36 seconds and shorter ones near 100 and 125 to 137 seconds; whether the original game has them was not checked.
+
+Nobody has listened to it yet, and only the attract demo was recorded.

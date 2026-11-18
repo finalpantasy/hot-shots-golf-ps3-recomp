@@ -489,3 +489,8 @@ Start a rendering worker on the stretched lie block and the black depth-restore 
 - Worker `af92c80089099214a` finished. `0033-rsx-lie-block.patch` (`libs/video/rsx_d3d12_backend.c`, on top of 0031): display draws scale the viewport from the guest surface size (1600x1080) to the backbuffer (`RSX_VP_SCALE=0` off). Debug switches added: `RSX_CAP_SECS`, `RSX_CAP_CB`, `VP_INFO`, `DSCONV_DBG=<addr>`. Final build sha8 `bbac1f19`, marker all zero. Sheets: scratchpad `lie\lie13sheet.png`.
 - Open: black whole frames about 2 per 6 to 14 shots (`lie13-1-t235.png`, `t255`), not only depth restore (lie6 t250, 3405 draws); render stall on hole 1 intro in lie2, lie3, lie12 (game keeps running); 8 dropped draws.
 - 08:2x rendering worker `a37c2a0a271fb1eb9` (Opus) started: owns `libs/video/**`, output `0036-rsx-black-frames.patch` (black frames, hole 1 intro stall, dropped draws).
+
+## 2026-11-18 run 29: audio recorded and checked, patch 0034
+
+- Worker `a5f6aa7a3f3cb0508` finished. `0034-audio-wav-capture.patch` (`libs/audio/cellAudio.c`): `AUDIO_WAV` writes a float stereo 48 kHz WAV, header fixed every ~2 s and at `cellAudioQuit`. Analysis: scratchpad `audio\` (`run1.wav`, `spec.png`). No defect found. A Python with numpy is at `%LOCALAPPDATA%\Python\bin\python.exe` (system `python` has PIL, no numpy).
+- Not verified: listening, comparison with the original, in-round sound effects, device frame drops.
