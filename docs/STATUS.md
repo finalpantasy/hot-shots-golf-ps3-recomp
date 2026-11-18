@@ -203,3 +203,19 @@ Still wrong: whole frames come out black in about 2 of every 6 to 14 shots. The 
 A 150-second attract run gave 148.5 seconds of audio, so it keeps pace with real time. Music starts at 5.5 seconds. Level is RMS 0.048, peak 0.47, with no clipping and no clicks: the largest jump between samples is 0.196. Left and right are balanced (energy ratio 1.05, correlation 0.86). The spectrum shows harmonic music, not a tone or buzz. The 25 strongest peaks sit within 5.3 cents of musical pitches; a 44.1 versus 48 kHz mix-up would put them about 147 cents off. There is a 5-second silent gap at 32 to 36 seconds and shorter ones near 100 and 125 to 137 seconds; whether the original game has them was not checked.
 
 Nobody has listened to it yet, and only the attract demo was recorded.
+
+## 2026-11-18 update 22: controller and keyboard mapping tested
+
+The pad code was split into `pad_xinput_to_host()` and `pad_keyboard_apply()` so a test can feed it fake controller and key states (patch `0035`). The test `libs/input/tests/test_pad_real_input.c` passes. It covers every button, both triggers, stick extremes and the dead zone, the packet lengths for pressure and sensor modes, unplugging a pad while a button is held, and every keyboard key, including losing window focus.
+
+One defect was fixed: XInput sticks never reached 0, and full up read as 1 instead of 0.
+
+| PS3 | Controller (XInput) | Keyboard |
+|---|---|---|
+| Cross, Circle, Square, Triangle | A, B, X, Y | Z, X, A, S |
+| L1, R1 | LB, RB | Q, W |
+| L2, R2 | LT, RT | 1, 2 |
+| Start, Select | Start, Back | Enter, Tab |
+| D-pad and left stick | D-pad, left stick | Arrow keys |
+
+The keyboard is read only while the game window has focus. A controller on XInput slot 1 or higher becomes PS3 port 1, which leaves port 0 on the keyboard; one controller is normally slot 0. Nothing has been tried with a physical controller, and the scripted swing was not rechecked on this build because the picture stalled in that run (see update 20).

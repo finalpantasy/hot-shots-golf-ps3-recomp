@@ -1,0 +1,360 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 854492e..5b2d151 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -214,15 +214,27 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
+  * practice the window of the video backend). PS3RECOMP_PAD_KEYBOARD_SDL selects
+  * the SDL source on macOS too, which is how the keyboard test is built. */
+ #if PAD_BACKEND_XINPUT
++#ifndef PS3RECOMP_PAD_TEST_KEYS
+ static int pad_host_window_focused(void)
+ {
++    /* The foreground window must belong to THIS process. On a hidden desktop (the
++     * headless runs) GetForegroundWindow is NULL, so no key is ever read. */
+     HWND fg = GetForegroundWindow();
+     if (!fg) return 0;
+     DWORD pid = 0;
+     GetWindowThreadProcessId(fg, &pid);
+     return pid == GetCurrentProcessId();
+ }
++#endif
++#ifdef PS3RECOMP_PAD_TEST_KEYS
++/* Host test: the test supplies the key state and the focus flag. */
++extern int pad_test_key_down(int key);
++extern int pad_test_focused(void);
++#define pad_host_window_focused pad_test_focused
++#define pad_key_down pad_test_key_down
++#else
+ static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
++#endif
+ #define PADKEY_UP VK_UP
+ #define PADKEY_DOWN VK_DOWN
+ #define PADKEY_LEFT VK_LEFT
+@@ -301,13 +313,8 @@ static int pad_key_down(int key)
+ #define PADKEY_TAB SDL_SCANCODE_TAB
+ #endif
+ 
+-static void pad_poll_keyboard(void)
++static void pad_keyboard_apply(PadHostState* hs)
+ {
+-    static int off = -1;
+-    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+-    if (off) return;
+-
+-    PadHostState* hs = &s_host_state[0];
+     if (!pad_host_window_focused()) {
+         /* Release everything on focus loss, or a key held while alt-tabbing
+          * would stay down forever. */
+@@ -342,8 +349,18 @@ static void pad_poll_keyboard(void)
+     hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+     hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+ 
++}
++
++static void pad_poll_keyboard(void)
++{
++    static int off = -1;
++    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
++    if (off) return;
++
++    PadHostState* hs = &s_host_state[0];
++    pad_keyboard_apply(hs);
+     { static int said = 0;
+-      if (!said && btns) { said = 1;
++      if (!said && hs->buttons) { said = 1;
+           printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
+           fflush(stdout); } }
+ }
+@@ -402,12 +419,64 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
+         normalized = 0.0f;
+ 
+     /* Map -1.0..1.0 to 0..255 with center at 128 */
+-    int val = (int)(normalized * 127.0f) + 128;
++    int val = (int)(normalized * 128.0f) + 128;
+     if (val < 0) val = 0;
+     if (val > 255) val = 255;
+     return (u8)val;
+ }
+ 
++/* XInput gamepad -> host pad state (one report). Separate from the polling so a
++ * host test can feed synthetic states through it. */
++static short pad_neg16(short v) { return v == -32768 ? 32767 : (short)-v; }
++static void pad_xinput_to_host(const XINPUT_GAMEPAD* gp, PadHostState* hs)
++{
++    hs->connected = 1;
++    u16 btns = 0;
++    if (gp->wButtons & XINPUT_GAMEPAD_BACK)       btns |= CELL_PAD_CTRL_SELECT;
++    if (gp->wButtons & XINPUT_GAMEPAD_LEFT_THUMB)     btns |= CELL_PAD_CTRL_L3;
++    if (gp->wButtons & XINPUT_GAMEPAD_RIGHT_THUMB)    btns |= CELL_PAD_CTRL_R3;
++    if (gp->wButtons & XINPUT_GAMEPAD_START)      btns |= CELL_PAD_CTRL_START;
++    if (gp->wButtons & XINPUT_GAMEPAD_DPAD_UP)    btns |= CELL_PAD_CTRL_UP;
++    if (gp->wButtons & XINPUT_GAMEPAD_DPAD_RIGHT)     btns |= CELL_PAD_CTRL_RIGHT;
++    if (gp->wButtons & XINPUT_GAMEPAD_DPAD_DOWN)      btns |= CELL_PAD_CTRL_DOWN;
++    if (gp->wButtons & XINPUT_GAMEPAD_DPAD_LEFT)      btns |= CELL_PAD_CTRL_LEFT;
++    if (gp->bLeftTrigger > PAD_TRIGGER_THRESHOLD)     btns |= CELL_PAD_CTRL_L2;
++    if (gp->bRightTrigger > PAD_TRIGGER_THRESHOLD)    btns |= CELL_PAD_CTRL_R2;
++    if (gp->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER)  btns |= CELL_PAD_CTRL_L1;
++    if (gp->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) btns |= CELL_PAD_CTRL_R1;
++    if (gp->wButtons & XINPUT_GAMEPAD_Y)          btns |= CELL_PAD_CTRL_TRIANGLE;
++    if (gp->wButtons & XINPUT_GAMEPAD_B)          btns |= CELL_PAD_CTRL_CIRCLE;
++    if (gp->wButtons & XINPUT_GAMEPAD_A)          btns |= CELL_PAD_CTRL_CROSS;
++    if (gp->wButtons & XINPUT_GAMEPAD_X)          btns |= CELL_PAD_CTRL_SQUARE;
++
++    hs->buttons = btns;
++
++    /* Analog sticks. PS3 Y axis is inverted vs XInput (up = 0). Negate the raw
++     * value before scaling: reflecting afterwards (255 - x) turns a centered stick
++     * into 127, whose bits (0x7F) alias SELECT+START and can make the guest
++     * self-exit (via sagemono, PR #42), and 256 - x wraps a full push to 0. */
++    hs->analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
++    hs->analog_ly = pad_xinput_stick_to_u8(pad_neg16(gp->sThumbLY), PAD_STICK_DEADZONE);
++    hs->analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
++    hs->analog_ry = pad_xinput_stick_to_u8(pad_neg16(gp->sThumbRY), PAD_STICK_DEADZONE);
++
++    /* Triggers */
++    hs->trigger_l2 = gp->bLeftTrigger;
++    hs->trigger_r2 = gp->bRightTrigger;
++
++    /* Pressure-sensitive buttons: XInput has digital only, so 0 or 255 */
++    hs->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
++    hs->press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
++    hs->press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
++    hs->press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
++    hs->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
++    hs->press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
++    hs->press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
++    hs->press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
++    hs->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
++    hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
++}
++
+ /* XInputGetState on a slot with nothing plugged in costs about 140 us (2 us on
+  * a connected one), and the backend is polled at least once a frame: three
+  * empty slots beside one pad were 0.6 ms of every frame on God of War HD's
+@@ -438,54 +507,7 @@ static void pad_poll_xinput(void)
+         }
+         s_pad_empty_until[i] = 0;
+ 
+-        s_host_state[i].connected = 1;
+-        XINPUT_GAMEPAD* gp = &state.Gamepad;
+-
+-        /* Map XInput buttons to PS3 CELL_PAD_CTRL_* */
+-        u16 btns = 0;
+-        if (gp->wButtons & XINPUT_GAMEPAD_BACK)           btns |= CELL_PAD_CTRL_SELECT;
+-        if (gp->wButtons & XINPUT_GAMEPAD_LEFT_THUMB)     btns |= CELL_PAD_CTRL_L3;
+-        if (gp->wButtons & XINPUT_GAMEPAD_RIGHT_THUMB)    btns |= CELL_PAD_CTRL_R3;
+-        if (gp->wButtons & XINPUT_GAMEPAD_START)          btns |= CELL_PAD_CTRL_START;
+-        if (gp->wButtons & XINPUT_GAMEPAD_DPAD_UP)        btns |= CELL_PAD_CTRL_UP;
+-        if (gp->wButtons & XINPUT_GAMEPAD_DPAD_RIGHT)     btns |= CELL_PAD_CTRL_RIGHT;
+-        if (gp->wButtons & XINPUT_GAMEPAD_DPAD_DOWN)      btns |= CELL_PAD_CTRL_DOWN;
+-        if (gp->wButtons & XINPUT_GAMEPAD_DPAD_LEFT)      btns |= CELL_PAD_CTRL_LEFT;
+-        if (gp->bLeftTrigger > PAD_TRIGGER_THRESHOLD)     btns |= CELL_PAD_CTRL_L2;
+-        if (gp->bRightTrigger > PAD_TRIGGER_THRESHOLD)    btns |= CELL_PAD_CTRL_R2;
+-        if (gp->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER)  btns |= CELL_PAD_CTRL_L1;
+-        if (gp->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) btns |= CELL_PAD_CTRL_R1;
+-        if (gp->wButtons & XINPUT_GAMEPAD_Y)              btns |= CELL_PAD_CTRL_TRIANGLE;
+-        if (gp->wButtons & XINPUT_GAMEPAD_B)              btns |= CELL_PAD_CTRL_CIRCLE;
+-        if (gp->wButtons & XINPUT_GAMEPAD_A)              btns |= CELL_PAD_CTRL_CROSS;
+-        if (gp->wButtons & XINPUT_GAMEPAD_X)              btns |= CELL_PAD_CTRL_SQUARE;
+-
+-        s_host_state[i].buttons = btns;
+-
+-        /* Analog sticks. PS3 Y axis is inverted vs XInput (up = 0). Reflect about
+-         * 128 (256 - x), NOT 255 - x: the latter turns a centered stick into 127,
+-         * whose bits (0x7F) alias SELECT+START and can make the guest self-exit.
+-         * (via sagemono, PR #42) */
+-        s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
+-        s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
+-        s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
+-        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
+-
+-        /* Triggers */
+-        s_host_state[i].trigger_l2 = gp->bLeftTrigger;
+-        s_host_state[i].trigger_r2 = gp->bRightTrigger;
+-
+-        /* Pressure-sensitive buttons: XInput has digital only, so 0 or 255 */
+-        s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+-        s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
+-        s_host_state[i].press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
+-        s_host_state[i].press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
+-        s_host_state[i].press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
+-        s_host_state[i].press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
+-        s_host_state[i].press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
+-        s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
+-        s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
+-        s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
++        pad_xinput_to_host(&state.Gamepad, &s_host_state[i]);
+     }
+ }
+ 
+diff --git a/b/libs/input/tests/test_pad_real_input.c b/libs/input/tests/test_pad_real_input.c
+new file mode 100644
+index 0000000..3b9f66a
+--- /dev/null
++++ b/libs/input/tests/test_pad_real_input.c
+@@ -0,0 +1,165 @@
++/* Real-player input on Windows: an XInput pad and the keyboard fallback, driven
++ * end to end through cellPadGetData with synthetic states.
++ *
++ *   x86_64-w64-mingw32-clang -std=gnu17 -DPS3RECOMP_PAD_TEST_KEYS -I include \
++ *       libs/input/tests/test_pad_real_input.c -o test_pad_real_input.exe && ./test_pad_real_input.exe
++ *
++ * XInput: p_xi_get_state is replaced by a fake after cellPadInit. Keyboard: the
++ * key state and the "window of this process has focus" flag come from the test
++ * (PS3RECOMP_PAD_TEST_KEYS), so no real keyboard or window is read.
++ */
++#define PS3RECOMP_PAD_TEST_KEYS 1
++#include "../cellPad.c"
++#include <assert.h>
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++u32 cellGcm_flip_request_count(void) { return 0; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++
++static unsigned char s_keys[256];
++static int s_focus;
++int pad_test_key_down(int key) { return s_keys[key & 255]; }
++int pad_test_focused(void) { return s_focus; }
++
++static int s_slot0_present;
++static XINPUT_GAMEPAD s_gp;
++static DWORD WINAPI fake_get_state(DWORD i, XINPUT_STATE* st)
++{
++    if (i != 0 || !s_slot0_present) return ERROR_DEVICE_NOT_CONNECTED;
++    st->Gamepad = s_gp;
++    return ERROR_SUCCESS;
++}
++
++static unsigned word(int off)
++{
++    const uint32_t ea = 0x2000;
++    Sleep(PAD_POLL_INTERVAL_MS + 40);
++    assert(cellPadGetData(0, (CellPadData*)(uintptr_t)ea) == CELL_OK);
++    assert(vm_base[ea + 3] != 0);
++    return (unsigned)vm_base[ea + 4 + off * 2] << 8 | vm_base[ea + 5 + off * 2];
++}
++#define D1() word(CELL_PAD_BTN_OFFSET_DIGITAL1)
++#define D2() word(CELL_PAD_BTN_OFFSET_DIGITAL2)
++#define LX() word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X)
++#define LY() word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y)
++
++#define SELECT 0x01u
++#define L3 0x02u
++#define START 0x08u
++#define UP 0x10u
++#define RIGHT 0x20u
++#define DOWN 0x40u
++#define LEFT 0x80u
++#define L2 0x01u
++#define R2 0x02u
++#define L1 0x04u
++#define R1 0x08u
++#define TRI 0x10u
++#define CIRCLE 0x20u
++#define CROSS 0x40u
++#define SQUARE 0x80u
++
++static void pad(unsigned btn, int lx, int ly, int lt, int rt)
++{
++    memset(&s_gp, 0, sizeof s_gp);
++    s_gp.wButtons = (WORD)btn; s_gp.sThumbLX = (SHORT)lx; s_gp.sThumbLY = (SHORT)ly;
++    s_gp.bLeftTrigger = (BYTE)lt; s_gp.bRightTrigger = (BYTE)rt;
++}
++static void keys(int a, int b)
++{
++    memset(s_keys, 0, sizeof s_keys);
++    if (a) s_keys[a] = 1;
++    if (b) s_keys[b] = 1;
++}
++
++int main(void)
++{
++    vm_base = (uint8_t*)calloc(1, 0x10000);
++    assert(vm_base);
++    assert(cellPadInit(7) == CELL_OK);
++    p_xi_get_state = fake_get_state;
++
++    /* ---- XInput on slot 0 ---- */
++    s_slot0_present = 1;
++    pad(0, 0, 0, 0, 0);
++    assert(D1() == 0 && D2() == 0);
++    assert(LX() == 128 && LY() == 128);                         /* centred, never 127 */
++    static const struct { unsigned xb; int word2; unsigned bit; } m[] = {
++        { XINPUT_GAMEPAD_A, 1, CROSS },  { XINPUT_GAMEPAD_B, 1, CIRCLE },
++        { XINPUT_GAMEPAD_X, 1, SQUARE }, { XINPUT_GAMEPAD_Y, 1, TRI },
++        { XINPUT_GAMEPAD_LEFT_SHOULDER, 1, L1 }, { XINPUT_GAMEPAD_RIGHT_SHOULDER, 1, R1 },
++        { XINPUT_GAMEPAD_START, 0, START }, { XINPUT_GAMEPAD_BACK, 0, SELECT },
++        { XINPUT_GAMEPAD_DPAD_UP, 0, UP }, { XINPUT_GAMEPAD_DPAD_DOWN, 0, DOWN },
++        { XINPUT_GAMEPAD_DPAD_LEFT, 0, LEFT }, { XINPUT_GAMEPAD_DPAD_RIGHT, 0, RIGHT },
++        { XINPUT_GAMEPAD_LEFT_THUMB, 0, L3 },
++    };
++    for (unsigned i = 0; i < sizeof m / sizeof m[0]; i++) {
++        pad(m[i].xb, 0, 0, 0, 0);
++        unsigned d1 = D1(), d2 = D2();
++        assert(m[i].word2 ? (d2 == m[i].bit && d1 == 0) : (d1 == m[i].bit && d2 == 0));
++    }
++    pad(0, 0, 0, 255, 0); assert(D2() == L2);
++    pad(0, 0, 0, 0, 255); assert(D2() == R2);
++    pad(0, 0, 0, 20, 20); assert(D2() == 0);                    /* below the trigger threshold */
++    /* Left stick: up = 0 on the PS3 (XInput up = +32767), left = 0. Dead zone is centred. */
++    pad(0, 0, 32767, 0, 0);  assert(LY() == 0 && LX() == 128);
++    pad(0, 0, -32768, 0, 0); assert(LY() == 255);
++    pad(0, -32768, 0, 0, 0); assert(LX() == 0);
++    pad(0, 32767, 0, 0, 0);  assert(LX() == 255);
++    pad(0, 5000, -5000, 0, 0); assert(LX() == 128 && LY() == 128);
++    pad(0, 20000, 0, 0, 0);  { unsigned x = LX(); assert(x == 190); }
++    /* Pressure: PRESS_ON/SENSOR_ON widen the packet and a pressed button reads 255. */
++    assert(cellPadSetPortSetting(0, CELL_PAD_SETTING_PRESS_ON) == CELL_OK);
++    pad(XINPUT_GAMEPAD_A, 0, 0, 20, 0);
++    assert(D2() == CROSS);
++    assert(vm_base[0x2000 + 3] == CELL_PAD_LEN_CHANGE_PRESS_ON);
++    assert(word(CELL_PAD_BTN_OFFSET_PRESS_CROSS) == 255);
++    assert(word(CELL_PAD_BTN_OFFSET_PRESS_L2) == 20);
++    assert(cellPadSetPortSetting(0, CELL_PAD_SETTING_PRESS_ON | CELL_PAD_SETTING_SENSOR_ON) == CELL_OK);
++    assert(D1() == 0);
++    assert(vm_base[0x2000 + 3] == CELL_PAD_LEN_CHANGE_SENSOR_ON);
++    assert(cellPadSetPortSetting(0, 0) == CELL_OK);
++    assert(D2() == CROSS);
++    assert(vm_base[0x2000 + 3] == CELL_PAD_LEN_CHANGE_DEFAULT);
++
++    /* ---- hot-unplug: the pad goes, the keyboard takes over, nothing sticks ---- */
++    pad(XINPUT_GAMEPAD_A, 0, 0, 0, 0);
++    s_slot0_present = 0; s_focus = 1; keys(0, 0);
++    Sleep(PAD_POLL_INTERVAL_MS + 40);
++    assert(D2() == 0);                                          /* A is not left pressed */
++    assert(LX() == 128 && LY() == 128);
++
++    /* ---- keyboard (no pad) ---- */
++    static const struct { int key; int word2; unsigned bit; } k[] = {
++        { 'Z', 1, CROSS }, { 'X', 1, CIRCLE }, { 'A', 1, SQUARE }, { 'S', 1, TRI },
++        { 'Q', 1, L1 }, { 'W', 1, R1 }, { '1', 1, L2 }, { '2', 1, R2 },
++        { VK_RETURN, 0, START }, { VK_TAB, 0, SELECT },
++        { VK_UP, 0, UP }, { VK_DOWN, 0, DOWN }, { VK_LEFT, 0, LEFT }, { VK_RIGHT, 0, RIGHT },
++    };
++    for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++) {
++        keys(k[i].key, 0);
++        unsigned d1 = D1(), d2 = D2();
++        assert(k[i].word2 ? (d2 == k[i].bit && d1 == 0) : (d1 == k[i].bit && d2 == 0));
++    }
++    keys(VK_LEFT, VK_UP); assert(D1() == (LEFT | UP)); assert(LX() == 0); assert(LY() == 0);
++    keys(VK_RIGHT, VK_DOWN); assert(LX() == 255); assert(LY() == 255);
++    /* Focus lost (another app, or a hidden desktop): held keys are ignored and released. */
++    keys('Z', VK_UP); s_focus = 0;
++    assert(D1() == 0 && D2() == 0 && LX() == 128 && LY() == 128);
++    s_focus = 1; assert(D2() == CROSS);
++
++    /* Port 0 is always reported connected so a boot that waits for a pad proceeds. */
++    CellPadInfo2* info = (CellPadInfo2*)(uintptr_t)0x4000;
++    assert(cellPadGetInfo2(info) == CELL_OK);
++    assert(vm_base[0x4000 + offsetof(CellPadInfo2, port_status) + 3] & CELL_PAD_STATUS_CONNECTED);   /* port_status[0] low byte */
++
++    printf("test_pad_real_input: ok\n");
++    return 0;
++}

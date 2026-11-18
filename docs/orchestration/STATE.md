@@ -494,3 +494,9 @@ Start a rendering worker on the stretched lie block and the black depth-restore 
 
 - Worker `a5f6aa7a3f3cb0508` finished. `0034-audio-wav-capture.patch` (`libs/audio/cellAudio.c`): `AUDIO_WAV` writes a float stereo 48 kHz WAV, header fixed every ~2 s and at `cellAudioQuit`. Analysis: scratchpad `audio\` (`run1.wav`, `spec.png`). No defect found. A Python with numpy is at `%LOCALAPPDATA%\Python\bin\python.exe` (system `python` has PIL, no numpy).
 - Not verified: listening, comparison with the original, in-round sound effects, device frame drops.
+
+## 2026-11-18 run 30: real input mapping, patch 0035
+
+- Worker `acd0d1afbac103c9a` finished. `0035-pad-real-input.patch` (`libs/input/cellPad.c`, new `libs/input/tests/test_pad_real_input.c`, on top of 0032). Test rebuilt and run by the coordinator: `test_pad_real_input: ok`.
+- Coordinator boot `padchk` (exe built 08:16 by the rendering worker, includes its in-progress edits): picture froze on an attract-demo hole 4 tee from before 220 s to 420 s while audio kept running; flips stopped, so PAD_SCRIPT menu presses never fired. Sent to rendering worker `a37c2a0a271fb1eb9` as a repro of the stall.
+- Not verified: scripted swing on a build with 0035 (worker's `padreal` run ended on the tee, inconclusive); physical controller.
