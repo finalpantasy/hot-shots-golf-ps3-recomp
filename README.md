@@ -14,7 +14,9 @@ The title screen, drawn by the port and captured 2026-11-17. The dark squares at
 
 ![The attract demo flying over a hole: lit fairway, bunkers, a path and tree shadows](docs/images/demo-flyover-2026-11-18.png)
 
-![The first tee of a round: the golfer, the ball and the shot HUD are drawn, the course behind them is nearly black](docs/images/tee-shot-2026-11-18.png)
+![The first tee of a real round: the golfer addressing the ball with the course behind her](docs/images/round-tee-2026-11-18.png)
+
+![The round after two scripted shots: a bunker, a waterfall and the course from the ball position](docs/images/round-second-shot-2026-11-18.png)
 
 The attract demo that follows the title, captured the same day. The course geometry and HUD draw. The lighting is too dark, the sky and part of the ground are missing, and stray light-blue triangles appear.
 
@@ -35,7 +37,7 @@ Updated 2026-11-17.
 | Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout, lit terrain with tree shadows. Some water and bunker edges are flat cyan |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
 | Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course" |
-| Playing a round | The round loads and reaches the first tee in under four minutes at 18 to 34 FPS. A Cross press starts the swing gauge. The tee close-up has a black background, and no full shot has been played. Not playable yet |
+| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots: the swing gauge runs, the ball is hit and the remaining distance drops from 316 to 292 to 237 yards. The tee close-up has a black background and one capture shows wrong colors. Not tested with a real controller |
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 
 ## What is in this repository

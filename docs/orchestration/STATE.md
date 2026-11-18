@@ -458,3 +458,14 @@ When the rendering worker reports: commit its patch, then turn on optimization f
 ### Exact next action
 
 Rendering worker on the tee close-up background and cyan surfaces; coordinator runs a swing with presses about 20 to 40 flips apart.
+
+## 2026-11-18 run 26: shots played in a round
+
+- `0032-pad-script-hold.patch` (`libs/input/cellPad.c`, upstream file was unmodified before): `PAD_SCRIPT_HOLD=<polls>`, default 40.
+- Boot `swing2` (`PAD_SCRIPT_HOLD=5`, menu presses every 120 flips from 2500, then triples every 300 flips from 5700 with spacing 20/30/40/50/60 flips): shots hit, Remaining 316 to 292 to 237 y, club 1W to 3I, "Replay" prompt, POWER 100%. Marker `bctr=0 nullcall=0 regist=0 stars=0 unresNID=0 unresCall=0 garbage=0 887A=0 lines=17649`. Strip: scratchpad `swing2-strip.png`.
+- This build included worker `ac91f4a86f53392c4`'s in-progress `libs/video` edits (it owns `libs/video/**`, output `0031-rsx-scene-persist.patch`: tee close-up background, cyan surfaces, present counter).
+- Not verified: white background with purple grass in `swing2-1-t280.png`; which press spacing gives a good impact; real controller; holing out.
+
+### Exact next action
+
+On the rendering worker's report: check captures, commit 0031, re-run the swing script to see the close-up. Then: finish a hole by script, compile `ppu_recomp_063.cpp` at -O1 outside the build cap if allowed, refresh the handoff.

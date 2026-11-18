@@ -1,0 +1,19 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 5f8a2fa..854492e 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1023,7 +1023,13 @@ skip_inject: ;
+            * looks like regardless of poll rate. */
+           static int fired[256], held[256];
+           for (int i = 0; i < n_ev; i++) {
+-              if (!fired[i] && now >= ev[i].t) { fired[i] = 1; held[i] = 40; }
++              /* PAD_SCRIPT_HOLD=<polls>: how long each scripted press is held
++               * (default 40). A swing needs presses closer together than 40
++               * polls, and overlapping holds read as one long press. */
++              static int s_hold = 0;
++              if (!s_hold) { const char* h = getenv("PAD_SCRIPT_HOLD");
++                             s_hold = h ? atoi(h) : 0; if (s_hold <= 0) s_hold = 40; }
++              if (!fired[i] && now >= ev[i].t) { fired[i] = 1; held[i] = s_hold; }
+               if (held[i] > 0) {
+                   held[i]--;
+                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);

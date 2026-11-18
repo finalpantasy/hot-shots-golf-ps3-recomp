@@ -173,3 +173,9 @@ Measured in one boot of the new build: the title runs at about 60 FPS, the demo 
 The dark terrain is fixed (patch `0030`). The game draws a shadow map into a depth-only surface and the ground shader reads it as a depth texture with a comparison. The backend dropped depth texture formats, so the shader read 0 and the sunlight term went to 0. The same patch stops the sampler table from filling: the unused border color was part of the sampler key.
 
 Scripted Cross presses in the round start the swing gauge and the club moves. The presses were 120 frames apart, too slow to finish a shot, so no ball has been hit yet. The tee close-up still has a black background. That frame has no color clear and seems to expect the previous frame's picture to persist, which is not proven.
+
+## 2026-11-18 update 18: shots are played in a round
+
+Scripted presses were held for 40 pad polls each, so presses close together read as one long press and the swing was cancelled. `PAD_SCRIPT_HOLD` now sets the hold length (patch `0032`). With 5-poll presses in groups of three, the game plays shots: the gauge runs, the ball is hit, a "Replay" prompt appears, and the remaining distance goes from 316 to 292 to 237 yards with the club changing from the driver to a 3 iron. Captures are `docs/images/round-tee-2026-11-18.png` and `docs/images/round-second-shot-2026-11-18.png`.
+
+Still wrong: the close-up with the big ball has a black background, and one capture of it had a white background with purple grass. No real controller has been tried.
