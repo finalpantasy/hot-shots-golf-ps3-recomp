@@ -332,6 +332,33 @@
         "The only data inside 0x60-0x4068 is a 5-entry inline switch table at 0x2C14-0x2C28 (words 0x14,0x30C,0x7DC,0x454,0x58C; targets 0x2C28,0x2F20,0x33F0,0x3068,0x31A0): ila $r21,0x2C14 at 0x2AF0, a $r5,$r21,$r126 at 0x2B18, clgti $r8,$r10,4 at 0x2B88, lqx/rotqby/a at 0x2B94-0x2BA0, bi $r2 at 0x2C10. The tool finds and subtracts it (compiler bound check); this is the 'data inside code at 0x2C18' an earlier pass stopped at. The two zero words at 0x3948 follow br 0x38C8; lnop and are alignment padding.",
         "Every other in-code ila to a code address (0x80, 0x150, 0x1818, 0x2260, 0x2AF0, 0x3750, 0x37E0, 0x3A28, 0x3B10, 0x3BE4) is the PIC base idiom (ila rX,next; brsl $r126,next). extra_entries: 0x138 is _exit() (ila $r4,0x4070 then printf and stopd), reached by no direct branch; 0x16C is the epilogue after the stopd at 0x168. The second stopd at 0x3AF0 (memory-error abort) has its epilogue 0x3AF4 seeded by find_spu_functions."
       ]
+    },
+    {
+      "ea": "0x00CAB400",
+      "size": "0x2540",
+      "fingerprint": "B24195A9C86BC758",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x60",
+          "0x1AE8"
+        ]
+      ],
+      "extra_entries": [
+        "0x168",
+        "0x19C"
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_B24195A9C86BC758_9536.bin",
+      "evidence": [
+        "Pushed about 32 times per frame in the course demo: '[spurs-job] dispatch MISS fp=0xB24195A9C86BC758 size=9536'. Image is 0x2540 bytes at EA 0x00CAB400.",
+        "JOBCRT Ver14 layout like the other jobs: 0x00-0x20 crt entry, 0x20-0x60 data (0xA5 fill, 'JOBCRT Ver14', bss end 0x3040 at 0x3C, bss start 0x2540 at 0x40), code 0x60-0x1AE8 (last 'bi $r0' at 0x1AE4, stop 0 padding to 0x1AF0), then the _exit() strings at 0x1AF0, float constants, JOBCRT Ver key 0x2400 and the trailer.",
+        "No inline jump tables: no il/ila of a code address followed by a bi table. bisl at 0xE0 and 0x1384 are call-through-pointer (ctor/dtor lists and a function pointer). bi $r7 at 0x15FC is a computed jump into the unrolled stqd loop at 0x1604-0x1628 (memset-style tail, PIC base 0x15E0); it lies inside a function so it cannot be an extra entry, watch the runtime log for unknown indirect targets.",
+        "extra_entries: 0x168 is _exit() (ila $r4,0x1AF0, then printf and stopd at 0x198), reached by no direct branch; 0x19C is the epilogue after that stopd."
+      ]
     }
   ]
 }

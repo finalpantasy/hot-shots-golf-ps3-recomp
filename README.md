@@ -22,11 +22,11 @@ Updated 2026-11-17.
 | Lift PPU code to C++ | Done: 33,221 functions |
 | Build a native executable | Done: one 446 MB `.exe`, no extra DLLs |
 | Boot | Runs to the title screen in about a minute. Both SPURS instances start and game archives load |
-| SPU jobs | 14 jobs lifted. No job is missing up to the title screen |
+| SPU jobs | 15 jobs lifted. One more job-queue binary shows up in some runs and is not lifted |
 | Rendering | Works up to the title screen, with a few wrong squares in the sky. 8 to 20 FPS there |
 | Intro movie | Skipped. The player reports the movie as finished because there is no video decoder |
 | Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
-| Course scene | The attract demo loads a hole and draws it with wrong lighting and missing parts. Its SPU job queue works but the one job it pushes is not lifted yet |
+| Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout. Terrain is too dark and foliage has black boxes |
 | Menus after the title, gameplay, audio | Not verified |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).

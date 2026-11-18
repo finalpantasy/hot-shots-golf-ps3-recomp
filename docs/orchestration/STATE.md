@@ -327,3 +327,9 @@ When the lift worker reports: check the course capture again (lighting, sky, tri
 - Worker `a5185470777d90621` (Opus, reason: shader and RSX state debugging) owns `libs/video/**`, patch `0024`: foliage boxes, dark terrain, title sky squares.
 - Worker `aa354238187c29d59` (Sonnet) still owns `tools/spu_*`, `port/spu/**` for job `0x00CAB400`.
 - Coordinator edits none of those; both workers build under `BUILD.lock`.
+
+## 2026-11-17 run 14: job 15 lifted, demo plays a shot
+
+- Worker `aa354238187c29d59`: job `0x00CAB400` (`B24195A9C86BC758`) lifted, 15 jobs in `tools/spu_jobs.json`. `boot-fix-1.02-job15-1.log` (180 s): `[cellSpursJq] done=16352 ran=16352 MISS=0`, 0 `dispatch MISS`, 0 `bctr to NULL`, 0 `null-call`, 0 `garbage vcall`. Captures show the demo golfer on the tee and a ball in flight with "264.0y / Carry 236.3y".
+- `tools/spu_lift_jobs.py` must be run before `recomp_pipeline.py build` after editing `spu_jobs.json`; the pipeline does not run it.
+- A second queue job appeared in one run: `16CB89234CCC254E`, 5568 bytes, 32 pushes. Same worker resumed to lift it as job 16.
