@@ -500,3 +500,13 @@ Start a rendering worker on the stretched lie block and the black depth-restore 
 - Worker `acd0d1afbac103c9a` finished. `0035-pad-real-input.patch` (`libs/input/cellPad.c`, new `libs/input/tests/test_pad_real_input.c`, on top of 0032). Test rebuilt and run by the coordinator: `test_pad_real_input: ok`.
 - Coordinator boot `padchk` (exe built 08:16 by the rendering worker, includes its in-progress edits): picture froze on an attract-demo hole 4 tee from before 220 s to 420 s while audio kept running; flips stopped, so PAD_SCRIPT menu presses never fired. Sent to rendering worker `a37c2a0a271fb1eb9` as a repro of the stall.
 - Not verified: scripted swing on a build with 0035 (worker's `padreal` run ended on the tee, inconclusive); physical controller.
+
+## 2026-11-18 run 31: black frames and stalls fixed, patch 0036
+
+- Worker `a37c2a0a271fb1eb9` finished. `0036-rsx-black-frames.patch` (`libs/video/cellGcmSys.c`, `libs/video/rsx_d3d12_backend.c`, on top of 0031 and 0033): `RSX_FLIP_MARK` (present at the flip marker), `GCM_FLIP_WRAP_WAIT` (bounded wait at the flip wrap), `RSX_FULL_SPLIT` (run full batches holding a display draw). Debug: `RSX_STALL_DBG`, `GCM_MARKER_DBG`. Worker logs `boot-fix-1.02-blk13-1.log` to `blk16-1.log`.
+- Coordinator build `all36` (sha8 `d1eb1479`, every patch through 0036) and boot `round36` (450 s, swing script): no black frame, no stall, hole 1 played to a 2.6 ft putt; marker all zero, 17409 lines. Strip: scratchpad `round36-strip.png`. Also confirms scripted swings work with 0035.
+- Open: 45 to 55 s load with no flips in every run; heavy views 12 to 17 FPS; stall cause inferred, sample 4 runs.
+
+### Exact next action
+
+Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-flip load. Ask Codex for patch replay of 0031 to 0036 and CLI flags for the new switches. Refresh the handoff.

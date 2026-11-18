@@ -20,6 +20,10 @@ The title screen, drawn by the port and captured 2026-11-17. The dark squares at
 
 ![The leaderboard after the first hole of a scripted round](docs/images/round-leaderboard-2026-11-18.png)
 
+![An approach shot from the rough, 70.8 yards remaining](docs/images/round-approach-2026-11-18.png)
+
+![Putting on the first green, 2.6 feet remaining](docs/images/round-putt-2026-11-18.png)
+
 The attract demo that follows the title, captured the same day. The course geometry and HUD draw. The lighting is too dark, the sky and part of the ground are missing, and stray light-blue triangles appear.
 
 ## Status
@@ -39,7 +43,7 @@ Updated 2026-11-17.
 | Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout, lit terrain with tree shadows. |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
 | Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course" |
-| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots, finish the first hole (par 4) at +4, show the leaderboard and start hole 2. Some captured frames come out black, and in some runs the picture stops updating while the game and its audio keep running. Not tested with a physical controller |
+| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots, finish the first hole (par 4) at +4, show the leaderboard and start hole 2. With patch `0036` a 450-second run had no black frames and no stalls; earlier builds stalled in about half the runs. Not tested with a physical controller |
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 
 

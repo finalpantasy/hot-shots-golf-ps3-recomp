@@ -219,3 +219,15 @@ One defect was fixed: XInput sticks never reached 0, and full up read as 1 inste
 | D-pad and left stick | D-pad, left stick | Arrow keys |
 
 The keyboard is read only while the game window has focus. A controller on XInput slot 1 or higher becomes PS3 port 1, which leaves port 0 on the keyboard; one controller is normally slot 0. Nothing has been tried with a physical controller, and the scripted swing was not rechecked on this build because the picture stalled in that run (see update 20).
+
+## 2026-11-18 update 23: black frames and picture stalls fixed
+
+Black frames were real: the presented image was black, not just the capture. When the command buffer was backed up across a ring wrap, the drain ran past a flip marker, so one present got the scene without its HUD and the next got the HUD over black. Presents now happen at the flip marker itself (`RSX_FLIP_MARK`). Split presents went from 5 to 41 per run to 0 to 2.
+
+The picture stopped because the flip at the ring wrap let the game restart at the start of the ring while the backend was still in its first half. The backend never reached the old lap's last flip, and the game waited for it forever. At the wrap the game now waits, with a time limit, until the backend is past the half (`GCM_FLIP_WRAP_WAIT`). This cause was read from the stalled state, not caught in a trace. Stalls hit about 6 of 12 runs before and 0 of 4 after.
+
+Batches that fill up after already holding a display draw are now run and the backbuffer kept (`RSX_FULL_SPLIT`), so no draws are dropped. Each fix has a switch that turns it off with `=0`. All three are in patch `0036`.
+
+Check on a build with every patch through `0036` (boot `round36`, 450 seconds): no black frames, no stall. Scripted presses played hole 1 from the tee to a putt 2.6 feet from the hole: 319, 302, 208, 70.8 and 5.4 yards remaining, then 6.5 feet. The title runs at 59 FPS; course views with 1700 to 3500 draws run at 12 to 28 FPS. Captures: `docs/images/round-approach-2026-11-18.png`, `docs/images/round-putt-2026-11-18.png`.
+
+Still open: every run has a 45 to 55 second load with no flips; heavy course views run at 12 to 17 FPS.

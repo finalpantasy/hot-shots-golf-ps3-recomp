@@ -1,0 +1,497 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -116,6 +116,10 @@
+  * presenting on a raw flip-count change raced the drain and showed empty or
+  * mixed batches (wave: black flashes, layout flicker). */
+ static volatile int s_flip_pending = 0;
++/* Set by a backend that can present a frame from inside the drain: called when
++ * the drain passes a flip without stopping (backlogged FIFO); nth counts them
++ * within one drain pass, from 0. */
++void (*g_gcm_flip_passed_hook)(int nth) = NULL;
+ /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
+ #define GCM_FLIP_MARKER 0xFEAD0100u
+ /* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
+@@ -123,6 +127,14 @@
+  * executes it; until the drain reaches the marker, the flip has not happened,
+  * however many vblanks go by. */
+ static volatile u32 s_fifo_flips_queued = 0, s_fifo_flips_reached = 0;
++static volatile u32 s_dbg_marker_io = 0, s_dbg_marker_ctx = 0;   /* last marker written (RSX_STALL_DBG) */
++/* GCM_MARKER_DBG=1: log every flip marker written and every one the drain meets. */
++static int gcm_marker_dbg(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("GCM_MARKER_DBG"); v = e ? atoi(e) : 0; }
++    return v;
++}
+ static u32 s_fifo_flips_completed = 0;   /* reached count at the last completion */
+ /* A flip requested outside the command stream (cellGcmSetFlipCommand, or a
+  * 0xFEAD word the drain met), not completed yet. */
+@@ -2511,6 +2523,7 @@
+      * short of `put` every tick is the signature of a FIFO that can never
+      * catch up, and the reason is the whole diagnosis. */
+     const char* why = "caught-up";
++    int flips_passed = 0;   /* flips drained past this pass (g_gcm_flip_passed_hook) */
+     while (s_fifo_getoff != put && budget-- > 0) {
+         u32 ea = gcm_io2ea(s_fifo_getoff);
+         if (!ea) {
+@@ -2640,6 +2653,8 @@
+                 /* Not past `queued`: a resync may already have written off
+                  * this flip. */
+                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
++                if (gcm_marker_dbg()) fprintf(stderr, "[marker] drain io=0x%X w=0x%08X fq=%u fr=%u put=0x%X%c",
++                                              s_fifo_getoff - 4, w, s_fifo_flips_queued, s_fifo_flips_reached, put, 10);
+             } else {
+                 cellGcmSetFlipCommand(w & 0xFFu);
+             }
+@@ -2659,6 +2674,12 @@
+              * commands ahead of it. */
+             if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
+                 { why = "flip"; break; }
++            /* Draining on past the flip puts the next frame's head into the
++             * batch the ticker presents for this one: Hot Shots Golf, a frame
++             * ahead across its ring wrap, presented its scene without the HUD
++             * and then the HUD over an empty (black) scene. Let the backend
++             * close the frame exactly here. */
++            if (g_gcm_flip_passed_hook) g_gcm_flip_passed_hook(flips_passed++);
+             continue;
+         }
+ 
+@@ -3559,6 +3580,10 @@
+     if (gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
+     s_fifo_flips_queued++;
++    s_dbg_marker_io = gcm_ea2io(cur); s_dbg_marker_ctx = ctx;
++    if (gcm_marker_dbg()) fprintf(stderr, "[marker] write io=0x%X fq=%u getoff=0x%X put=0x%X end_room=0x%X%c",
++                                  s_dbg_marker_io, s_fifo_flips_queued, s_fifo_getoff,
++                                  vm_read32(GCM_CONTROL_GUEST_ADDR), end - (cur + 4), 10);
+     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
+      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
+      * (see "recycled the title's own ring"), rewriting ctx->current and put
+@@ -3579,6 +3604,39 @@
+     const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+     if (runtime_ring && !s_seg_size && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
++        /* ...and not while the walker is still in the first half of this lap:
++         * the guest writes its next frames from begin and would overwrite
++         * commands the walker has not read. Hot Shots Golf writes two frames a
++         * lap; with the walker a frame behind it lapped it, the walker then
++         * ran the new lap's head and stopped at its put, the flip marker at
++         * the end of the old lap was never reached, and the title waited for
++         * that flip forever (picture frozen, sound running). Wait, as the
++         * SDK's buffer-full callback does, bounded on the walker making no
++         * progress like cellGcm_fifo_recycle. GCM_FLIP_WRAP_WAIT=0 skips it. */
++        static int wrap_wait = -1;
++        if (wrap_wait < 0) { const char* e = getenv("GCM_FLIP_WRAP_WAIT"); wrap_wait = (e && e[0] == '0') ? 0 : 1; }
++        const u32 io_cur = gcm_ea2io(cur);
++        const u32 half = io_begin + (io_cur - io_begin) / 2;
++        const u32 put_now = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
++        /* Only when `put` lets the walker get there; otherwise waiting is
++         * a 2 s hitch that changes nothing. */
++        if (wrap_wait && s_fifo_getoff < half && put_now >= half && put_now <= io_cur) {
++            static int s_wrap_logs = 0;
++            const u32 get0 = s_fifo_getoff;
++            int ms = 0, idle = 0;
++            u32 last_get = get0;
++            if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
++            while (s_fifo_getoff >= io_begin && s_fifo_getoff < half && idle < 2000 && ms < 10000) {
++                Sleep(1); ms++;
++                if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
++                else idle++;
++            }
++            if (PS3_LOG_FIRST(s_wrap_logs, 8) || idle >= 2000)
++                printf("[cellGcmSys] flip wrap: walker at get=0x%X was in the half the next lap "
++                       "overwrites (half=0x%X, marker io=0x%X); waited %d ms, get=0x%X%s%c",
++                       get0, half, io_cur, ms, s_fifo_getoff,
++                       idle >= 2000 ? " -- walker stalled, wrapping anyway" : "", 10);
++        }
+         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
+         vm_write32(ctx + 8, begin);
+         return 1;
+@@ -4884,3 +4942,18 @@
+     s_fifo_getoff  = get;
+     s_fifo_calloff = 0;
+ }
++
++/* RSX_STALL_DBG: the flip handshake state, for the backend watchdog line. */
++void cellGcm_flip_debug(char* b, unsigned n)
++{
++    const u32 c = s_dbg_marker_ctx, mio = s_dbg_marker_io;
++    const u32 mea = mio != 0xFFFFFFFFu ? gcm_io2ea(mio) : 0;
++    const u32 cur = c ? vm_read32(c + 8) : 0;
++    snprintf(b, n, "fst=%u req=%u tick=%u fq=%u fr=%u fc=%u direct=%d gpend=%ld getoff=0x%X"
++                   " marker@io=0x%X now=0x%08X next=0x%08X ctx=0x%X begin=0x%X end=0x%X cur=0x%X(io 0x%X)",
++             s_flip_status, s_flip_req_seq, s_flip_tick_seq, s_fifo_flips_queued,
++             s_fifo_flips_reached, s_fifo_flips_completed, s_flip_direct_pending,
++             (long)s_gcm_pending, s_fifo_getoff, mio, mea ? vm_read32(mea) : 0,
++             mea ? vm_read32(mea + 4) : 0, c, c ? vm_read32(c) : 0, c ? vm_read32(c + 4) : 0,
++             cur, cur ? gcm_ea2io(cur) : 0);
++}
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -33,6 +33,7 @@
+ #define WIN32_LEAN_AND_MEAN
+ #endif
+ #include <windows.h>
++#include <tlhelp32.h>   /* RSX_STALL_DBG thread dump */
+ 
+ /* We need these GUIDs — define them here to avoid uuid.lib dependency.
+  * initguid.h only turns DEFINE_GUID into a definition for headers included
+@@ -1641,6 +1642,148 @@
+  * Frame sync helpers
+  * -----------------------------------------------------------------------*/
+ 
++/* RSX_STALL_DBG=<s>: watchdog on the frame-clock thread (the one that owns the
++ * window, drains the FIFO and presents). When it has not passed a stage mark
++ * for <s> seconds, print the stage it is in and its raw call stack (module +
++ * offset; resolve with llvm-symbolizer), once per stall. A picture that stops
++ * while the process lives is either this thread blocked or the guest no longer
++ * flipping; this says which, and where. */
++static volatile const char* s_stall_stage = "init";
++static volatile LONG64 s_stall_hb = 0;
++static HANDLE s_stall_thread = NULL;
++static int stall_dbg_secs(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_STALL_DBG"); v = e ? atoi(e) : 0; if (v < 0) v = 0; }
++    return v;
++}
++static void stall_mark(const char* st)
++{
++    if (!stall_dbg_secs()) return;
++    s_stall_stage = st;
++    s_stall_hb = (LONG64)GetTickCount64();
++}
++/* Raw x64 unwind of a suspended thread: return addresses, innermost first. */
++static int stall_unwind(HANDLE th, DWORD64* rips, int max)
++{
++    int n = 0;
++    if (SuspendThread(th) == (DWORD)-1) return 0;
++    CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_FULL;
++    if (GetThreadContext(th, &c)) {
++        while (n < max && c.Rip) {
++            rips[n++] = c.Rip;
++            DWORD64 base = 0;
++            PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, NULL);
++            if (!f) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; }
++            else { PVOID hd = NULL; DWORD64 ef = 0;
++                   RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &ef, NULL); }
++        }
++    }
++    ResumeThread(th);
++    return n;
++}
++static void stall_print_stack(const DWORD64* rips, int n)
++{
++    for (int i = 0; i < n; i++) {
++        HMODULE m = NULL; char nm[MAX_PATH] = "?";
++        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                               (LPCSTR)(uintptr_t)rips[i], &m) && m) {
++            GetModuleFileNameA(m, nm, sizeof nm);
++            const char* b = strrchr(nm, 92); /* backslash */
++            fprintf(stderr, "[STALL]   #%02d %s+0x%llX%c", i, b ? b + 1 : nm,
++                    (unsigned long long)(rips[i] - (DWORD64)(uintptr_t)m), 10);
++        } else fprintf(stderr, "[STALL]   #%02d 0x%llX%c", i, (unsigned long long)rips[i], 10);
++    }
++}
++/* Every thread of the process: name + stack. For a guest that has stopped
++ * flipping, this names what its render thread is blocked on. */
++static void stall_dump_all_threads(void)
++{
++    typedef HRESULT (WINAPI *GTD)(HANDLE, PWSTR*);
++    static GTD gtd = NULL; static int gtd_init = 0;
++    if (!gtd_init) { gtd_init = 1;
++        gtd = (GTD)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription"); }
++    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++    if (snap == INVALID_HANDLE_VALUE) return;
++    THREADENTRY32 te; te.dwSize = sizeof te;
++    const DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
++    if (Thread32First(snap, &te)) do {
++        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
++        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
++                              FALSE, te.th32ThreadID);
++        if (!h) continue;
++        char name[96] = "";
++        if (gtd) { PWSTR w = NULL;
++            if (SUCCEEDED(gtd(h, &w)) && w) {
++                WideCharToMultiByte(CP_UTF8, 0, w, -1, name, sizeof name, NULL, NULL); LocalFree(w); } }
++        DWORD64 rips[24]; const int n = stall_unwind(h, rips, 24);
++        fprintf(stderr, "[STALL] thread %lu '%s':%c", (unsigned long)te.th32ThreadID, name, 10);
++        stall_print_stack(rips, n);
++        CloseHandle(h);
++    } while (Thread32Next(snap, &te));
++    CloseHandle(snap);
++    fflush(stderr);
++}
++static DWORD WINAPI stall_watch(LPVOID arg)
++{
++    const ULONGLONG lim = (ULONGLONG)stall_dbg_secs() * 1000ull;
++    LONG64 reported = -1;
++    ULONGLONG last_status = 0, flip_t = 0;
++    unsigned last_flips = 0, dumped_flips = 0;
++    (void)arg;
++    for (;;) {
++        Sleep(500);
++        const LONG64 hb = s_stall_hb;
++        const ULONGLONG now = GetTickCount64();
++        /* Guest stopped flipping for 10 s (after it had started): dump every
++         * thread once per stopped flip count. */
++        { extern unsigned cellGcm_flip_request_count(void);
++          const unsigned f = cellGcm_flip_request_count();
++          if (f != last_flips) { last_flips = f; flip_t = now; }
++          else if (f && f != dumped_flips && now - flip_t >= 10000) {
++              dumped_flips = f;
++              fprintf(stderr, "[STALL] no guest flip for %llu ms at flips=%u: all threads%c",
++                      (unsigned long long)(now - flip_t), f, 10);
++              stall_dump_all_threads();
++          } }
++        /* Every 5 s: is the guest still flipping, and is the FIFO drained? */
++        if (now - last_status >= 5000) {
++            extern unsigned cellGcm_flip_request_count(void);
++            extern u32 cellGcm_control_guest_addr(void);
++            extern u32 vm_read32(unsigned int);
++            last_status = now;
++            extern void cellGcm_flip_debug(char*, unsigned);
++            const u32 ctl = cellGcm_control_guest_addr();
++            char fd[400]; cellGcm_flip_debug(fd, sizeof fd);
++            fprintf(stderr, "[STALL] status stage=%s hb_age=%llu flips=%u frames=%llu pending=%u"
++                            " put=0x%08X get=0x%08X %s%c", (const char*)s_stall_stage,
++                    (unsigned long long)(hb ? now - (ULONGLONG)hb : 0),
++                    cellGcm_flip_request_count(), (unsigned long long)s_d3d.frame_count,
++                    s_d3d.draw_count, vm_read32(ctl), vm_read32(ctl + 4), fd, 10);
++            fflush(stderr);
++        }
++        if (!hb || hb == reported || now - (ULONGLONG)hb < lim) continue;
++        reported = hb;
++        DWORD64 rips[40];
++        const int n = s_stall_thread ? stall_unwind(s_stall_thread, rips, 40) : 0;
++        fprintf(stderr, "[STALL] frame-clock thread at '%s' for %llu ms, stack:%c",
++                (const char*)s_stall_stage, (unsigned long long)(now - (ULONGLONG)hb), 10);
++        stall_print_stack(rips, n);
++        fflush(stderr);
++    }
++    return 0;
++}
++static void stall_watch_start(void)
++{
++    if (!stall_dbg_secs() || s_stall_thread) return;
++    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
++                    &s_stall_thread, THREAD_ALL_ACCESS, FALSE, 0);
++    stall_mark("init");
++    HANDLE t = CreateThread(NULL, 0, stall_watch, NULL, 0, NULL);
++    if (t) CloseHandle(t);
++}
++
+ static void wait_for_gpu(void)
+ {
+     u32 fi = s_d3d.frame_index;
+@@ -1894,6 +2037,7 @@
+ }
+ 
+ static int s_present_this_frame;   /* defined with the present path below */
++static int s_bb_continue = 0;      /* next render_frame keeps the backbuffer (batch_room) */
+ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+ {
+     char dir[300]; const char* base = getenv("RSX_CAP_DIR");
+@@ -5347,7 +5491,9 @@
+      * polygons). These workloads are a few draws/frame, so full serialisation
+      * costs little. */
+     const double _pf0 = rsx_prof_on() ? perf_now() : 0.0;
++    stall_mark("rf:gpuwait");
+     wait_for_gpu();
++    stall_mark("rf:record");
+     const double _pf1 = _pf0 ? perf_now() : 0.0;
+     if (_pf0) { s_prof[PF_RF_WAIT] += _pf1 - _pf0; s_prof_rf++; s_prof_rdraws += s_d3d.draw_count; }
+     rdoc_frame_begin(s_d3d.draw_count);
+@@ -5935,13 +6081,18 @@
+     /* Set render target + depth */
+     s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
+ 
+-    /* Clear color and depth */
++    /* Clear color and depth -- unless this batch continues one batch_room
++     * executed early with display draws in it (same backbuffer: no Present
++     * came between). */
++    if (!s_bb_continue) {
+     s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
+         s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
+     s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(
+         s_d3d.cmd_list, dsv_handle,
+         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+         1.0f, 0, 0, NULL);
++    }
++    s_bb_continue = 0;
+ 
+     /* Set viewport and scissor */
+     D3D12_VIEWPORT viewport = {0, 0, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f};
+@@ -6723,7 +6874,9 @@
+     if (_pf0) s_prof[PF_RF_TAIL] += _pf3 - _pf2;
+     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
++    stall_mark("rf:exec");
+     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
++    stall_mark("rf:post");
+     double _pf4 = _pf0 ? perf_now() : 0.0;
+     if (_pf0) s_prof[PF_SUBMIT] += _pf4 - _pf3;
+ 
+@@ -6907,6 +7060,7 @@
+     /* Present, on the vblank unless D3D12_VSYNC=0: that one is for measuring a
+      * title past the display's rate. Skipped for an offscreen-only batch. */
+     if (_pf0) _pf4 = perf_now();   /* debug dumps above are not "submit" */
++    stall_mark("rf:Present");
+     if (s_present_this_frame) {
+         if (!d3d12_vsync_off())
+             s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+@@ -6919,10 +7073,12 @@
+ 
+     const double _pf5 = _pf0 ? perf_now() : 0.0;
+     if (_pf0) s_prof[PF_PRESENT] += _pf5 - _pf4;
++    stall_mark("rf:nextwait");
+     move_to_next_frame();
+     if (_pf0) { s_prof[PF_NEXT] += perf_now() - _pf5; rsx_prof_report(); }
+ 
+     s_d3d.frame_count++;
++    stall_mark("rf:tail");
+ 
+     /* RPCS3-style titlebar stats, refreshed once a second: presented FPS,
+      * draw count of the last frame, and the backbuffer size. */
+@@ -6939,6 +7095,7 @@
+                      g_rsx_title_base,
+                      s_tframes * 1000.0 / (double)(tnow - s_tt0),
+                      s_dbg_last_draws, s_d3d.width, s_d3d.height);
++            stall_mark("rf:title");
+             SetWindowTextA(s_d3d.hwnd, tb);
+             s_tframes = 0;
+             s_tt0 = tnow;
+@@ -7030,6 +7187,7 @@
+ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
+ {
+     (void)ud;
++    stall_mark("drain:clear");
+ 
+     /* Convert RSX ARGB u32 to float[4] RGBA */
+     float cc[4];
+@@ -7159,6 +7317,46 @@
+     s_d3d.vp_ib_offset = 0;
+ }
+ 
++/* The drain passed a guest flip without stopping (FIFO backlogged, see
++ * g_gcm_flip_passed_hook): present what is accumulated now, so the frame ends at
++ * its flip and not at whatever the drain reached next. Recorded as a clear-style
++ * boundary, so the ticker's present for this flip and a display clear later in
++ * the next frame do not present again. Only the first flip passed in one drain
++ * presents (each present waits a vblank, and a title megabytes behind is
++ * catching up); later ones run their draws unpresented, like before.
++ * RSX_FLIP_MARK=0 turns it off. */
++static void d3d12_flip_passed(int nth)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_FLIP_MARK"); on = (e && e[0] == '0') ? 0 : 1; }
++    if (!on || !s_d3d.initialized) return;
++    int have_display = 0;
++    for (u32 i = 0; i < s_d3d.draw_count && i < MAX_DRAWS; i++)
++        if (dr_is_display_draw(&s_d3d.draws[i])) { have_display = 1; break; }
++    if (!have_display) return;
++    extern unsigned cellGcm_flip_request_count(void);
++    const unsigned fc = cellGcm_flip_request_count();
++    if (nth > 0) {
++        s_rf_why = "flipmark-skip";
++        s_present_this_frame = 0;
++        render_frame();
++        s_present_this_frame = 1;
++    } else {
++        s_rf_why = "flipmark";
++        s_present_this_frame = 1;
++        render_frame();
++        s_clear_presents++;
++        s_last_clear_boundary_flip = fc;
++        s_last_clear_presented_flip = fc;
++    }
++    /* Same batch reset as the clear boundary. */
++    for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++) s_d3d.draws[_i].indexed = 0;
++    s_ix_run_valid = 0;
++    s_d3d.draw_count   = 0;
++    s_d3d.vb_offset    = 0;
++    s_d3d.vp_vb_offset = 0;
++}
++
+ static void d3d12_set_render_target(void* ud, const rsx_state* state)
+ {
+     (void)ud;
+@@ -8255,17 +8453,44 @@
+  * buffer, so the main pass of that frame was never recorded -- the sky dome
+  * drawn first showed through as cyan, or the batch had no display draw and was
+  * not presented (RSX_PROF: "9 frames ... 60 rf"). Only offscreen and depth-only
+- * work is in such a batch, which persists in its own targets; once a display
+- * draw is recorded the batch is left alone, since executing it early would
+- * lose that draw's output to the next batch's backbuffer clear. */
++ * work is in such a batch, which persists in its own targets.
++ *
++ * A batch that already holds display draws is executed early too, unpresented,
++ * and the next batch then keeps the backbuffer (and the shared depth buffer)
++ * instead of clearing it, so those draws still reach the screen with whatever
++ * follows. While the FIFO is backlogged the drain runs past a flip into the next
++ * frame's shadow pass (2000+ depth-only draws) before the display clear that
++ * presents frame N; frame N's ~1800 display draws plus that pass overflowed the
++ * vertex buffer and the tail was dropped (vbdrop=13 a frame). RSX_FULL_SPLIT=0
++ * restores the old drop. */
++static int full_split_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_FULL_SPLIT"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
+ static void batch_room(u32 verts)
+ {
+     if (!s_d3d.initialized || !s_d3d.draw_count) return;
+     if (s_d3d.draw_count + 4u < MAX_DRAWS &&
+         (u64)s_d3d.vp_vb_offset / VP_VERT_STRIDE + verts <= VP_MAX_VERTICES)
+         return;
++    int has_disp = 0;
+     for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
+-        if (dr_is_display_draw(&s_d3d.draws[_i])) return;
++        if (dr_is_display_draw(&s_d3d.draws[_i])) { has_disp = 1; break; }
++    if (has_disp) {
++        if (!full_split_on()) return;
++        { static int _n = 0; if (PS3_LOG_FIRST(_n, 3))
++            fprintf(stderr, "[BATCHFULL] %u records, %u verts with display draws:"
++                            " executing now, backbuffer kept for the rest%c", s_d3d.draw_count,
++                    (unsigned)(s_d3d.vp_vb_offset / VP_VERT_STRIDE), 10); }
++        s_present_this_frame = 0;
++        s_rf_why = "full-disp";
++        render_frame();
++        s_present_this_frame = 1;
++        s_bb_continue = 1;
++        return;
++    }
+     { static int _n = 0; if (PS3_LOG_FIRST(_n, 3))
+         fprintf(stderr, "[BATCHFULL] %u records, %u verts before any display draw:"
+                         " executing the offscreen part now%c", s_d3d.draw_count,
+@@ -9023,6 +9248,8 @@
+                  title ? title : "ps3recomp");
+     }
+     s_d3d.hwnd = create_window(width, height, title);
++    stall_watch_start();
++    { extern void (*g_gcm_flip_passed_hook)(int); g_gcm_flip_passed_hook = d3d12_flip_passed; }
+     if (!s_d3d.hwnd) {
+         printf("[D3D12] ERROR: Window creation failed\n");
+         return -1;
+@@ -9119,16 +9346,19 @@
+ int rsx_d3d12_backend_pump_messages(void)
+ {
+     MSG msg;
++    stall_mark("pump");
+     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+         if (msg.message == WM_QUIT) return -1;
+         TranslateMessage(&msg);
+         DispatchMessageA(&msg);
+     }
++    stall_mark("loop");
+     return s_d3d.window_closed ? -1 : 0;
+ }
+ 
+ void rsx_d3d12_backend_present(void)
+ {
++    stall_mark("flip-present");
+     if (blink_dbg())
+         printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
+                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);
