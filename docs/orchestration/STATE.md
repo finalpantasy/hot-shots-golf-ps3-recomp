@@ -320,3 +320,10 @@ Add timed captures to the scratch `ghost_shot.py`, run 150 s with Cross presses,
 ### Exact next action
 
 When the lift worker reports: check the course capture again (lighting, sky, triangles may depend on the job), then commit and push.
+
+## 2026-11-17 run 13: workers out
+
+- `boot-fix-1.02-ccap-1.log` (build `build/jq-a8ba648b/`, 165 s, no input): demo hole 8 at 25.59 FPS, 490 draws: green, flag, trees, sky. Bugs: opaque black boxes around foliage, terrain too dark. Captures in `work/runtime/rsxcap-course/frame_01..04`.
+- Worker `a5185470777d90621` (Opus, reason: shader and RSX state debugging) owns `libs/video/**`, patch `0024`: foliage boxes, dark terrain, title sky squares.
+- Worker `aa354238187c29d59` (Sonnet) still owns `tools/spu_*`, `port/spu/**` for job `0x00CAB400`.
+- Coordinator edits none of those; both workers build under `BUILD.lock`.
