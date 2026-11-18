@@ -67,3 +67,7 @@ The NULL-pointer cascade ending at `func_007B5B70+0x7E9` came from the runtime's
 ## 2026-11-17 update 2: first SPURS job runs
 
 The first SPURS job (`0x00CB3580`) is lifted and runs to completion, `cellSpursJobChainSetExceptionEventHandler` has a handler, and the title ID is read from `PARAM.SFO` (`NPUA80864`). The executable has command-line flags (see `docs/CLI.md`). The window still shows no game frame (0 draws). Next blockers and evidence: `docs/orchestration/STATE.md`.
+
+## 2026-11-17 update 3: second SPURS instance starts
+
+Two ps3recomp SPURS bugs are fixed: port bindings shared across instances, and a 32-entry job guard table. The game's `sgx-spurs-` instance now stays up and the host backend counts 2,048 draw calls in 20 s. The window is still one solid color. Two render jobs are not lifted yet. Evidence: `docs/orchestration/STATE.md`.

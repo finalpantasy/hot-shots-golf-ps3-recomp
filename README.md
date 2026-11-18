@@ -2,7 +2,7 @@
 
 A native Windows port of the PS3 game Hot Shots Golf: World Invitational (US, `NPUA80864`, known as Everybody's Golf 6 outside North America), made by statically recompiling the PS3 executable to x86-64 with [ps3recomp](https://github.com/sp00nznet/ps3recomp). No emulator runs underneath it.
 
-**It is not playable yet.** The build compiles, starts, opens a D3D12 window and runs the game's boot code. It does not draw a single frame of the game. Nothing here will let you play golf today.
+**It is not playable yet.** The build compiles, starts, opens a D3D12 window and runs the game's boot code. It does not show a single frame of the game. Nothing here will let you play golf today.
 
 ## Status
 
@@ -13,9 +13,9 @@ Updated 2026-11-17.
 | Decrypt and extract the packages | Done for the fixed 1.02 profile |
 | Lift PPU code to C++ | Done: 33,221 functions |
 | Build a native executable | Done: one 446 MB `.exe`, no extra DLLs |
-| Boot | Runs for 20 s without a crash, then the thread pool waits on a value that stays zero. Seven system calls the game imports have no handler |
-| SPU jobs | The first SPURS job is lifted and runs. Others are not lifted yet |
-| Rendering | Not working. The window stays black, 0 draw calls |
+| Boot | Runs for 20 s without a crash. Both SPURS instances start and the renderer issues draw calls |
+| SPU jobs | 1 job lifted and running. 2 render jobs are not lifted yet and are skipped |
+| Rendering | Not working. The host counts 2,048 draw calls, but the window is one solid color |
 | Menu, gameplay, audio, saves | Not reached |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).

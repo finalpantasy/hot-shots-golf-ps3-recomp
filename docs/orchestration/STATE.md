@@ -137,3 +137,34 @@ Label is unchanged: Lifted, boot in progress. No guest frame was drawn.
 ### Exact next action
 
 Identify the library of the seven NIDs from the import stubs in the log lines just before each `unresolved NID`, name them with `compute_nid` candidates, and trace the writer of `0x1103C1EC` to learn what the thread pool is waiting for.
+
+## 2026-11-17 run 3: SPURS instance ports and job guard table
+
+Build SHA-256 `b99080d22afd02043799606c9690a4eae9ef23f262f407db1c290bdd42ed50e0`. Build log `build-fix-1.02-guards2.log`, boot log `boot-fix-1.02-guards2.log` (20 s, hidden desktop). Both fixes are in ps3recomp `libs/spurs/cellSpurs.c`, exported with the job chain handler as patch `0002-cellspurs-jobchain-handler-instance-ports-guard-table.patch`.
+
+1. Port bindings were one global table. The game's `MG6_` SPURS instance binds static port 1, then its `sgx-spurs-` instance asks for port 1 too and got `0x8041070A` (busy). The game logged `failed to create SPURS printf server event` and shut that instance down, so its renderer never started. Bindings are now per instance. Limit: the SPU-side lookup `spurs_port_queue(port)` still takes the first instance that bound the port.
+2. The job guard table held 32 guards. The game initializes 1,039 in this run and guard 33 failed with `0x80410901`. The table is now append-only with a hash index and room for 32,768.
+
+| Marker | Run 2 | Run 3 |
+| --- | --- | --- |
+| `failed to create SPURS printf server event` | 1 | 0 |
+| `terminate SPURS` | 1 | 0 |
+| `JobGuardInitialize` succeeded | 32 | 1,039 |
+| `failed to initialize job v2 guard` | not reached | 0 |
+| window title draw count | 0 | 2,048 |
+| captured window | one solid color | one solid color |
+| `[null-call]` | 0 | 5 (`lr=0x007B56CC`) |
+| `bctr to NULL` | 0 | 400 |
+
+The draw count is the host backend's counter. The captured window is still a single color, so no guest frame is claimed. Label unchanged: Lifted, boot in progress.
+
+### Next blockers from run 3
+
+1. Two SPURS jobs on the `sgx-spurs-` instance are not lifted and miss on every dispatch: fingerprint `0xFDFFAAC1BCD5352E` (34,704 bytes, job `0x1192CC00`) and `0xCB9BD0241BB0DE67` (53,280 bytes, job `0x1192CB80`). Add them to `tools/spu_jobs.json` if they pass the lifter's strict checks.
+2. `[null-call]` near `lr=0x007B56CC` on tid 1 with `r12=0x48000042`, 5 times, and 400 `bctr to NULL` lines. Cause not traced.
+3. Unresolved imports, all outside the boot path so far: `cellHttp` (5), `sceNp` (2), `cellFont` (2), `cellFontFT` (1), `libgem` (1), `cellCamera` `0x0E63C444` (23 calls), `sys_crashdump` (1). Names are not identified.
+4. The earlier thread pool `HOTREAD` lines are gone in this run.
+
+### Exact next action
+
+Lift the two `sgx-spurs-` jobs, then trace the NULL call at `lr=0x007B56CC`.
