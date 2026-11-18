@@ -480,3 +480,11 @@ On the rendering worker's report: check captures, commit 0031, re-run the swing 
 ### Exact next action
 
 Start a rendering worker on the stretched lie block and the black depth-restore frames (owns `libs/video/**`, output `0033`). Tell Codex to add 0031 and 0032 to the patch replay and expose `RSX_DISP_TEX`, `PAD_SCRIPT_HOLD`, `JC_PARALLEL`, `RSX_SHADER_CACHE` as CLI flags. Refresh the handoff.
+
+- Rendering worker `af92c80089099214a` (Opus) started 06:55: owns `external/ps3recomp/libs/video/**`, output `0033-rsx-lie-block.patch` (stretched lie block, black depth-restore frames, 8 dropped draws).
+- 07:55 two more workers (Sonnet): audio `a5f6aa7a3f3cb0508` owns `libs/audio/**`, output `0034-audio-wav-capture.patch` (`AUDIO_WAV=<path>` capture and analysis); input `acd0d1afbac103c9a` owns `libs/input/**`, output `0035-pad-real-input.patch` (XInput and keyboard mapping test). Boots serialize on `BUILD.lock`.
+
+## 2026-11-18 run 28: lie inset fixed, patch 0033
+
+- Worker `af92c80089099214a` finished. `0033-rsx-lie-block.patch` (`libs/video/rsx_d3d12_backend.c`, on top of 0031): display draws scale the viewport from the guest surface size (1600x1080) to the backbuffer (`RSX_VP_SCALE=0` off). Debug switches added: `RSX_CAP_SECS`, `RSX_CAP_CB`, `VP_INFO`, `DSCONV_DBG=<addr>`. Final build sha8 `bbac1f19`, marker all zero. Sheets: scratchpad `lie\lie13sheet.png`.
+- Open: black whole frames about 2 per 6 to 14 shots (`lie13-1-t235.png`, `t255`), not only depth restore (lie6 t250, 3405 draws); render stall on hole 1 intro in lie2, lie3, lie12 (game keeps running); 8 dropped draws.

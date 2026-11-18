@@ -189,3 +189,9 @@ With the whole scene drawn, views with 1800 to 2300 draws run at 19 to 32 FPS an
 A scripted round (boot `swing3`, 440 seconds) finished hole 1, a par 4, at +4, showed the leaderboard and started hole 2. Captures are `docs/images/round-leaderboard-2026-11-18.png`, `docs/images/round-swing-2026-11-18.png` and `docs/images/tee-closeup-2026-11-18.png`.
 
 Still wrong: the grass block under the ball is often drawn as a large stretched shape, in green, gray or black and white, covering the swing gauge. A few close-up frames are black because a depth restore reads zero. 8 draws were dropped in one run. The 768 MB buffer has not been tried on a machine with little memory. No real controller has been tried.
+
+## 2026-11-18 update 20: the lie inset draws in its corner
+
+The small picture of the ball's lie (grass or sand under the ball) was drawn stretched across the whole screen. The game draws it at 1277,777, 323 by 258 pixels on a 1600 by 1080 surface. That rectangle failed the bounds check against our 1280 by 720 backbuffer, so the draw fell back to a full-screen viewport. Draws to the display now scale their viewport from the guest surface size to the backbuffer (patch `0033`, `RSX_VP_SCALE=0` turns it off). Close-up frame rate is unchanged at 14 to 21 FPS. Capture: `docs/images/round-address-2026-11-18.png`.
+
+Still wrong: whole frames come out black in about 2 of every 6 to 14 shots. The depth surface at `0x034C0000` was checked and is handled correctly, so it is not the only cause. In some runs the picture stops updating on the hole 1 intro while the game keeps running; this happened before `0033` too.

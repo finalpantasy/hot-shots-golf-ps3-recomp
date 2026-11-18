@@ -14,7 +14,7 @@ The title screen, drawn by the port and captured 2026-11-17. The dark squares at
 
 ![The attract demo flying over a hole: lit fairway, bunkers, a path and tree shadows](docs/images/demo-flyover-2026-11-18.png)
 
-![The first tee of a real round: the golfer addressing the ball with the course behind her](docs/images/round-tee-2026-11-18.png)
+![Hole 1 of a real round: the golfer addressing the ball, the swing gauge and the ball's lie in the corner](docs/images/round-address-2026-11-18.png)
 
 ![The round after two scripted shots: a bunker, a waterfall and the course from the ball position](docs/images/round-second-shot-2026-11-18.png)
 
@@ -39,7 +39,7 @@ Updated 2026-11-17.
 | Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout, lit terrain with tree shadows. |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
 | Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course" |
-| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots: the swing gauge runs, the ball is hit and the first hole (par 4) is finished at +4, the leaderboard shows, and hole 2 starts. The grass block under the ball is often drawn as a large stretched shape that covers the swing gauge, and a few close-up frames are black. Not tested with a real controller |
+| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots: the swing gauge runs, the ball is hit and the first hole (par 4) is finished at +4, the leaderboard shows, and hole 2 starts. Some captured frames come out black, and in some runs the picture stops updating on the hole 1 intro while the game keeps running. Not tested with a real controller |
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 
 ## What is in this repository
