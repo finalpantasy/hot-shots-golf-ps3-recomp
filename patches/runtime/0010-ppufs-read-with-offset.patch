@@ -1,0 +1,48 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 37e3745..73653b5 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -661,6 +698,35 @@ static void cellFsLseek(ppu_context* ctx)
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
++/* cellFsReadWithOffset(fd, offset, buf, size, nread*): read at an absolute
++ * offset and leave the descriptor's own position where it was. Hot Shots Golf
++ * WI loads its .xb archives with it. */
++static void cellFsReadWithOffset(ppu_context* ctx)
++{
++    int fd          = (int)(uint32_t)ctx->gpr[3];
++    int64_t off     = (int64_t)ctx->gpr[4];
++    uint32_t buf    = (uint32_t)ctx->gpr[5];
++    uint64_t nbytes = ctx->gpr[6];
++    uint32_t nread_ptr = (uint32_t)ctx->gpr[7];
++    FILE* f = fd_file(fd);
++    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
++    if (off < 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EINVAL; return; }
++    if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
++    fs_prefault(buf, nbytes);
++    fs_set_dir(fd, f, 1);
++    const int64_t before = FS_TELL64(f);
++    size_t n = 0;
++    if (FS_SEEK64(f, off, SEEK_SET) == 0)
++        n = fread(vm_base + buf, 1, (size_t)nbytes, f);
++    if (before >= 0) FS_SEEK64(f, before, SEEK_SET);
++    { static int logged = 0;
++      if (PS3_LOG_FIRST(logged, 8))
++          fprintf(stderr, "[fs] read_with_offset fd=%d off=%lld nbytes=%llu -> %zu\n",
++                  fd, (long long)off, (unsigned long long)nbytes, n); }
++    if (nread_ptr) vm_write64(nread_ptr, (uint64_t)n);
++    ctx->gpr[3] = CELL_OK;
++}
++
+ /* CellFsStat is 0x34 (52) bytes, 4-byte aligned -- the s64/u64 members are
+  * be_t<...,4> so there is NO 4-byte pad after gid (verified vs RPCS3:
+  * CHECK_SIZE_ALIGN(CellFsStat, 52, 4)). Laying it out 8-byte-aligned (0x38,
+@@ -1085,6 +1151,7 @@ extern "C" void ppu_fs_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsLseek"),    "cellFsLseek",    cellFsLseek);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsReadWithOffset"), "cellFsReadWithOffset", cellFsReadWithOffset);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsFGetBlockSize"), "cellFsFGetBlockSize", cellFsFGetBlockSize);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat);

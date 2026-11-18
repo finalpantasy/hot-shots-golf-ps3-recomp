@@ -1,5 +1,5 @@
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index b09220e..c66c709 100644
+index b09220e..eacc729 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -859,7 +859,28 @@ static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
@@ -54,7 +54,15 @@ index b09220e..c66c709 100644
      ReleaseSRWLockExclusive(&s_spurs_queue_lock);
  }
  
-@@ -897,7 +922,12 @@ static void spurs_cancel_attached_queues(u32 spurs_ea)
+@@ -894,11 +919,22 @@ static void spurs_cancel_attached_queues(u32 spurs_ea)
+  * with it the ack the SPU then blocks on in SPU_RdInMbox. Havok's SPU task
+  * stalls on the first physics step that way (port 2), and the PPU step waits
+  * for it forever. */
++#if defined(_MSC_VER)
++static __declspec(thread) int t_job_sent_user_event;
++#else
++static __thread int t_job_sent_user_event;
++#endif
  uint32_t spurs_port_queue(uint32_t port)
  {
      AcquireSRWLockShared(&s_spurs_queue_lock);
@@ -66,9 +74,11 @@ index b09220e..c66c709 100644
 +    for (int o = 0; port < 64 && o < MAX_SPURS_PORT_OWNERS && !q; o++)
 +        if (s_spurs_ports[o].owner) q = s_spurs_ports[o].q[port];
      ReleaseSRWLockShared(&s_spurs_queue_lock);
++    if (q) t_job_sent_user_event = 1;
      return q;
  }
-@@ -929,21 +959,23 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
+ 
+@@ -929,21 +965,23 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
       * 0x10..0x3F first (the low ports are the ones titles ask for by number),
       * and hand it back. This used to write 0 either way, so every attach
       * landed on port 0 and the SPU's real port number routed nowhere. */
@@ -96,7 +106,7 @@ index b09220e..c66c709 100644
      printf("[cellSpurs] AttachLv2EventQueue(queue=%u) port=%u%s\n", queue, p,
             isDynamic ? " (dynamic)" : "");
      ReleaseSRWLockExclusive(&s_spurs_queue_lock);
-@@ -954,7 +986,8 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
+@@ -954,7 +992,8 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
  {
      if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
      AcquireSRWLockExclusive(&s_spurs_queue_lock);
@@ -106,7 +116,7 @@ index b09220e..c66c709 100644
      ReleaseSRWLockExclusive(&s_spurs_queue_lock);
      printf("[cellSpurs] DetachLv2EventQueue(port=%u)\n", port);
      return CELL_OK;
-@@ -2797,7 +2830,12 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
+@@ -2797,7 +2836,12 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
   * what makes "run this job when I say so" mean anything.
   * -----------------------------------------------------------------------*/
  
@@ -120,7 +130,7 @@ index b09220e..c66c709 100644
  static struct {
      u32 ea;          /* guest CellSpursJobGuard address (128-byte aligned) */
      u32 count;       /* notifications still outstanding                    */
-@@ -2807,10 +2845,18 @@ static struct {
+@@ -2807,10 +2851,18 @@ static struct {
      int active;
  } s_jobguards[MAX_JOBGUARDS];
  
@@ -141,7 +151,7 @@ index b09220e..c66c709 100644
      return -1;
  }
  
-@@ -2828,9 +2874,13 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
+@@ -2828,9 +2880,13 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
      if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
  
      int i = jg_find(ea);
@@ -158,7 +168,38 @@ index b09220e..c66c709 100644
  
      s_jobguards[i].ea         = ea;
      s_jobguards[i].count      = notify_count;
-@@ -3188,6 +3238,47 @@ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
+@@ -2945,8 +3001,30 @@ static u64 spurs_event_data3_probe(void)
+     return (u64)(unsigned)v;
+ }
+ 
++static u32 s_real_evt_jc[16];
++static int s_real_evt_n = 0;
++
+ static void jc_signal_done(u32 jc_ea, int job_index)
+ {
++    /* A job that posts its own completion event (send_event or throw_event
++     * through the interrupt mailbox, delivered by spurs_port_queue on this
++     * thread) must not also get an invented one. The invented event carries
++     * the walker's lap counter in data2. Hot Shots Golf's sgx sound loop
++     * (func_00936F24) uses data2 as an index into a table of 128-byte entries
++     * and calls the entry's callback, so on its service-loop chain the counter
++     * ran past the table and the loop called through unrelated memory.
++     * SPURS_FAKE_JOB_EVENT=1 restores the invented event for comparison. */
++    {
++        static int s_fake = -1;
++        if (s_fake < 0) s_fake = getenv("SPURS_FAKE_JOB_EVENT") ? 1 : 0;
++        int known = 0;
++        for (int k = 0; k < s_real_evt_n; k++) if (s_real_evt_jc[k] == jc_ea) known = 1;
++        if (t_job_sent_user_event) {
++            t_job_sent_user_event = 0;
++            if (!known && s_real_evt_n < 16) { s_real_evt_jc[s_real_evt_n++] = jc_ea; known = 1; }
++        }
++        if (known && !s_fake) return;
++    }
+     /* Carry the job's mailbox answer in the completion event. On hardware the
+      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
+      * synthetic payload means the caller reads back zero for whatever it
+@@ -3188,6 +3266,47 @@ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
      return CELL_OK;
  }
  

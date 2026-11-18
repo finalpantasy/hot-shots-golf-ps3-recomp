@@ -48,3 +48,46 @@ Added 13 names to `external/ps3recomp/tools/nid_database.py` and exported `patch
 Checked the [RPCS3 module declarations](https://github.com/RPCS3/rpcs3/tree/0ebb63697666a54b44a4de69ef222c4ecee0001a/rpcs3/Emu/Cell/Modules), then used the project's `compute_nid` and `NIDDatabase.load_builtins` against `analysis/fix-1.02/EBOOT.imports.json`. `work/runtime/logs/nid-verify-codex-3.log` reports `PASS: 13 hashes, EBOOT library names, and built-in lookups agree.` The patch passed reverse application checking. Runtime dispatch is part of item 4.
 
 
+
+## 4. Peripheral handlers
+
+Registered the handlers in `port/stubs.cpp`. The changes cover `cellHttp`, `sceNp`, `cellCamera`, `cellGem`, `cellFont`, `cellFontFT`, and `sys_crashdump` in the ps3recomp libraries. The port selects offline HTTP and disables the virtual camera in `port/main.cpp`.
+
+The handlers validate HTTP client settings, return offline NP and device statuses, write camera and Move output records, store crash log registrations, and use local TTF files to render glyphs into guest surfaces. The first hidden boot reached nine of the 13 named imports and exposed a later Move import, `0xA03EF587`. Confirmed it as `cellGemPrepareCamera` with the project hash and import table. The same run showed that the game requests font set `0x209`, so the font handler now maps it to the Latin face.
+
+| Check | Evidence |
+|---|---|
+| Runtime patches | Updated `0007-peripheral-nid-names.patch` and added `0009-peripheral-handlers.patch`. Both passed reverse apply checking. |
+| Locked Git Bash build | `build-fix-1.02-codex-4b.log` ends with `[done] build`. |
+| Focused Clang harness | `peripheral-check-codex-4c.log` has `PASS: disconnected camera and Move statuses and guest outputs.` and `PASS: font library lifecycle, PPC float arguments, surface ABI, and nonzero glyph pixels.` It exercised all 14 registrations with guest-layout buffers and a local test TTF. |
+| Hidden desktop boots | `boot-fix-1.02-codex-4b.log` and `boot-fix-1.02-codex-4c.log` had zero unresolved imports. Both aborted before the later Move and font calls. |
+
+The actual game font pixels and the later call sites still need a run that advances past the abort.
+
+### Requests for Claude
+
+- Check the repeatable guest abort through `0x0077FFCC` and `0x007F266C` in both reruns.
+- The NID database scans C filenames and can replace the curated `libgem` label with `cellGem`. The ownership rule limits my change to names. Keep an existing entry when this scan finds the same NID.
+
+  ```diff
+  -                    self.add(module, m.group(1))
+  +                    name = m.group(1)
+  +                    if compute_nid(name) not in self._by_nid:
+  +                        self.add(module, name)
+  ```
+
+
+
+## 5. Single executable design
+
+The Windows executable starts the fixed 1.02 profile when it finds the startup files. If either file is missing, display the expected locations and return exit code 1 before creating runtime folders or allocating guest memory. Keep the message open when Explorer opens a new console for the process.
+
+| Part | Rule |
+|---|---|
+| Runtime folder | Use the executable folder by default. Override it with `--build-dir`. |
+| Discovery | Look for `PARAM.SFO` and `USRDIR/EBOOT.elf` in the `game` subfolder, then in the runtime folder itself. |
+| Overrides | Honor explicit game and ELF paths, the existing positional ELF form, and the `PS3_GAME` layout under an explicit game root. |
+| Firmware | Provide `--dev-flash` for optional firmware. |
+| Distribution | The Windows executable contains the lifted code and links to Windows system DLLs. The tarball gate applies if a release ships an AppImage. |
+
+

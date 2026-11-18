@@ -242,3 +242,34 @@ Seen in every run since SGX initialize was reached: `*** sgxbus.c(934) : failed 
 ### Exact next action
 
 Run `build/frame1-3d6db76d/` five times for 20 s each and record good or bad per run, to get the failure rate. Then trace `func_00936F24` around `+0x19FE` in `generated/fix-1.02/recompiled` to find the object whose function table is unset.
+
+## 2026-11-17 run 7: black boots traced to the invented job event
+
+Failure rate on `build/frame1-3d6db76d/`: 4 of 5 runs (`boot-fix-1.02-rate-1..5.log`) had `bctr to NULL`; the frame is black or partial in those.
+
+Cause: `jc_signal_done` in `libs/spurs/cellSpurs.c` invents the job-completion event. It sends `data2 = lap counter` to every attached queue. The game's loop in `func_00936F24` (`sgx-audio-thr`) uses `data2` as an index into a table of 128-byte entries at `jc+0x200` and calls the entry's callback. The `soc-job` chain is a service loop, so the counter passes the end of the table (129 entries) and the loop calls through whatever memory lies beyond it (`r12=0x48000084`).
+
+What the job really posts (run with `SPU_MBOXTRACE=1`, log `boot-fix-1.02-mbox-1.log`): outbound mailbox = the answer (for example `0x400`, `0xB4D0`, `0x8A10`, `0x2000`), interrupt mailbox = `0x50000000 | index`. `0x50` is `throw_event` on SPU port 16, and port 16 is the dynamic port of queue 3 (`AttachLv2EventQueue(queue=3) port=16`). Index was 0 for the 25 setup queries and 1 for the audio loop.
+
+Change (in tree, patch not exported yet): when a job posted an interrupt mailbox word, send `data2 = word & 0xFFFFFF`, `data3 = outbound mailbox`, only to the queue bound to that port. `SPURS_FAKE_JOB_EVENT=1` restores the old behavior. The dropped answers may also explain `sgxbus.c(934) : failed to regist module`; not confirmed.
+
+Active worker: `a815d8ff935f4a9cb` (Opus, blue-only frame, owns `libs/video/**` except window code, builds under `BUILD.lock` as `blue-worker`, will export patch `0009`).
+
+## 2026-11-17 run 8: black boots fixed, game reaches the title menu load
+
+Run 7's first two attempts did not work: the SPU user-event hook consumes the interrupt mailbox word before `jc_signal_done` can see it, and it already delivers the real event to the right queue. The invented event was simply extra. Final change in `libs/spurs/cellSpurs.c` (patch `0002`, re-exported): `spurs_port_queue` sets a thread-local flag when a job's own event is delivered; `jc_signal_done` then marks the chain and sends no invented events for it. `SPURS_FAKE_JOB_EVENT=1` restores the old behavior.
+
+Also added `cellFsReadWithOffset` (`sys_fs` NID `0x0D5B4A14`) in `runtime/ppu/ppu_fs.cpp`, patch `0010-ppufs-read-with-offset.patch`. The game reads its `.xb` archives with it.
+
+Evidence, build `build/evt3-7c4f6c46/`, logs `boot-fix-1.02-evt3-1..4.log`: 4 of 4 runs have 0 `bctr to NULL`, 0 `null-call`, 0 `887A0005`, and `sgxbus.c(934) : failed to regist module` is gone. The game leaves the autosave notice, shows "Auto-loading..." (`docs/images/auto-loading-2026-11-17.png`, still blue only), then opens `title.US_01.xb`, `coursebg_menu.xb` and the avatar archives.
+
+### Next blockers
+
+1. Job `0xCAD980` (fingerprint `79D3C33093353269`, 17904 bytes) is dispatched 24 times in 20 s and is not lifted. Worker `ae1d90fb014b205b9` (Opus) owns `tools/spu_*` and `port/spu/**` for this.
+2. Blue-only frame: worker `a815d8ff935f4a9cb` (Opus), patch `0009`.
+3. `cellSail` imports unresolved: `0x018281A8` `cellSailGraphicsAdapterGetFrame2`, `0x44A20E79` `cellSailGraphicsAdapterUpdateAvSync`, `0x5F7C7A6F` `cellSailPlayerSetParameter`, `0x1C9D5E5A` (not named). Passed to Codex by mailbox.
+4. The new chain `0x12E74800` still gets invented events on queue 1 (`d2` counts 0 to `0x1D`); correct only if its jobs never post their own.
+
+### Exact next action
+
+When both workers report: rebuild, run 5 boots of 30 s, view the captures, then update docs and push.
