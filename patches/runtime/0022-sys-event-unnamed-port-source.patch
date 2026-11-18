@@ -1,0 +1,16 @@
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index 6f72c1e..90af04e 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -1113,7 +1113,10 @@ int64_t sys_event_port_send(ppu_context* ctx)
+         return (int64_t)(int32_t)CELL_ESRCH;
+ 
+     sys_event_t evt;
+-    evt.source = p->name;
++    /* Unnamed ports report (pid << 32) | port id, as LV2 does. */
++    { extern int32_t sys_process_getpid(void);
++      evt.source = p->name ? p->name
++                 : (((uint64_t)(uint32_t)sys_process_getpid() << 32) | port_id); }
+     evt.data1  = data1;
+     evt.data2  = data2;
+     evt.data3  = data3;

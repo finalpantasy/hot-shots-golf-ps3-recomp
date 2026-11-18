@@ -95,3 +95,16 @@ Still open: only the blue channel is shown, one SPURS job used during the title 
 The blue-only picture is fixed. The RSX vertex code ignored vertex arrays with stride 0, which the game uses for its 2D color values, so red and green came out as zero. See `docs/images/autosave-notice-2026-11-17.png`.
 
 The SPURS job used by the title load is lifted (14 jobs, no dispatch misses). The game now shows the JAPAN Studio logo and starts its intro movie, where it stops: the movie player library (`cellSail`) is a stub. There is no video decoder in the port yet.
+
+## 2026-11-17 update 8: title screen, New Game accepted
+
+The game reaches its title screen ("New Game", "HSG Info") in about a minute. See `docs/images/title-screen-2026-11-17.png`. Four fixes got it there:
+
+- `cellSail` now reports the full player event sequence and ends the intro movie at once, with the log line `[cellSail] no decoder: movie <uri> skipped`. No video is decoded.
+- `sys_event_port_send` sets the event source of an unnamed port to `(pid << 32) | port id`. It sent 0, and the game drops movie player events whose source does not match.
+- The job chain walker treats a jump-to-self command as a parked chain and polls it. It used to stop the chain after 4096 reads, after which no queued job ran and the title drew at 0.25 FPS.
+- Invented job completion events go only to the queues of the chain's own SPURS instance. They went to every attached queue, including the sound engine's, which crashed its service loop once the chain above stayed alive.
+
+A scripted Cross press (`PAD_SCRIPT`) on "New Game" is accepted: the game writes save `NPUA80864` (five data files), looks for saves of the previous game (`BCUS98115`), and loads the next scene. That scene has not been looked at yet.
+
+Open: `cellOskExtUtility` imports `0x7C95FEB8` and `0x09565B21` are unresolved and are called after "New Game". The title runs at 8 to 20 FPS. A few squares in the title sky draw black or gray.

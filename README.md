@@ -2,11 +2,11 @@
 
 A native Windows port of the PS3 game Hot Shots Golf: World Invitational (US, `NPUA80864`, known as Everybody's Golf 6 outside North America), made by statically recompiling the PS3 executable to x86-64 with [ps3recomp](https://github.com/sp00nznet/ps3recomp). No emulator runs underneath it.
 
-**It is not playable yet.** The build compiles, starts, opens a D3D12 window, runs the game's boot code, draws the autosave notice, the loading screens and the JAPAN Studio logo, and then stops at the intro movie. Nothing here will let you play golf today.
+**It is not playable yet.** The build compiles, starts, opens a D3D12 window, runs the game's boot code, draws the autosave notice, the loading screens, the JAPAN Studio logo and the title screen, and takes "New Game" from a scripted button press. The intro movie is skipped because there is no video decoder. Nothing here will let you play golf today.
 
-![The autosave notice over a course background, drawn by the port](docs/images/autosave-notice-2026-11-17.png)
+![The title screen with New Game and HSG Info, drawn by the port](docs/images/title-screen-2026-11-17.png)
 
-The game's first screen, drawn by the port and captured 2026-11-17.
+The title screen, drawn by the port and captured 2026-11-17. The dark squares at the top left are a rendering bug.
 
 ## Status
 
@@ -17,11 +17,12 @@ Updated 2026-11-17.
 | Decrypt and extract the packages | Done for the fixed 1.02 profile |
 | Lift PPU code to C++ | Done: 33,221 functions |
 | Build a native executable | Done: one 446 MB `.exe`, no extra DLLs |
-| Boot | Runs to the intro movie. Both SPURS instances start and game archives load |
-| SPU jobs | 14 jobs lifted. No job is missing up to the intro movie |
-| Rendering | Works for the first screens: autosave notice, loading screens, studio logo |
-| Intro movie | Not working. The movie player library is a stub and there is no video decoder |
-| Menu, gameplay, audio, saves | Not reached |
+| Boot | Runs to the title screen in about a minute. Both SPURS instances start and game archives load |
+| SPU jobs | 14 jobs lifted. No job is missing up to the title screen |
+| Rendering | Works up to the title screen, with a few wrong squares in the sky. 8 to 20 FPS there |
+| Intro movie | Skipped. The player reports the movie as finished because there is no video decoder |
+| Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
+| Menus after the title, gameplay, audio | Not verified |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 

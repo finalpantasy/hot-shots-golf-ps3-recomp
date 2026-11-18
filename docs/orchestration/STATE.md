@@ -283,3 +283,22 @@ When both workers report: rebuild, run 5 boots of 30 s, view the captures, then 
 - Boot speed varies from 2 to 63 FPS between runs while workers load the machine. Not investigated.
 
 Chain shutdown fix verified: build `build/stop-c1a9d00d/`, `boot-fix-1.02-stop-1..5.log`, 5 of 5 runs with 0 `failed to regist module`, 0 `bctr to NULL`, 0 `null-call`, 0 `887A0005`. Patch `0002` re-exported.
+
+## 2026-11-17 run 10: title screen, New Game accepted
+
+- Sail worker `ab6124b51bf7bd01e` finished: `libs/codec/cellSail.*`, patch `0021`. Movie is skipped with a logged line.
+- `runtime/syscalls/sys_event.c`: unnamed port source is `(pid << 32) | port id`, patch `0022`. Without it `func_00877D40` drops every cellSail event.
+- `libs/spurs/cellSpurs.c`, patch `0002` re-exported: (a) a NEXT or RESET_PC that targets its own slot is polled, not counted idle. Chain "chlib/spu/Spu.cpp" parks that way and was killed after 4096 reads ("malformed?"), title at 0.25 FPS. (b) `jc_signal_done` pushes only to queues owned by the chain's SPURS instance (`s_jobchains[].spurs_ea`). With (a) alone, 2 of 2 boots crashed in `func_00936F24` (400 `bctr to NULL`) because chlib job counters reached sgx queue 3. (c) The idle bound now prints the last 32 commands walked.
+- Evidence: build `build/own-d5b1fd2d/`, logs `boot-fix-1.02-own-1..2.log`, 90 s, `PAD_SCRIPT=62:0x4000,70:0x4000,78:0x4000,84:0x4000`. Both runs: 0 `bctr to NULL`, 0 `null-call`, 0 `failed to regist`, 0 `malformed`. Run 1: title at 7.93 FPS, Cross accepted, `SAVE complete for 'NPUA80864'`, `AutoLoad2 BCUS98115`, new chlib chain created. Run 2 (slower boot): "Now Loading" after the first press.
+- Earlier build `build/title-11307e93/` (sys_event fix only): title in 2 of 3 runs at 60 s; the third was still at "Auto-loading...".
+
+### Next blockers
+
+1. Unresolved `cellOskExtUtility` NIDs `0x7C95FEB8`, `0x09565B21`, called after New Game. `cellOskDialog] Abort()` follows. Passed to Codex by mailbox.
+2. What the game shows after New Game is not captured yet. Needs timed multi-capture in `ghost_shot.py`.
+3. Title FPS 8 to 20, and black or gray squares in the title sky.
+4. `gen_hle_nids.py --all` is not rerun by the pipeline when only HLE sources change.
+
+### Exact next action
+
+Add timed captures to the scratch `ghost_shot.py`, run 150 s with Cross presses, view the frames after New Game.
