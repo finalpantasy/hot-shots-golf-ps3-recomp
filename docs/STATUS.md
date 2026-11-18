@@ -243,3 +243,11 @@ Codex replaced the 4 ms sleep in the FIFO drain loop (`port/main.cpp`) with a wa
 With all three, a 450-second scripted round (boot `round37`) holed out on hole 1, finished hole 2 and reached hole 3, where the same script on the previous build was still putting on hole 1. Capture: `docs/images/round-holed-2026-11-18.png`.
 
 New problems in that run: two black captures mid-hole and one frame with inverted colors (purple grass, orange sky). A worker is narrowing down which change causes them. The window title no longer shows FPS.
+
+## 2026-11-18 update 25: correction, the swing still has black frames
+
+Update 23 said a 450-second run had no black frames. That run took a capture every 16 seconds. With captures every 6 seconds, both the `round36` build and the current build show black frames during swings: 3 and 5 of 41 captures. A backbuffer dump showed 42 of 150 presented frames black, in runs of 60 to 120 frames from address to impact. So the black frames fixed in update 23 were one cause, not the only one, and the speed and load changes did not cause these.
+
+Cause, found by a worker: during the swing the game draws one background frame, then for several frames draws only the golfer on top of it, starting without a clear and restoring depth from a saved copy at `0x034C0000`. The backend clears the color target to black at the start of those frames, and its main depth buffer lives only on the GPU, so the saved copy reads as zero and every later draw fails the depth test. The inverted-color frames at impact may be the game's own flash effect; that is not proven. A worker is changing the backend to keep surfaces across frames and to copy depth on the GPU.
+
+The upside-down rectangle at the bottom left of hole 2 is probably the river's reflection render showing on screen; it is not fixed.

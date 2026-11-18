@@ -520,3 +520,8 @@ Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-f
 - Codex applied `cellGcm_fifo_kick_wait(4)` in `port/main.cpp` (load worker `a0258e126d503484f` found the 4 ms tick).
 - Boot `round37` (build 2a459f40, 450 s swing script): hole 1 holed, hole 2 done, hole 3 tee; marker all zero, 25477 lines. Bad: black t248, t328; inverted colors t312; window title empty. Strip: scratchpad `round37-strip.png`.
 - Regression worker started (Opus): owns `libs/video/**`, output `0039-rsx-regress.patch`.
+
+## 2026-11-18 run 33: swing black frames are old, not a regression
+
+- Worker `a2845cc475f943a16` finished, no patch. Black captures (41 shots, every 6 s): current 5, 0037 off 6, `GCM_FIFO_KICK=0` 5, round36 build 3. `RSX_CAP`: 42 of 150 presented frames black in swing runs. Cause: no-clear golfer frames get a black clear; depth at guest 0x0 is GPU-only so the 0x034C0000 copy reads 0. Evidence scratchpad `regress\` (`around.png`, `cap1\`, `cap36\`, sheets).
+- Swing-frames worker started (Opus): owns `libs/video/**`, output `0039-rsx-swing-frames.patch` (persistent color surfaces without clear, GPU depth copy, hole 2 reflection rectangle).
