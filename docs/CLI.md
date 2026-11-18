@@ -7,6 +7,8 @@ Command-line flags take precedence over environment variables. Default paths sta
 Flags accept `--flag value` or `--flag=value`.
 Explicit relative paths resolve from the launch directory. The process uses the build folder for internal relative paths.
 
+On Windows, the launcher sets the game process's profile and temp paths under `<build dir>/cache/profile`. Windows and graphics drivers can still write system records outside the build folder.
+
 | Flag | Environment | Default | What it does | Status |
 |---|---|---|---|---|
 | `--elf <file>` | none | `<game-dir>/USRDIR/EBOOT.elf` | PPU ELF to boot. A bare path with no flag does the same. | wired |
@@ -22,7 +24,7 @@ Explicit relative paths resolve from the launch directory. The process uses the 
 | `--width <px>` | none | 1280 | Render surface and windowed client width. | wired |
 | `--height <px>` | none | 720 | Render surface and windowed client height. | wired |
 | `--verbose <n>` | `PS3_VERBOSE` | 0 | Use 0 for normal logs or 1 through 9 to enable additional runtime diagnostics. | wired |
-| `--log <file>` | none | console | Send output to a file. A bare name goes in `<build dir>/logs`. | wired |
+| `--log <file>` | none | console | Save standard output and errors in one file. A bare name goes in `<build dir>/logs`. | wired |
 | `--hidden` | none | off | Create a hidden window that cannot take focus on Windows. | wired |
 | `--exit-after <sec>` | none | off | Quit cleanly (same path as the console's Quit Game) after this many seconds. | wired |
 | `--help` | none | | Print the option list. | wired |
@@ -38,7 +40,7 @@ The US font set uses `data/font/SCE-PS3-RD-R-LATIN2.TTF` under the firmware fold
 
 Put the extracted US game files in the `game` folder next to the executable. The folder needs `PARAM.SFO` and `USRDIR/EBOOT.elf` from the inputs for the fixed 1.02 build. The launcher also checks for both files directly next to the executable. An alternate game root can contain the same layout under `PS3_GAME`.
 
-The executable reads the title ID from `PARAM.SFO` and starts the game. If a startup file is missing or the title ID cannot be read, it prints a setup message and exits with code 1. A fresh Explorer console waits for Enter so the message stays visible.
+The executable expects the US title ID `NPUA80864` in `PARAM.SFO`. On Windows it checks the ELF against the fixed 1.02 SHA-256 in the project manifest before running the lifted code. Missing or incompatible startup files produce a setup message and exit code 1. A fresh Explorer console waits for Enter so the message stays visible.
 
 ## Exit codes
 

@@ -388,3 +388,12 @@ On the worker's report: check its captures, commit `0026`, update README status.
 ### Exact next action
 
 Send input after Continue to learn what that scene is (menu or round), and look at play frame rate.
+
+## 2026-11-18 run 20: menus reached
+
+- `boot-fix-1.02-play-1.log` (425 s, build sha8 `3915fbac`, `PAD_SCRIPT=2500,4000,4300,4600,4680,4750` all Cross on flips): title, clubhouse menu ("Single Player", "Challenge"), Challenge course select (Maple Leaf Golf Club, Beginner Rank) at 22 to 25 FPS. `bctr=0 nullcall=0 unresNID=0 887A=0`. Capture committed as `docs/images/course-select-2026-11-18.png`.
+- The first press landed during the attract demo in this run, not on the title; the later presses did the menu work. Which press did what is not mapped.
+
+### Exact next action
+
+Add presses after flip 4750 to pick the course and start a round; a run is capped at 10 minutes, so the round start must fit in about 430 s.

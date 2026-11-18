@@ -10,6 +10,8 @@ The title screen, drawn by the port and captured 2026-11-17. The dark squares at
 
 ![A golf hole from the attract demo: waterfall, bunkers, trees and the hole HUD](docs/images/demo-hole-2026-11-17.png)
 
+![The Challenge course select screen showing Maple Leaf Golf Club, reached with scripted button presses](docs/images/course-select-2026-11-18.png)
+
 The attract demo that follows the title, captured the same day. The course geometry and HUD draw. The lighting is too dark, the sky and part of the ground are missing, and stray light-blue triangles appear.
 
 ## Status
@@ -28,7 +30,8 @@ Updated 2026-11-17.
 | Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
 | Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout. Terrain is too dark |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
-| After "Continue" | The load finishes and course scenes draw. No further input sent yet, so menus and play are not verified |
+| Menus | Scripted Cross presses go from the title through the clubhouse menu to the Challenge course select at 22 to 25 FPS |
+| Playing a round | Not verified |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 

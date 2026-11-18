@@ -133,3 +133,7 @@ A scripted Cross on "Continue" is accepted and the next scene loads. That scene,
 Captures after the fix show course fly-bys and the demo's shot screen with the power gauge. Scripted input now counts game frames (`PAD_CLOCK=flips`), because load time varied by a factor of three with machine load.
 
 Open: course terrain is too dark. The shot screen has a black background behind the golfer, and two captures show mostly sky; neither is compared with real hardware. Frame rate in play is 11 to 14 FPS. Line primitives are skipped.
+
+## 2026-11-18 update 12: menus
+
+Scripted Cross presses (`PAD_SCRIPT` on frame counts) go from the title through the clubhouse menu ("Single Player", "Challenge") to the Challenge course select, which lists Maple Leaf Golf Club. Text, portraits and the 3D clubhouse draw at 22 to 25 FPS. Log `boot-fix-1.02-play-1.log`: 0 unresolved imports, 0 NULL calls. Starting a round is the next thing to try.
