@@ -163,3 +163,13 @@ The pipeline runs clang with `--driver-mode=cl`. In that mode clang ignores `-O2
 The same ignored flag means the runtime library and the lifted PPU code are also built without optimization. That is the next thing to fix and measure.
 
 The course is still drawn wrong in the round: the fly-through shows the sky and mountains above a flat cyan plane where the terrain should be.
+
+## 2026-11-18 update 17: everything is now built optimized, course is lit
+
+The ignored optimization flag applied to the whole build. `port/CMakeLists.txt` now passes `/clang:-O2` to the runtime and `/clang:-O1` to the lifted PPU files when the cl driver is in use. One file, `ppu_recomp_063.cpp` (68 MB), did not finish at `-O1` in 9 minutes and stays unoptimized.
+
+Measured in one boot of the new build: the title runs at about 60 FPS, the demo flyover at 46 to 52 FPS with 686 to 902 draws, and the round at 18 to 34 FPS with 734 to 1704 draws. The first tee is reached in under 220 seconds; it took about 470 before. The marker line is all zeros.
+
+The dark terrain is fixed (patch `0030`). The game draws a shadow map into a depth-only surface and the ground shader reads it as a depth texture with a comparison. The backend dropped depth texture formats, so the shader read 0 and the sunlight term went to 0. The same patch stops the sampler table from filling: the unused border color was part of the sampler key.
+
+Scripted Cross presses in the round start the swing gauge and the club moves. The presses were 120 frames apart, too slow to finish a shot, so no ball has been hit yet. The tee close-up still has a black background. That frame has no color clear and seems to expect the previous frame's picture to persist, which is not proven.

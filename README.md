@@ -12,6 +12,8 @@ The title screen, drawn by the port and captured 2026-11-17. The dark squares at
 
 ![The Challenge course select screen showing Maple Leaf Golf Club, reached with scripted button presses](docs/images/course-select-2026-11-18.png)
 
+![The attract demo flying over a hole: lit fairway, bunkers, a path and tree shadows](docs/images/demo-flyover-2026-11-18.png)
+
 ![The first tee of a round: the golfer, the ball and the shot HUD are drawn, the course behind them is nearly black](docs/images/tee-shot-2026-11-18.png)
 
 The attract demo that follows the title, captured the same day. The course geometry and HUD draw. The lighting is too dark, the sky and part of the ground are missing, and stray light-blue triangles appear.
@@ -24,17 +26,16 @@ Updated 2026-11-17.
 | --- | --- |
 | Decrypt and extract the packages | Done for the fixed 1.02 profile |
 | Lift PPU code to C++ | Done: 33,221 functions |
-| Build a native executable | Done: one 446 MB `.exe`, no extra DLLs |
+| Build a native executable | Done: one 276 MB `.exe`, no extra DLLs |
 | Boot | Runs to the title screen in about a minute. Both SPURS instances start and game archives load |
 | SPU jobs | 16 jobs lifted. No job seen so far is missing; the last one lifted has not run yet |
-| Rendering | Works up to the title screen, with a few wrong squares in the sky. 8 to 20 FPS there |
+| Rendering | The title, menus and course draw. The title runs at about 60 FPS and course scenes at 18 to 50 FPS |
 | Intro movie | Skipped. The player reports the movie as finished because there is no video decoder |
 | Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
-| Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout. Terrain is too dark |
+| Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout, lit terrain with tree shadows. Some water and bunker edges are flat cyan |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
-| Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course", at 13 to 25 FPS |
-| Playing a round | The round loads and reaches the first tee with the character, ball and shot HUD drawn. The course behind them is nearly black and it runs at about 3.5 frames per second. No swing has been made. Not playable |
-
+| Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course" |
+| Playing a round | The round loads and reaches the first tee in under four minutes at 18 to 34 FPS. A Cross press starts the swing gauge. The tee close-up has a black background, and no full shot has been played. Not playable yet |
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 
 ## What is in this repository

@@ -447,3 +447,14 @@ Workers started 03:25 (both Opus; reasons: SPU lifter and SPURS timing across sy
 ### Exact next action
 
 When the rendering worker reports: commit its patch, then turn on optimization for the runtime and PPU code, full rebuild, boot, compare.
+
+## 2026-11-18 run 25: whole build optimized, patch 0030
+
+- Worker `aef6cb937ffc4a2cd` finished: `0030-rsx-course-lighting.patch` (base HEAD + 0005 + 0008 + 0024 + 0026 + 0027). Depth texture formats 0x90 to 0x93 were dropped in `d3d12_bind_texture`; depth-only pass had no surface size; shadow compare units go through `rsx_fp_decompile_buffered_shadow_ex`; sampler key no longer includes unused border color (2048 to 41 to 57 samplers). `RSX_DEPTH_TEX=0` turns the depth-texture part off. New switches `RSX_CAP_MINDRAWS`, `RSX_CAP_NODISP`.
+- Coordinator: `port/CMakeLists.txt` adds `/clang:-O2 -msse4.1` directory-wide and `/clang:-O1` for lifted PPU files under the cl driver; `PORT_PPU_O0_FILES` (default `ppu_recomp_063.cpp`) stay at -O0 because that file ran past the 9 minute build cap. Full rebuild took two capped passes. Build `46b71d5b`. Old exe kept at `build/O0-backup/`.
+- Boot `opt2` (round script, 91 Cross presses 120 flips apart, `RSX_PROF=1`): title 62 FPS at 275 draws; demo 46 to 52 FPS; round 18 to 34 FPS at 734 to 1704 draws; tee by 220 s. Marker `bctr=0 nullcall=0 regist=0 stars=0 unresNID=0 unresCall=0 garbage=0 887A=0 lines=20395`. Swing gauge and club respond to Cross.
+- Not verified: a completed shot (presses too far apart); tee close-up black background; presented-frame counter in some phases; cyan water and bunker edges; menus FPS on this build; 063 at -O1.
+
+### Exact next action
+
+Rendering worker on the tee close-up background and cyan surfaces; coordinator runs a swing with presses about 20 to 40 flips apart.

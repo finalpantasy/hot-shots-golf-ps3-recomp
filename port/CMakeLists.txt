@@ -72,6 +72,19 @@ endif()
 list(LENGTH RECOMP_SOURCES RECOMP_SOURCE_COUNT)
 message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 
+# clang under the cl driver (CMAKE_C_COMPILER_ARG1=--driver-mode=cl, which this
+# port's pipeline uses) ignores -O1/-O2/-O3 with "argument unused during
+# compilation", so the runtime's own -O2, CMake's Release -O3 and the -O1
+# below never reached the compiler and everything was built unoptimized.
+# /clang: hands the flag to the clang driver itself. The lifted PPU files
+# get -O1 further down (they are huge); everything else gets -O2. -msse4.1
+# is what the runtime asks for when its flag probe works, which it does not
+# under the cl driver.
+if(CMAKE_C_COMPILER_ARG1 MATCHES "driver-mode=cl")
+    add_compile_options(/clang:-O2 -msse4.1)
+    set(PORT_CL_DRIVER ON)
+endif()
+
 # ---------------------------------------------------------------------------
 # ps3recomp runtime library
 # ---------------------------------------------------------------------------
@@ -345,6 +358,21 @@ if(MSVC)
 else()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-w;-ffp-contract=off")
+    if(PORT_CL_DRIVER)
+        # Source options follow the directory-wide /clang:-O2, so -O1 wins here.
+        set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "-w;/clang:-ffp-contract=off;/clang:-O1")
+        # Files that do not finish compiling at -O1 in a sane time stay at -O0.
+        # ppu_recomp_063.cpp (68 MB) ran past 9 minutes on its own.
+        set(PORT_PPU_O0_FILES "ppu_recomp_063.cpp" CACHE STRING
+            "Lifted PPU files compiled without optimization")
+        foreach(_f ${PORT_PPU_O0_FILES})
+            if(EXISTS "${RECOMP_DIR}/${_f}")
+                set_source_files_properties("${RECOMP_DIR}/${_f}" PROPERTIES
+                    COMPILE_OPTIONS "-w;/clang:-ffp-contract=off;/clang:-O0")
+            endif()
+        endforeach()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
