@@ -1,0 +1,454 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2173,13 +2173,48 @@
+ /* Host thread that last walked the FIFO, for PS3_SAMPLE_DRAIN. */
+ volatile unsigned long g_gcm_drain_tid;
+ 
++/* RSX_PROF=1: where the FIFO walker's thread spends a frame. The D3D12
++ * backend reads and resets these in its summary line (cellGcm_prof_take).
++ * idle = time on the walker thread between two drain passes (the frame
++ * clock's sleep plus presents made outside a drain). */
++static int gcm_prof_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_PROF"); v = e ? atoi(e) : 0; }
++    return v;
++}
++static u64 s_gprof_drain_ns, s_gprof_lock_ns, s_gprof_gap_ns, s_gprof_last_end;
++static u32 s_gprof_passes, s_gprof_stop[6];   /* caught-up flip parked sema report other */
++static const char* s_gprof_why;
++void cellGcm_prof_take(double* drain_s, double* lock_s, double* gap_s, unsigned* passes,
++                       unsigned stops[6])
++{
++    *drain_s = s_gprof_drain_ns * 1e-9; *lock_s = s_gprof_lock_ns * 1e-9;
++    *gap_s = s_gprof_gap_ns * 1e-9; *passes = s_gprof_passes;
++    for (int i = 0; i < 6; i++) { stops[i] = s_gprof_stop[i]; s_gprof_stop[i] = 0; }
++    s_gprof_drain_ns = s_gprof_lock_ns = s_gprof_gap_ns = 0; s_gprof_passes = 0;
++}
++
+ void cellGcm_rsx_process_fifo(void)
+ {
+     wprof_note_walker();
+     g_gcm_drain_tid = GetCurrentThreadId();
+     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
++    const u64 pf0 = gcm_prof_on() ? get_timestamp_ns() : 0;
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
++    const u64 pf1 = pf0 ? get_timestamp_ns() : 0;
++    s_gprof_why = NULL;
+     gcm_rsx_process_fifo_unlocked();
++    if (pf0) {
++        const u64 pf2 = get_timestamp_ns();
++        s_gprof_lock_ns += pf1 - pf0; s_gprof_drain_ns += pf2 - pf1; s_gprof_passes++;
++        if (s_gprof_last_end) s_gprof_gap_ns += pf0 - s_gprof_last_end;
++        s_gprof_last_end = pf2;
++        const char* w = s_gprof_why;
++        int k = !w ? 5 : !strcmp(w, "caught-up") ? 0 : !strcmp(w, "flip") ? 1 :
++                !strcmp(w, "parked") ? 2 : !strcmp(w, "sema") ? 3 : !strcmp(w, "report") ? 4 : 5;
++        s_gprof_stop[k]++;
++    }
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+     if (ft_t0) {
+         const uint64_t t1 = ps3_ft_now();
+@@ -3029,6 +3064,7 @@
+      * ring start, and the resync dropped them: inFAMOUS 2 stopped presenting
+      * for good that way in about one New Marais run in five ("stuck-get" at a
+      * self-jump with no "jump-park" before it). */
++    s_gprof_why = s_sema_blocked_pass ? "sema" : s_report_hold_pass ? "report" : why;
+     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
+       if (s_sema_blocked_pass || s_park_pass || s_report_hold_pass) {
+           stuck = 0; last = s_fifo_getoff;
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -562,6 +562,163 @@
+     if (v < 0) { const char* e = getenv("PERF"); v = e ? atoi(e) : 0; }
+     return v;
+ }
++/* RSX_PROF=1: one line every ~2 s splitting the FIFO walker thread's wall time
++ * into the frame's phases -- render_frame (GPU wait / record / tail), submit,
++ * Present, next-frame fence wait, draw recording, the drain itself and the
++ * walker's idle time between drains -- so a slow frame can be pinned on the
++ * backend or on the guest. Times are per presented frame (ms). */
++enum { PF_RF_WAIT, PF_RF_BODY, PF_RF_TAIL, PF_SUBMIT, PF_PRESENT, PF_NEXT,
++       PF_RECORD, PF_CLEAR, PF_BPRESENT, PF_FLIPCB, PF_N };
++static double s_prof[PF_N];
++static u32 s_prof_rf, s_prof_frames, s_prof_ndraw, s_prof_rdraws;
++static u32 s_prof_ncompile = 0, s_prof_nmemhit = 0, s_prof_ndiskhit = 0, s_prof_npso = 0;
++static double s_prof_compile = 0.0, s_prof_psotime = 0.0;
++static int rsx_prof_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_PROF"); v = e ? atoi(e) : 0; }
++    return v;
++}
++static void rsx_prof_report(void)
++{
++    static double t_last = 0.0;
++    double now = perf_now();
++    if (t_last == 0.0) { t_last = now; return; }
++    double wall = now - t_last;
++    if (wall < 2.0) return;
++    t_last = now;
++    extern void cellGcm_prof_take(double*, double*, double*, unsigned*, unsigned*);
++    double drain = 0, lockw = 0, gap = 0; unsigned passes = 0, stops[6] = {0};
++    cellGcm_prof_take(&drain, &lockw, &gap, &passes, stops);
++    double f = s_prof_frames ? (double)s_prof_frames : 1.0, k = 1000.0 / f;
++    double rf = s_prof[PF_RF_WAIT] + s_prof[PF_RF_BODY] + s_prof[PF_RF_TAIL];
++    fprintf(stderr, "[RSX_PROF] %.1fs %u frames (%.2f fps) %u rf, %.0f draws/frame rendered, "
++                    "%.0f recorded | ms/frame: rf %.1f [gpuwait %.1f body %.1f tail %.1f] "
++                    "submit %.1f present %.1f nextwait %.1f | record %.1f clear %.1f "
++                    "flipcb %.1f bpresent %.1f | drain %.1f (%u passes, %.1f/frame; stop "
++                    "caught-up %u flip %u park %u sema %u report %u other %u) lockwait %.1f "
++                    "idle %.1f | shaders: %u compiled %.0f ms, %u mem hits, %u disk hits; "
++                    "%u PSOs %.0f ms | samplers %u%c",
++            wall, s_prof_frames, s_prof_frames / wall, s_prof_rf, s_prof_rdraws / f,
++            s_prof_ndraw / f, rf * k, s_prof[PF_RF_WAIT] * k, s_prof[PF_RF_BODY] * k,
++            s_prof[PF_RF_TAIL] * k, s_prof[PF_SUBMIT] * k, s_prof[PF_PRESENT] * k,
++            s_prof[PF_NEXT] * k, s_prof[PF_RECORD] * k, s_prof[PF_CLEAR] * k,
++            s_prof[PF_FLIPCB] * k, s_prof[PF_BPRESENT] * k, drain * k, passes, passes / f,
++            stops[0], stops[1], stops[2], stops[3], stops[4], stops[5], lockw * k, gap * k,
++            s_prof_ncompile, s_prof_compile * 1000.0, s_prof_nmemhit, s_prof_ndiskhit,
++            s_prof_npso, s_prof_psotime * 1000.0, s_d3d.samp_n, 10);
++    fflush(stderr);
++    memset(s_prof, 0, sizeof s_prof);
++    s_prof_rf = s_prof_frames = s_prof_ndraw = s_prof_rdraws = 0;
++    s_prof_ncompile = s_prof_nmemhit = s_prof_ndiskhit = s_prof_npso = 0;
++    s_prof_compile = s_prof_psotime = 0.0;
++}
++
++/* Guest shader bytecode cache, keyed on the final HLSL text and target.
++ * D3DCompile runs on the FIFO walker's thread, so every compile stalls the
++ * guest: a scene change compiled for seconds (the drain thread sampled 70-90%
++ * inside D3DCOMPILER_47 for 10 s windows, the guest frozen behind it). Two
++ * levels:
++ *  - in memory: the pipeline cache is keyed on blend/cull/target format/VS as
++ *    well as the program, so one fragment program used under three blend modes
++ *    was decompiled and compiled three times for byte-identical HLSL;
++ *  - on disk (RSX_SHADER_CACHE=<dir>, default shader_cache_d3d12 next to the
++ *    exe; RSX_SHADER_CACHE=0 turns it off): a second run of the same scene
++ *    loads the bytecode instead of recompiling it.
++ * The key covers the whole HLSL text (two independent 64-bit hashes plus its
++ * length), so a decompiler change simply produces new keys. */
++#define RSX_SBC_MAX 2048
++typedef struct { u64 h1, h2; u32 len; ID3DBlob* blob; } RsxShaderBlob;
++static RsxShaderBlob s_sbc[RSX_SBC_MAX];
++static int s_sbc_n = 0;
++static const char* rsx_sbc_dir(void)
++{
++    static int init = 0; static char dir[MAX_PATH];
++    if (!init) {
++        init = 1;
++        const char* e = getenv("RSX_SHADER_CACHE");
++        if (e && e[0] == '0' && !e[1]) dir[0] = 0;
++        else if (e && *e) snprintf(dir, sizeof dir, "%s", e);
++        else {
++            char exe[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
++            char* sl = (n && n < MAX_PATH) ? strrchr(exe, '\\') : NULL;
++            if (sl) { *sl = 0; snprintf(dir, sizeof dir, "%s\\shader_cache_d3d12", exe); }
++        }
++        if (dir[0]) CreateDirectoryA(dir, NULL);
++    }
++    return dir[0] ? dir : NULL;
++}
++static HRESULT rsx_compile_cached(const char* src, size_t len, const char* name,
++                                  const char* target, ID3DBlob** out)
++{
++    *out = NULL;
++    u64 h1 = 14695981039346656037ull, h2 = 0x9E3779B97F4A7C15ull;
++    for (size_t i = 0; i < len; i++) {
++        h1 = (h1 ^ (u8)src[i]) * 1099511628211ull;
++        h2 = (h2 + (u8)src[i]) * 0xFF51AFD7ED558CCDull; h2 ^= h2 >> 29;
++    }
++    for (const char* t = target; *t; t++) { h1 = (h1 ^ (u8)*t) * 1099511628211ull; h2 ^= (u8)*t; h2 *= 0xC4CEB9FE1A85EC53ull; }
++    for (int i = 0; i < s_sbc_n; i++)
++        if (s_sbc[i].h1 == h1 && s_sbc[i].h2 == h2 && s_sbc[i].len == (u32)len) {
++            s_sbc[i].blob->lpVtbl->AddRef(s_sbc[i].blob);
++            *out = s_sbc[i].blob; s_prof_nmemhit++;
++            return S_OK;
++        }
++    ID3DBlob* blob = NULL;
++    const char* dir = rsx_sbc_dir();
++    char path[MAX_PATH + 64]; path[0] = 0;
++    if (dir) {
++        snprintf(path, sizeof path, "%s\\%016llx%016llx_%u_%s.dxbc", dir,
++                 (unsigned long long)h1, (unsigned long long)h2, (unsigned)len, target);
++        FILE* f = fopen(path, "rb");
++        if (f) {
++            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
++            /* A DXBC container starts "DXBC" and carries its own size at +24. */
++            if (sz > 32 && sz < (16 << 20) && SUCCEEDED(D3DCreateBlob((SIZE_T)sz, &blob))) {
++                u8* p = (u8*)blob->lpVtbl->GetBufferPointer(blob);
++                u32 csz = 0;
++                if (fread(p, 1, (size_t)sz, f) != (size_t)sz || memcmp(p, "DXBC", 4) != 0 ||
++                    (memcpy(&csz, p + 24, 4), csz != (u32)sz)) {
++                    blob->lpVtbl->Release(blob); blob = NULL;
++                } else s_prof_ndiskhit++;
++            }
++            fclose(f);
++        }
++    }
++    if (!blob) {
++        double t0 = perf_now();
++        ID3DBlob* err = NULL;
++        HRESULT hr = D3DCompile(src, len, name, NULL, NULL, "main", target, 0, 0, &blob, &err);
++        s_prof_compile += perf_now() - t0; s_prof_ncompile++;
++        if (FAILED(hr) || !blob) {
++            static int _e = 0; if (PS3_LOG_FIRST(_e, 16))
++                printf("[D3D12] %s compile FAIL: %s\n", name,
++                       err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
++            if (err) err->lpVtbl->Release(err);
++            if (blob) blob->lpVtbl->Release(blob);
++            return FAILED(hr) ? hr : E_FAIL;
++        }
++        if (err) err->lpVtbl->Release(err);
++        if (path[0]) {
++            char tmp[MAX_PATH + 80];
++            snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentThreadId());
++            FILE* f = fopen(tmp, "wb");
++            if (f) {
++                size_t bs = blob->lpVtbl->GetBufferSize(blob);
++                int ok = fwrite(blob->lpVtbl->GetBufferPointer(blob), 1, bs, f) == bs;
++                ok = (fclose(f) == 0) && ok;
++                if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileA(tmp);
++            }
++        }
++    }
++    if (s_sbc_n < RSX_SBC_MAX) {
++        blob->lpVtbl->AddRef(blob);
++        s_sbc[s_sbc_n].h1 = h1; s_sbc[s_sbc_n].h2 = h2; s_sbc[s_sbc_n].len = (u32)len;
++        s_sbc[s_sbc_n].blob = blob; s_sbc_n++;
++    }
++    *out = blob;
++    return S_OK;
++}
+ /* Debug switches read on every draw, quad or bind go through this: getenv
+  * takes the CRT environment lock and scans every variable, and a dozen of
+  * them per draw was a quarter of God of War HD's drain-thread time (ucrtbase
+@@ -765,13 +922,11 @@
+     /* Enable debug layer in debug builds */
+     /* Debug layer: on in debug builds, or in any build when D3D12_DBG is set
+      * (so a Release run can capture exact PSO/validation errors). */
+-    if (
+-#ifdef NDEBUG
+-        getenv("D3D12_DBG")
+-#else
+-        !getenv("D3D12_NO_DBG") /* D3D12_NO_DBG=1 disables the debug layer in debug builds */
+-#endif
+-    ) {
++    /* Opt-in in every build now (D3D12_DBG=1, or D3D12_IQ=1 which reads its
++     * messages). Keyed on NDEBUG it was on in this port's optimised build,
++     * which compiles the backend without NDEBUG, and the validation layer then
++     * sat in every command-list call of a 1000-draw frame. */
++    if (getenv("D3D12_DBG") || getenv("D3D12_IQ")) {
+         ID3D12Debug* debug_controller = NULL;
+         hr = D3D12GetDebugInterface(&IID_ID3D12Debug, (void**)&debug_controller);
+         if (SUCCEEDED(hr) && debug_controller) {
+@@ -2089,10 +2244,8 @@
+             at += n;
+         }
+     }
+-    ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
+-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
+-                            "main", "vs_5_0", 0, 0, &vb, &e);
+-    if (e) e->lpVtbl->Release(e);
++    ID3DBlob* vb = NULL;
++    HRESULT hr = rsx_compile_cached(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", &vb);
+     if (FAILED(hr) || !vb) {
+         static int _e=0; if (PS3_LOG_FIRST(_e, 4)) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
+         return -1;
+@@ -2256,10 +2409,20 @@
+     if (!dr->tex[u].set) return u == 0 ? 0 : 1;
+     const u32 k[4] = { dr->tex[u].addr & 0x000F0F0Fu, dr->tex[u].filter & 0x07071FFFu,
+                        dr->tex[u].ctrl0 & 0x70u, dr->tex[u].border };
+-    for (u32 i = 2; i < s_d3d.samp_n; i++)
+-        if (!memcmp(s_d3d.samp_key[i], k, sizeof k)) return (int)i;
++    /* Hash index over samp_key (open addressing, 0 = empty, else index+1):
++     * the linear memcmp scan ran per unit per draw over every state made so
++     * far, 4% of the walker thread at ~1000 draws a frame. */
++    static u16 s_samp_ix[4096];
++    u32 hk = (k[0] * 0x9E3779B1u) ^ (k[1] * 0x85EBCA77u) ^ (k[2] * 0xC2B2AE3Du) ^ (k[3] * 0x27D4EB2Fu);
++    hk = (hk ^ (hk >> 15)) & 4095u;
++    for (u32 pr = 0; pr < 4096; pr++, hk = (hk + 1) & 4095u) {
++        const u32 e = s_samp_ix[hk];
++        if (!e) break;
++        if (e - 1 < s_d3d.samp_n && !memcmp(s_d3d.samp_key[e - 1], k, sizeof k)) return (int)(e - 1);
++    }
+     if (s_d3d.samp_n >= 2048) return u == 0 ? 0 : 1;
+     const u32 i = s_d3d.samp_n++;
++    s_samp_ix[hk] = (u16)(i + 1);
+     memcpy(s_d3d.samp_key[i], k, sizeof k);
+     D3D12_SAMPLER_DESC s;
+     rsx_sampler_desc(k, &s);
+@@ -2949,17 +3112,13 @@
+         char* rp = strstr(hlsl, "return r[0];");
+         if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
+     }
+-    ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
+-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
+-                            "main", "ps_5_0", 0, 0, &pb, &e);
++    ID3DBlob* pb = NULL;
++    HRESULT hr = rsx_compile_cached(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", &pb);
+     if (FAILED(hr) || !pb) {
+         static int _e2=0; if (PS3_LOG_FIRST(_e2, 16))
+-            printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
+-                   e ? (const char*)e->lpVtbl->GetBufferPointer(e) : "?");
+-        if (e) e->lpVtbl->Release(e);
++            printf("[FP] PS compile FAIL (fp=0x%08X)\n", fp_addr);
+         return NULL;
+     }
+-    if (e) e->lpVtbl->Release(e);
+ 
+     D3D12_INPUT_ELEMENT_DESC il[16];
+     for (int _i = 0; _i < 16; _i++) {
+@@ -3057,8 +3216,10 @@
+     pd.SampleDesc.Count = 1;
+ 
+     ID3D12PipelineState* pso = NULL;
++    const double _pc0 = perf_now();
+     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+         s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
++    s_prof_psotime += perf_now() - _pc0; s_prof_npso++;
+     pb->lpVtbl->Release(pb);
+     if (FAILED(hr)) {
+         static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
+@@ -4869,7 +5030,10 @@
+      * (gcm/cube: triangles mixing stale and new vertices -> missing/sliver
+      * polygons). These workloads are a few draws/frame, so full serialisation
+      * costs little. */
++    const double _pf0 = rsx_prof_on() ? perf_now() : 0.0;
+     wait_for_gpu();
++    const double _pf1 = _pf0 ? perf_now() : 0.0;
++    if (_pf0) { s_prof[PF_RF_WAIT] += _pf1 - _pf0; s_prof_rf++; s_prof_rdraws += s_d3d.draw_count; }
+     rdoc_frame_begin(s_d3d.draw_count);
+ 
+     /* Compile the real vertex program once its microcode is captured, and keep
+@@ -5906,6 +6070,8 @@
+     }
+ 
+     if (perf_on()) s_perf_rf += perf_now() - _rf0;
++    const double _pf2 = _pf0 ? perf_now() : 0.0;
++    if (_pf0) s_prof[PF_RF_BODY] += _pf2 - _pf1;
+     /* MEMPEEK=<hex addr>:<n>: n big-endian floats at a guest address each frame,
+      * with a min/max so a buffer of constants is distinguishable from real data. */
+     { const char* mp = env_str("MEMPEEK", &s_env_mempeek);
+@@ -6152,9 +6318,13 @@
+     }
+ 
+     /* Close and execute */
++    const double _pf3 = _pf0 ? perf_now() : 0.0;
++    if (_pf0) s_prof[PF_RF_TAIL] += _pf3 - _pf2;
+     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
+     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
++    double _pf4 = _pf0 ? perf_now() : 0.0;
++    if (_pf0) s_prof[PF_SUBMIT] += _pf4 - _pf3;
+ 
+     /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
+      * frame. The legacy (is_vp=0) DrawInstanced path silently produced ZERO
+@@ -6308,16 +6478,21 @@
+ 
+     /* Present, on the vblank unless D3D12_VSYNC=0: that one is for measuring a
+      * title past the display's rate. Skipped for an offscreen-only batch. */
++    if (_pf0) _pf4 = perf_now();   /* debug dumps above are not "submit" */
+     if (s_present_this_frame) {
+         if (!d3d12_vsync_off())
+             s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+         else
+             s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0,
+                                               s_d3d.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
++        if (_pf0) s_prof_frames++;
+     }
+     rdoc_frame_end();
+ 
++    const double _pf5 = _pf0 ? perf_now() : 0.0;
++    if (_pf0) s_prof[PF_PRESENT] += _pf5 - _pf4;
+     move_to_next_frame();
++    if (_pf0) { s_prof[PF_NEXT] += perf_now() - _pf5; rsx_prof_report(); }
+ 
+     s_d3d.frame_count++;
+ 
+@@ -8312,6 +8487,34 @@
+ 
+ static rsx_backend s_d3d12_backend = {0};
+ 
++/* RSX_PROF wrappers: registered instead of the plain callbacks only when
++ * RSX_PROF is set, so the normal path carries no timing calls. */
++static void d3d12_draw_arrays_prof(void* ud, u32 p, u32 first, u32 count)
++{
++    double t = perf_now(); d3d12_draw_arrays(ud, p, first, count);
++    s_prof[PF_RECORD] += perf_now() - t; s_prof_ndraw++;
++}
++static void d3d12_draw_indexed_prof(void* ud, u32 p, u32 first, u32 count)
++{
++    double t = perf_now(); d3d12_draw_indexed(ud, p, first, count);
++    s_prof[PF_RECORD] += perf_now() - t; s_prof_ndraw++;
++}
++static void d3d12_clear_prof(void* ud, u32 flags, u32 color, float depth, u8 stencil)
++{
++    /* Clears at a frame boundary run render_frame inside: count that once. */
++    double t = perf_now(); double rf0 = s_prof[PF_RF_WAIT] + s_prof[PF_RF_BODY] + s_prof[PF_RF_TAIL]
++        + s_prof[PF_SUBMIT] + s_prof[PF_PRESENT] + s_prof[PF_NEXT];
++    d3d12_clear(ud, flags, color, depth, stencil);
++    double rf1 = s_prof[PF_RF_WAIT] + s_prof[PF_RF_BODY] + s_prof[PF_RF_TAIL]
++        + s_prof[PF_SUBMIT] + s_prof[PF_PRESENT] + s_prof[PF_NEXT];
++    s_prof[PF_CLEAR] += perf_now() - t - (rf1 - rf0);
++}
++static void d3d12_present_prof(void* ud, u32 buffer_id)
++{
++    double t = perf_now(); d3d12_present(ud, buffer_id);
++    s_prof[PF_FLIPCB] += perf_now() - t;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Public API
+  * -----------------------------------------------------------------------*/
+@@ -8385,6 +8588,12 @@
+     s_d3d12_backend.draw_arrays       = d3d12_draw_arrays;
+     s_d3d12_backend.draw_indexed      = d3d12_draw_indexed;
+     s_d3d12_backend.bind_texture      = d3d12_bind_texture;
++    if (rsx_prof_on()) {
++        s_d3d12_backend.present      = d3d12_present_prof;
++        s_d3d12_backend.clear        = d3d12_clear_prof;
++        s_d3d12_backend.draw_arrays  = d3d12_draw_arrays_prof;
++        s_d3d12_backend.draw_indexed = d3d12_draw_indexed_prof;
++    }
+ 
+     rsx_set_backend(&s_d3d12_backend);
+ 
+@@ -8532,7 +8741,9 @@
+           if (remap < 0) { const char* e = getenv("TEX_REMAP"); remap = e ? atoi(e) : 0; }
+           if (remap) rsx_reset_upload_claims(); }
+         s_present_this_frame = has_display;
++        const double _bp = rsx_prof_on() ? perf_now() : 0.0;
+         render_frame();
++        if (_bp) s_prof[PF_BPRESENT] += perf_now() - _bp;
+         s_present_this_frame = 1;
+     }
+ }
+--- a/libs/video/rsx_vertex_fetch.c
++++ b/libs/video/rsx_vertex_fetch.c
+@@ -16,6 +16,16 @@
+     float f; memcpy(&f, &w, 4); return f;
+ }
+ 
++/* Same as rsx_rd_bef, inlined for the per-vertex loop below: the call
++ * itself was a measurable share of the FIFO walker thread at ~1000 draws. */
++static inline float rd_bef_inl(const u8* p)
++{
++    u32 w; memcpy(&w, p, 4);
++    w = ((w >> 24) & 0xFFu) | ((w >> 8) & 0xFF00u) |
++        ((w << 8) & 0xFF0000u) | ((w << 24) & 0xFF000000u);
++    float f; memcpy(&f, &w, 4); return f;
++}
++
+ float rsx_rd_half_be(const u8* p)
+ {
+     u16 h = (u16)((p[0] << 8) | p[1]);
+@@ -87,7 +97,7 @@
+     u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+     switch (a->type) {
+     case 2: /* CELL_GCM_VERTEX_F: float32 BE */
+-        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
++        for (u32 k = 0; k < n; k++) out[k] = rd_bef_inl(p + k * 4);
+         break;
+     case 3: /* SF: half float BE */
+         for (u32 k = 0; k < n; k++) out[k] = rsx_rd_half_be(p + k * 2);
