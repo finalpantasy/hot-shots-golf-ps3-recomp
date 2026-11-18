@@ -1,0 +1,22 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -140,6 +140,18 @@
+ static void host_path(char* out, size_t cap, const char* guest)
+ {
+     const char* rel = guest;
++    /* Match the directory used by cellSaveData for the local PS3 user. */
++    static const char save_mount[] = "/dev_hdd0/home/00000001/savedata";
++    const size_t save_mount_len = sizeof(save_mount) - 1;
++    if (strncmp(guest, save_mount, save_mount_len) == 0
++        && (guest[save_mount_len] == '/' || guest[save_mount_len] == '\0')) {
++        const char* save_root = ps3_env_once("PS3_SAVEDATA_ROOT");
++        if (save_root && *save_root) {
++            snprintf(out, cap, "%s%s", save_root, guest);
++            for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
++            return;
++        }
++    }
+     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
+      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
+      * /dev_hdd0/game/<title>/), mirroring the PS3/RPCS3 layout: base data on

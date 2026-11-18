@@ -168,3 +168,48 @@ The draw count is the host backend's counter. The captured window is still a sin
 ### Exact next action
 
 Lift the two `sgx-spurs-` jobs, then trace the NULL call at `lr=0x007B56CC`.
+
+## Ownership split with Codex (proposed 2026-11-17, active once the owner starts Codex)
+
+Codex works from `docs/orchestration/CODEX-GOAL.md` on the host, release and peripheral-module side and reports in `docs/orchestration/CODEX-LOG.md`. Claude keeps the boot path: SPU jobs, `libs/spurs`, `runtime/**`, `tools/**`, `pipeline.toml`, `port/CMakeLists.txt`, builds of record and commits. Builds and game runs are serialized with `work/runtime/BUILD.lock`.
+
+## 2026-11-17 run 4: six jobs lifted, base-file fallback, GPU device loss (open)
+
+Build SHA-256 starts `649c4bac`. Build log `build-fix-1.02-jobs6.log`; boot logs `boot-fix-1.02-jobs6.log` and `-jobs6b.log` (20 s each, hidden desktop). This build also contains Codex's in-progress window-mode change in `libs/video/rsx_d3d12_backend.c`, so it is not a clean single-variable build.
+
+Changes on the Claude side:
+
+- Five more SPURS jobs lifted and registered by worker `aa95d6ef8ed237dce` (six in total): `CB9BD0241BB0DE67` (EA `0xD09F00`, 53,280 bytes), `FDFFAAC1BCD5352E` (`0xCDD880`, 34,704), `ABD49FC58F53F368` (`0xCF7100`, 9,488), `F523F26F69764538` (`0xCB4400`, 64,912), `1B6BDAC375C5438D` (`0xCC4200`, 13,840). They use a second job layout with no JOBCRT header; two contain inline switch tables, which `tools/spu_lift_jobs.py` now handles. None of the five has been seen running.
+- `runtime/ppu/ppu_fs.cpp`: for HDD (PSN) titles, a file missing under `PS3_HDD0_ROOT/game/<title>/` resolves to the base install under the VFS root. Patch `0004`. Reason: in run 3 the base files (`xbdata/courseinfo`, input and shot tables, 90 failed opens) were not found, and the NULL calls at `lr=0x007B56CC` followed those failed loads. In run 4 there are 0 failed opens, 0 `[null-call]` and 0 `bctr to NULL`, but the run also stops earlier, so this is not yet proof of the fix.
+
+Regression, cause not isolated: the D3D12 device is removed at the first pipeline state creation (`[VP] colour PSO FAIL (0x887A0005)`, log line 1881), the game never prints `=== SGX system initialize`, and no job dispatch after the first is reached. Reproduced in both runs. Candidates: the window-mode change, the base fallback changing which shader data the game loads, or GPU state on the machine at the time. The build before it (`b99080d2`) was not kept, so the comparison has to use `build/tocspill-f768037d/` or a rebuild with one change reverted.
+
+### Exact next action
+
+1. When `work/runtime/BUILD.lock` is free, run `build/tocspill-f768037d/HotShotsGolfRecomp.exe` for 15 s on the hidden desktop. If it also logs `887A0005`, the cause is the machine's GPU state, not the code.
+2. Otherwise rebuild with the window-mode change reverted, then with the base fallback reverted, one at a time, keeping each executable in its own folder.
+3. From now on copy every build of record to `build/<name>-<sha8>/` before the next build.
+
+## 2026-11-17 run 5: device loss isolated to the base-file fallback path
+
+One build (`build/ab-e260235f/`, SHA-256 starts `e260235f`), two 20 s hidden-desktop boots that differ only in `PS3_NO_HDD_BASE_FALLBACK` (new switch in `ppu_fs.cpp`, patch `0004`). Logs: `boot-fix-1.02-ab-fallback-on.log`, `-off.log`.
+
+| Marker | Fallback on (default) | Fallback off |
+| --- | --- | --- |
+| failed file opens | 0 | 36 |
+| `887A0005` device removed | 10 | 0 |
+| `=== SGX system initialize` | not reached | reached |
+| lifted job `F523F26F69764538` entered | not reached | 3 times |
+| SPURS dispatch misses | not reached | 32, four new fingerprints |
+
+Reading: the window-mode change is not the cause. With the base files visible the game takes a different early path, the RSX FIFO is parsed as garbage (`bind_texture` and `draw_arrays` with nonsense arguments, FIFO walker "circling" at `get=0x00400500 put=0x00600654`), and the D3D12 device is removed at the first pipeline state creation. With the fallback off the game runs on missing data, which is the wrong state, but it gets further into SPURS. The fallback stays on by default because the files exist on a real console; the switch is for finding SPU jobs until the FIFO bug is fixed.
+
+### Next blockers
+
+1. GCM FIFO parse with base files present: find which `cellGcm` call sets up the command buffer the walker misreads (start from the first `SetDefaultCommandBuffer` and the first "FIFO walker circling" line in the fallback-on log).
+2. Four more SPURS jobs miss with the fallback off: `49C1D6C47E80AF43` (24,720 bytes), `5DA195169669A5FF` (72,464), `80435D36E623FAA0` (19,488), `82D0BE145EC28AEE` (17,424). Dumps are in `analysis/spu-miss/`.
+3. Of the five jobs lifted in run 4, only `F523F26F69764538` has been seen entering. No job return code was logged for it.
+
+### Exact next action
+
+Trace blocker 1. In parallel, a worker lifts the four jobs in blocker 2.

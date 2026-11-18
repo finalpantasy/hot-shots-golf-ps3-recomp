@@ -71,3 +71,7 @@ The first SPURS job (`0x00CB3580`) is lifted and runs to completion, `cellSpursJ
 ## 2026-11-17 update 3: second SPURS instance starts
 
 Two ps3recomp SPURS bugs are fixed: port bindings shared across instances, and a 32-entry job guard table. The game's `sgx-spurs-` instance now stays up and the host backend counts 2,048 draw calls in 20 s. The window is still one solid color. Two render jobs are not lifted yet. Evidence: `docs/orchestration/STATE.md`.
+
+## 2026-11-17 update 4: six SPURS jobs lifted, base files found, GCM FIFO bug exposed
+
+Six SPURS jobs are lifted and registered. The runtime now finds base-install files for this PSN title. With those files visible the game takes a different early path and the RSX command stream is misparsed, which removes the D3D12 device. That FIFO bug is the current first blocker. Evidence and the A/B run: `docs/orchestration/STATE.md`.

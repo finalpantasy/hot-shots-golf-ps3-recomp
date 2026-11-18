@@ -25,18 +25,16 @@ static const char kHelp[] =
 "  --hdd0 <dir>        Folder for /dev_hdd0. Env PS3_HDD0_ROOT. Default: <exe dir>/hdd0.\n"
 "  --hdd1 <dir>        Folder for /dev_hdd1. Env PS3_HDD1_ROOT. Default: <exe dir>/hdd1.\n"
 "  --savedata <dir>    Save data folder. Env PS3_SAVEDATA_ROOT. Default: <exe dir>/savedata.\n"
-"                      [not yet wired: the runtime does not read it]\n"
 "  --title <text>      Window caption. Env PS3_TITLE. Default: TITLE from PARAM.SFO.\n"
-"  --fullscreen        Start fullscreen.            [not yet wired]\n"
+"  --fullscreen        Cover the primary monitor with a borderless window (Windows).\n"
 "  --windowed          Start in a window (default).\n"
 "  --width <px>        Window width. Default 1280.\n"
 "  --height <px>       Window height. Default 720.\n"
-"  --verbose <n>       Log detail, 0 to 9. Env PS3_VERBOSE.\n"
-"                      [not yet wired: exported to the environment only]\n"
+"  --verbose <n>       Runtime diagnostics: 0 off, 1 to 9 on. Env PS3_VERBOSE.\n"
 "  --log <file>        Write all output to this file. A bare name goes in\n"
 "                      <exe dir>/logs. Default: console.\n"
 "  --hidden            Create the window without showing it or taking focus.\n"
-"                      For automated test runs. Best effort, see docs/CLI.md.\n"
+"                      For automated test runs on Windows.\n"
 "  --exit-after <sec>  Quit cleanly after this many seconds.\n"
 "  --help              Show this text.\n"
 "  --version           Show the version.\n";
@@ -178,7 +176,8 @@ void cli_resolve(const CliOptions& o, const std::string& exe_dir, ResolvedPaths&
     r.elf = o.elf.empty() ? r.vfs_root + "/USRDIR/EBOOT.elf" : o.elf;
     r.hdd0     = pick(o.hdd0,     "PS3_HDD0_ROOT",     exe_dir + "/hdd0");
     r.hdd1     = pick(o.hdd1,     "PS3_HDD1_ROOT",     exe_dir + "/hdd1");
-    r.savedata = pick(o.savedata, "PS3_SAVEDATA_ROOT", exe_dir + "/savedata");
+    r.savedata = pick(o.savedata, "PS3_SAVEDATA_ROOT",
+                     pick("", "PS3_GAMEDATA_ROOT", exe_dir + "/savedata"));
     r.title    = pick(o.title,    "PS3_TITLE",         "");
     r.log_dir  = exe_dir + "/logs";
     slashes(r.hdd0); slashes(r.hdd1); slashes(r.savedata);

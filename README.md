@@ -13,9 +13,9 @@ Updated 2026-11-17.
 | Decrypt and extract the packages | Done for the fixed 1.02 profile |
 | Lift PPU code to C++ | Done: 33,221 functions |
 | Build a native executable | Done: one 446 MB `.exe`, no extra DLLs |
-| Boot | Runs for 20 s without a crash. Both SPURS instances start and the renderer issues draw calls |
-| SPU jobs | 1 job lifted and running. 2 render jobs are not lifted yet and are skipped |
-| Rendering | Not working. The host counts 2,048 draw calls, but the window is one solid color |
+| Boot | Runs. Both SPURS instances start and base game files are found |
+| SPU jobs | 6 jobs lifted, 2 seen running. At least 4 more are not lifted |
+| Rendering | Not working. With the base game files loaded, the RSX command stream is misread and the GPU device is lost. No game frame has been shown |
 | Menu, gameplay, audio, saves | Not reached |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).

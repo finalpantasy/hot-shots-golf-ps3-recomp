@@ -39,6 +39,7 @@
 #include "win32_compat.h"
 #include "cli_options.h"
 
+#include <filesystem>
 #include <string>
 
 #include <stdint.h>
@@ -128,6 +129,7 @@ unsigned cellGcm_flip_request_count(void);
  * so the frame clock below is backend-agnostic. */
 #if defined(_WIN32)
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" void rsx_d3d12_backend_set_window_mode(int fullscreen, int hidden);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 #  define rsx_backend_init    rsx_d3d12_backend_init
@@ -178,27 +180,6 @@ static uint32_t    g_window_w = WINDOW_WIDTH;
 static uint32_t    g_window_h = WINDOW_HEIGHT;
 static bool        g_window_hidden = false;
 
-#ifdef _WIN32
-/* --hidden: the D3D12 backend creates its window with WS_VISIBLE and has no
- * option to skip it. A CBT hook on the frame-clock thread clears WS_VISIBLE and
- * adds WS_EX_NOACTIVATE while the window is being created; if the OS ignores
- * that, hide_thread_windows() hides it right after init. Best effort, no
- * runtime change. */
-static LRESULT CALLBACK hidden_cbt_proc(int code, WPARAM wp, LPARAM lp)
-{
-    if (code == HCBT_CREATEWND) {
-        CBT_CREATEWNDA* cw = (CBT_CREATEWNDA*)lp;
-        if (cw && cw->lpcs) {
-            cw->lpcs->style     &= ~(LONG)WS_VISIBLE;
-            cw->lpcs->dwExStyle |= WS_EX_NOACTIVATE;
-        }
-    }
-    return CallNextHookEx(NULL, code, wp, lp);
-}
-static BOOL CALLBACK hide_one(HWND h, LPARAM) { ShowWindow(h, SW_HIDE); return TRUE; }
-static void hide_thread_windows(void) { EnumThreadWindows(GetCurrentThreadId(), hide_one, 0); }
-#endif
-
 /* ---------------------------------------------------------------------------
  * Frame clock
  * -----------------------------------------------------------------------*/
@@ -234,15 +215,7 @@ static DWORD WINAPI frame_clock(LPVOID)
 {
     const char* title = g_window_title.empty() ? "ps3recomp" : g_window_title.c_str();
 
-#ifdef _WIN32
-    HHOOK hook = g_window_hidden
-        ? SetWindowsHookExA(WH_CBT, hidden_cbt_proc, NULL, GetCurrentThreadId()) : NULL;
-#endif
     int rsx_ok = (rsx_backend_init(g_window_w, g_window_h, title) == 0);
-#ifdef _WIN32
-    if (hook) UnhookWindowsHookEx(hook);
-    if (g_window_hidden) hide_thread_windows();
-#endif
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             rsx_ok ? (g_window_hidden ? "OK -- window hidden" : "OK -- window open") : "FAILED");
 
@@ -340,6 +313,43 @@ static void make_dirs(const std::string& path)
         }
     }
     make_one_dir(t);
+}
+
+static bool make_absolute(std::string& path)
+{
+    if (path.empty()) return true;
+    std::error_code error;
+    const auto resolved = std::filesystem::absolute(path, error);
+    if (error) {
+        fprintf(stderr, "error: cannot resolve %s (%s)\n", path.c_str(), error.message().c_str());
+        return false;
+    }
+    path = resolved.generic_string();
+    return true;
+}
+
+static bool resolve_firmware(std::string& roots, const std::string& exe_dir)
+{
+    const char* configured = getenv("PS3_DEV_FLASH");
+    if (!configured || !*configured) {
+        roots = exe_dir + "/dev_flash";
+        return true;
+    }
+#ifdef _WIN32
+    const char separator = ';';
+#else
+    const char separator = ':';
+#endif
+    const std::string list(configured);
+    for (size_t start = 0;;) {
+        const size_t end = list.find(separator, start);
+        std::string root = list.substr(start, end - start);
+        if (!make_absolute(root)) return false;
+        roots += root;
+        if (end == std::string::npos) return true;
+        roots += separator;
+        start = end + 1;
+    }
 }
 
 /* --exit-after: a clean quit through the same path the console's Quit Game uses. */
@@ -474,10 +484,21 @@ int main(int argc, char** argv)
     }
     if (opt.help)    { fputs(cli_help_text(), stdout); return 0; }
     if (opt.version) { puts(PORT_VERSION_STRING); return 0; }
+#ifndef _WIN32
+    if (opt.fullscreen || opt.hidden) {
+        fputs("error: --fullscreen and --hidden require the Windows backend.\n", stderr);
+        return 2;
+    }
+#endif
 
-    const std::string exe_dir = cli_exe_dir(argv[0]);
+    std::string exe_dir = cli_exe_dir(argv[0]);
+    if (!make_absolute(exe_dir)) return 1;
     ResolvedPaths rp;
     cli_resolve(opt, exe_dir, rp);
+    for (auto* path : {&rp.elf, &rp.vfs_root, &rp.hdd0, &rp.hdd1, &rp.savedata, &rp.log_file})
+        if (!make_absolute(*path)) return 1;
+    std::string firmware;
+    if (!resolve_firmware(firmware, exe_dir)) return 1;
 
     /* Log file first, so everything after it is captured. A bare --log name
      * lands in <exe dir>/logs. */
@@ -501,21 +522,34 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // Keep relative paths used internally by the runtime and graphics driver in the port folder.
+    std::error_code cwd_error;
+    std::filesystem::current_path(exe_dir, cwd_error);
+    if (cwd_error) {
+        fprintf(stderr, "error: cannot use the executable folder %s (%s)\n",
+                exe_dir.c_str(), cwd_error.message().c_str());
+        return 1;
+    }
+
     /* The runtime reads its roots from the environment, so the resolved values
      * (flag, env, or default next to the exe) are exported before it starts. */
     make_dirs(rp.hdd0); make_dirs(rp.hdd1); make_dirs(rp.savedata); make_dirs(rp.log_dir);
     cli_setenv("PS3_VFS_ROOT", rp.vfs_root.c_str());
     cli_setenv("PS3_HDD0_ROOT", rp.hdd0.c_str());
     cli_setenv("PS3_HDD1_ROOT", rp.hdd1.c_str());
-    cli_setenv("PS3_SAVEDATA_ROOT", rp.savedata.c_str());   /* not read by the runtime yet */
+    cli_setenv("PS3_SAVEDATA_ROOT", rp.savedata.c_str());
+    // cellSaveData uses the older variable for the same save tree.
+    cli_setenv("PS3_GAMEDATA_ROOT", rp.savedata.c_str());
+    cli_setenv("PS3_DEV_FLASH", firmware.c_str());
     cli_setenv("PS3_VERBOSE", std::to_string(rp.verbose).c_str());
-    if (opt.fullscreen)
-        fprintf(stderr, "[boot] --fullscreen is not wired yet; starting windowed\n");
+    if (rp.verbose > 0)
+        fprintf(stderr, "[boot] Verbose runtime logging enabled (PS3_VERBOSE=%d)\n", rp.verbose);
     if (opt.width)  g_window_w = (uint32_t)opt.width;
     if (opt.height) g_window_h = (uint32_t)opt.height;
     g_window_hidden = opt.hidden;
 
 #ifdef _WIN32
+    rsx_d3d12_backend_set_window_mode(opt.fullscreen, opt.hidden);
 #pragma comment(lib, "winmm.lib")
     /* 1 ms timer resolution. The default granularity is about 15.6 ms, which
      * inflates every shorter wait the title makes and throttles the whole

@@ -57,6 +57,80 @@ def read_ea(elf, ea, size):
     raise ValueError(f"EA 0x{ea:X}+0x{size:X} is not inside one PT_LOAD file image")
 
 
+def _imm(ins, index=-1):
+    try:
+        return int([t.strip() for t in ins.operands.split(",")][index], 0)
+    except (ValueError, IndexError):
+        return None
+
+
+def find_jump_tables(blob, insns, ranges, in_code):
+    """Switch tables the compiler placed inline, right after their dispatch.
+
+    Shape (GCC SPU, position-independent):
+        ila  $rT, TABLE           ; TABLE is the address right after the `bi`
+        clgti $rC, $rI, K         ; bounds check, K+1 entries
+        lqx / rotqby              ; load entry I
+        a    $rD, $rE, $rT(+delta); entry is TABLE-relative (may be negative)
+        bi   $rD                  ; dispatch; TABLE follows immediately
+    A candidate is read while each word, taken as TABLE + signed(word), lands
+    on an aligned address inside the code ranges. It is accepted only if a
+    `clgti ... K` with K+1 == entry count sits between the `ila` and the
+    table, so the extent is the compiler's own bound, not a heuristic run
+    length. A candidate without that bound is an error, never a guess.
+    """
+    tables = {}
+    for ins in insns.values():
+        if ins.mnemonic not in ("il", "ila"):
+            continue
+        base = _imm(ins)
+        if base is None or base & 3 or base in tables or not in_code(base):
+            continue
+        prev = insns.get(base - 4)
+        if prev is None or prev.mnemonic != "bi" or prev.operands.strip() == "$r0":
+            continue
+        rng_end = next(b for a, b in ranges if a <= base < b)
+        targets = []
+        while base + 4 * len(targets) < rng_end:
+            off = base + 4 * len(targets)
+            w = struct.unpack(">i", blob[off:off + 4])[0]
+            tgt = base + w
+            if tgt & 3 or not in_code(tgt) or base <= tgt <= off:
+                break
+            targets.append(tgt)
+        if len(targets) < 2:
+            continue
+        lo = min(ins.addr, base - 0x100)
+        bound = next((a for a in range(lo, base, 4) if a in insns
+                      and insns[a].mnemonic in ("clgti", "clgthi")
+                      and _imm(insns[a]) == len(targets) - 1), None)
+        if bound is None:
+            raise ValueError(f"jump-table candidate at 0x{base:X} ({len(targets)} words, "
+                             f"ila at 0x{ins.addr:X}) has no matching clgti bound")
+        tables[base] = dict(base=base, entries=len(targets), targets=targets,
+                            ref=ins.addr, bound=bound)
+    return [tables[k] for k in sorted(tables)]
+
+
+def subtract_ranges(ranges, holes):
+    out = []
+    for a, b in ranges:
+        cur = [(a, b)]
+        for h0, h1 in holes:
+            nxt = []
+            for s, e in cur:
+                if h1 <= s or h0 >= e:
+                    nxt.append((s, e))
+                    continue
+                if s < h0:
+                    nxt.append((s, h0))
+                if h1 < e:
+                    nxt.append((h1, e))
+            cur = nxt
+        out.extend(cur)
+    return sorted(out)
+
+
 def lift_one(job, elf, args, stage, tools):
     from find_spu_functions import detect_functions
     from spu_disasm import disassemble_spu
@@ -98,6 +172,14 @@ def lift_one(job, elf, args, stage, tools):
     def in_code(x):
         return any(a <= x < b for a, b in ranges)
 
+    insns = {i.addr: i for i in disassemble_spu(blob, base_addr=0)}
+    tables = find_jump_tables(blob, insns, ranges, in_code)
+    if tables:
+        ranges = subtract_ranges(ranges, [(t["base"], t["base"] + 4 * t["entries"]) for t in tables])
+        rec["jump_tables"] = [dict(base=f"0x{t['base']:X}", entries=t["entries"],
+                                   ref=f"0x{t['ref']:X}", bound=f"0x{t['bound']:X}")
+                              for t in tables]
+
     seeds, _ = detect_functions(blob, 0, verbose=False, raw=True)
     bounds = sorted({(max(s, a), min(e, b)) for s, e in seeds for a, b in ranges
                      if max(s, a) < min(e, b)})
@@ -113,6 +195,19 @@ def lift_one(job, elf, args, stage, tools):
         end = min([s for s in starts if s > x] + [rng_end])
         bounds.append((x, end))
     bounds.sort()
+    # Every verified jump-table target is an entry (find_spu_functions reads at
+    # most 32 entries per table, so a longer table loses its tail otherwise).
+    for x in sorted({t for tb in tables for t in tb["targets"]}):
+        if x in {s for s, _ in bounds}:
+            continue
+        hit = next(((s, e) for s, e in bounds if s < x < e), None)
+        if hit:
+            bounds.remove(hit)
+            bounds += [(hit[0], x), (x, hit[1])]
+        else:
+            rng_end = next(b for a, b in ranges if a <= x < b)
+            bounds.append((x, min([s for s, _ in bounds if s > x] + [rng_end])))
+        bounds.sort()
     if entry not in {s for s, _ in bounds}:
         bounds.append((entry, min([s for s, _ in bounds if s > entry] +
                                   [next(b for a, b in ranges if a <= entry < b)])))
@@ -150,14 +245,35 @@ def lift_one(job, elf, args, stage, tools):
     covered = set()
     for s, e in diag["functions"]:
         covered.update(range(s, e, 4))
-    insns = {i.addr: i for i in disassemble_spu(blob, base_addr=0)}
-    gaps = []
+    def zero_pad(x):
+        # An all-zero word decodes as `stop 0x0`; it is alignment padding only
+        # when it follows (through other padding) an unconditional branch.
+        if blob[x:x + 4] != b"\0\0\0\0":
+            return False
+        y = x - 4
+        while y >= 0 and (insns[y].mnemonic in PADDING or blob[y:y + 4] == b"\0\0\0\0"):
+            y -= 4
+        return y >= 0 and insns[y].mnemonic in ("br", "bra", "bi")
+
+    gaps, holes = [], []
     for a, b in ranges:
         for x in range(a, b, 4):
             if x not in covered:
-                if insns[x].mnemonic not in PADDING:
-                    raise ValueError(f"code at 0x{x:X} ({insns[x].mnemonic}) is in no function")
-                gaps.append(x)
+                if insns[x].mnemonic not in PADDING and not zero_pad(x):
+                    if holes and holes[-1][1] == x:
+                        holes[-1][1] = x + 4
+                    else:
+                        holes.append([x, x + 4])
+                else:
+                    gaps.append(x)
+    if holes:
+        raise ValueError("code in no function: " + ", ".join(
+            f"0x{s:X}-0x{e:X} ({insns[s].mnemonic})" for s, e in holes))
+    for t in tables:
+        lost = sorted(set(t["targets"]) - fstarts)
+        if lost:
+            raise ValueError(f"jump table 0x{t['base']:X} targets lack entries: " +
+                             ", ".join(f"0x{x:X}" for x in lost))
     hdr = (outdir / "spu_recomp.h").read_text(encoding="utf-8", errors="ignore")
     if f"{prefix}spu_func_{entry:08X}(" not in hdr:
         raise ValueError("generated header is missing the entry symbol")

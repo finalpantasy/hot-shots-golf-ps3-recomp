@@ -1,0 +1,61 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 37e3745..6426da8 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -134,12 +134,25 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
+ /* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
+  * translators. (extern "C" is ill-formed at block scope.) */
+ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
++extern "C" const char* cellGame_get_hdd_title_id(void);   /* cellGame.c: NULL unless an HDD title */
+ 
+ /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
+  * prefixes are stripped; the rest is appended to the root. */
+ static void host_path(char* out, size_t cap, const char* guest)
+ {
+     const char* rel = guest;
++    /* Match the directory used by cellSaveData for the local PS3 user. */
++    static const char save_mount[] = "/dev_hdd0/home/00000001/savedata";
++    const size_t save_mount_len = sizeof(save_mount) - 1;
++    if (strncmp(guest, save_mount, save_mount_len) == 0
++        && (guest[save_mount_len] == '/' || guest[save_mount_len] == '\0')) {
++        const char* save_root = ps3_env_once("PS3_SAVEDATA_ROOT");
++        if (save_root && *save_root) {
++            snprintf(out, cap, "%s%s", save_root, guest);
++            for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
++            return;
++        }
++    }
+     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
+      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
+      * /dev_hdd0/game/<title>/), mirroring the PS3/RPCS3 layout: base data on
+@@ -150,6 +163,30 @@ static void host_path(char* out, size_t cap, const char* guest)
+     if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
+         snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
++        /* An HDD (PSN) title has no disc: its base install AND its updates both
++         * live in /dev_hdd0/game/<title>/. A host setup that keeps the base
++         * package under ppu_vfs_root and only the update under PS3_HDD0_ROOT
++         * then misses every base file -- Hot Shots Golf could not open
++         * xbdata/courseinfo, its input and shot tables, and went on to call
++         * through the NULL objects those loads left behind. So when the HDD0
++         * path does not exist but the same file exists in the base install,
++         * resolve to the base. A path that exists in neither stays on HDD0, so
++         * new files are still created there. Only for CATEGORY "HG" titles. */
++        /* PS3_NO_HDD_BASE_FALLBACK=1 turns this off, for A/B runs. */
++        static int no_base = -1;
++        if (no_base < 0) { const char* e = ps3_env_once("PS3_NO_HDD_BASE_FALLBACK"); no_base = (e && *e == '1') ? 1 : 0; }
++        const char* tid = no_base ? nullptr : cellGame_get_hdd_title_id();
++        size_t tn = tid ? strlen(tid) : 0;
++        if (tn && strncmp(guest + 10, "game/", 5) == 0 &&
++            strncmp(guest + 15, tid, tn) == 0 && guest[15 + tn] == '/') {
++            struct stat st;
++            if (stat(out, &st) != 0) {
++                char base[1024];
++                snprintf(base, sizeof(base), "%s/%s", ppu_vfs_root, guest + 16 + tn);
++                for (char* p = base; *p; p++) if (*p == '\\') *p = '/';
++                if (stat(base, &st) == 0) snprintf(out, cap, "%s", base);
++            }
++        }
+         return;
+     }
+ 
