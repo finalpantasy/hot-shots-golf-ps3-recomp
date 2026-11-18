@@ -1,0 +1,36 @@
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2925,9 +2925,11 @@
+      * OBSERVED zero, which threw away any notify that arrived while the job
+      * was still running -- the title notified 6 times and the chain completed
+      * 2 laps, so the thread waiting on the other 4 completions never woke. */
+-    s_jobguards[i].pending++;
+-    { u32 remaining = (s_jobguards[i].pending >= s_jobguards[i].reset)
+-                    ? 0u : s_jobguards[i].reset - s_jobguards[i].pending;
++    /* Atomic: Notify runs on PPU threads while jg_wait consumes on the walker
++     * thread; a plain ++ racing the walker's -= can lose a notify. */
++    { u32 pend = __atomic_add_fetch(&s_jobguards[i].pending, 1u, __ATOMIC_ACQ_REL);
++      u32 rst  = __atomic_load_n(&s_jobguards[i].reset, __ATOMIC_ACQUIRE);
++      u32 remaining = (pend >= rst) ? 0u : rst - pend;
+       s_jobguards[i].count = remaining;
+       vm_write32(ea, remaining); }
+     { static int _n = 0;
+@@ -2969,11 +2971,14 @@
+      * later never ran. Only a shutdown ends the wait. */
+     for (;;) {
+         if (t_jc_stop && *t_jc_stop) return 0;     /* chain shut down */
+-        if (s_jobguards[i].pending >= s_jobguards[i].reset) {
++        u32 rst = __atomic_load_n(&s_jobguards[i].reset, __ATOMIC_ACQUIRE);
++        if (__atomic_load_n(&s_jobguards[i].pending, __ATOMIC_ACQUIRE) >= rst) {
+             /* Consume exactly one release worth of credits, so notifies that
+-             * arrived during the previous lap still count. */
+-            s_jobguards[i].pending -= s_jobguards[i].reset;
+-            if (!s_jobguards[i].auto_reset) s_jobguards[i].reset = 0;
++             * arrived during the previous lap still count. Atomic subtract:
++             * a Notify may land between the check and the consume. */
++            __atomic_sub_fetch(&s_jobguards[i].pending, rst, __ATOMIC_ACQ_REL);
++            if (!s_jobguards[i].auto_reset)
++                __atomic_store_n(&s_jobguards[i].reset, 0u, __ATOMIC_RELEASE);
+             s_jobguards[i].count = s_jobguards[i].reset;
+             vm_write32(ea, s_jobguards[i].count);
+             return 1;

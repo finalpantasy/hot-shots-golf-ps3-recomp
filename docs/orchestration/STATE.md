@@ -510,3 +510,13 @@ Start a rendering worker on the stretched lie block and the black depth-restore 
 ### Exact next action
 
 Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-flip load. Ask Codex for patch replay of 0031 to 0036 and CLI flags for the new switches. Refresh the handoff.
+- Workers started: speed `libs/video/**` (Opus, output 0037); load time, other `libs/**` except video/input/audio (Sonnet, output 0038).
+- 10:50 load worker `a0258e126d503484f` finished, no patch: both no-flip loads are the `Sleep(4)` FIFO drain tick in `port/main.cpp:233` (Codex owns it); fix sent to Codex: `cellGcm_fifo_kick_wait(4)` as in `runtime/ppu/tests/boot_main.cpp:491`. Owner repeated: every launch muted and hidden; sent to Codex.
+
+## 2026-11-18 run 32: speed patch 0037, guard atomic 0038, faster loads
+
+- Worker `ac83fab0854188da0` finished. `0037-rsx-speed.patch` (`rsx_d3d12_backend.c`, `rsx_vertex_fetch.c/.h`): `RSX_VTX_FAST`, `RSX_VS_MEMO`, `RSX_SRV_DEDUP`, `RSX_PSO_REUSE`, `RSX_TEX_MEMO`, `RSX_STRIP_IX` (each `=0` off), `RSX_PROF=2`, `RSX_SPEED_CHECK=<n>`. A/B logs `boot-fix-1.02-xOff1-1.log` to `xOn2-1.log`.
+- Coordinator `0038-spurs-guard-atomic.patch` (`libs/spurs/cellSpurs.c`, base = tree after 0028): `pending` atomic in `cellSpursJobGuardNotify`, `jg_wait`.
+- Codex applied `cellGcm_fifo_kick_wait(4)` in `port/main.cpp` (load worker `a0258e126d503484f` found the 4 ms tick).
+- Boot `round37` (build 2a459f40, 450 s swing script): hole 1 holed, hole 2 done, hole 3 tee; marker all zero, 25477 lines. Bad: black t248, t328; inverted colors t312; window title empty. Strip: scratchpad `round37-strip.png`.
+- Regression worker started (Opus): owns `libs/video/**`, output `0039-rsx-regress.patch`.

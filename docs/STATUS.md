@@ -231,3 +231,15 @@ Batches that fill up after already holding a display draw are now run and the ba
 Check on a build with every patch through `0036` (boot `round36`, 450 seconds): no black frames, no stall. Scripted presses played hole 1 from the tee to a putt 2.6 feet from the hole: 319, 302, 208, 70.8 and 5.4 yards remaining, then 6.5 feet. The title runs at 59 FPS; course views with 1700 to 3500 draws run at 12 to 28 FPS. Captures: `docs/images/round-approach-2026-11-18.png`, `docs/images/round-putt-2026-11-18.png`.
 
 Still open: every run has a 45 to 55 second load with no flips; heavy course views run at 12 to 17 FPS.
+
+## 2026-11-18 update 24: course views twice as fast, three holes reached
+
+Patch `0037` cuts the renderer's per-draw work: vertex fetch is planned once per draw, shader lookups compare program bytes before hashing, texture descriptors and pipeline states are reused when they match the previous draw, and indexed strips are converted once. Each change has a switch to turn it off. In runs alternating the switches off and on, on one build with the PC's CPU 68 to 72% busy, heavy course views went from 12 to 14 FPS to 22 to 24 FPS, and the backend's recording time fell from 40 to 44 ms to 15 to 16 ms per frame. `RSX_SPEED_CHECK` runs the old and new code side by side; it found no differences over 5.2 million vertices.
+
+Patch `0038` makes the SPURS job-guard counter atomic; a notify could be lost when the game thread and the job-chain thread updated it at the same time.
+
+Codex replaced the 4 ms sleep in the FIFO drain loop (`port/main.cpp`) with a wait that wakes when commands arrive. The game polls for each marker during loads, so the loads were paced by that sleep.
+
+With all three, a 450-second scripted round (boot `round37`) holed out on hole 1, finished hole 2 and reached hole 3, where the same script on the previous build was still putting on hole 1. Capture: `docs/images/round-holed-2026-11-18.png`.
+
+New problems in that run: two black captures mid-hole and one frame with inverted colors (purple grass, orange sky). A worker is narrowing down which change causes them. The window title no longer shows FPS.
