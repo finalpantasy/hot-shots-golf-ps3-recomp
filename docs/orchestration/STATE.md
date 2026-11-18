@@ -407,3 +407,16 @@ Add presses after flip 4750 to pick the course and start a round; a run is cappe
 ### Exact next action
 
 On the worker's report: verify FPS in the demo and the round, commit `0027`, then retry the round and send swing input.
+
+## 2026-11-18 run 22: patch 0027, stall is in the guest
+
+- Worker `a488a7d74f9958cfa` finished, patch `0027-rsx-frame-time.patch` (applies on 0005/0008/0020/0024/0026): `RSX_PROF=1` profiler; debug layer opt-in (`D3D12_DBG=1` or `D3D12_IQ=1`); shader bytecode cache by HLSL hash in memory and in `build/fix-1.02/shader_cache_d3d12` (`RSX_SHADER_CACHE=0` off, or a folder path); hashed sampler lookup; inlined vertex float read.
+- Numbers (demo, same scene): render_frame 24.6 ms to 10 to 12 ms; shader compiles 88 (50.8 s) to 1 (42 ms) with 78 disk and 58 memory hits; about 11 FPS at 860 draws to 15 to 28 FPS at 750 to 960 draws.
+- Round: 1100 to 1130 draws, about 0.85 FPS, walker idle 2275 to 2890 ms per 2.3 s window, 95% of process time in ntdll waits. None of the round's draws count as display draws, so nothing is presented. Last marker line: `bctr=0 nullcall=0 regist=0 stars=0 unresNID=0 unresCall=0 garbage=0 887A=0 lines=7695`.
+- Not verified: title and menus not compared in captures after 0027; sampler table hits its 2048 limit in the round; flat cyan water in `final2-1.png`; `port/main.cpp` idles with `Sleep(4)` (Codex's file).
+- The shader cache folder sits beside the executable. Release gate 2 (portable) is satisfied by that location; Codex should confirm it against its write trace.
+- Worker `a85b98713035368ac` (Opus, reason: guest thread and SPURS wait diagnosis) owns `runtime/**`, `libs/spurs/**`, `libs/sync/**`, `libs/video/**`, patches `0023` re-export and `0028`: what the guest waits on each frame in the round. Coordinator edits none of those.
+
+### Exact next action
+
+On the worker's report: verify the round gets past "Now Loading", commit, then send swing input.

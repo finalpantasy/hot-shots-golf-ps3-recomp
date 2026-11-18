@@ -141,3 +141,11 @@ Scripted Cross presses (`PAD_SCRIPT` on frame counts) go from the title through 
 ## 2026-11-18 update 13: a round starts loading
 
 More scripted presses pick the course, the character (Yuna) and the shot type, and confirm "Go to Course". The round then loads: course sound files open, the job queue runs (4064 jobs, 0 misses), and the frame has 1143 draws. It runs at about 1 frame per second with "Now Loading" still on screen for the 150 seconds watched. Frame rate falls as draw count rises everywhere (277 draws: 20 to 36 FPS; 394: 13; 600 to 900: 9 to 14), so frame time in the renderer is the next thing to fix.
+
+## 2026-11-18 update 14: renderer time cut, the round stall is a guest wait
+
+Profiling (`RSX_PROF=1`) found two costs in the renderer. The D3D12 debug layer was on by default, and every shader was compiled at run time on the command thread: 88 compiles, 50.8 seconds per run. The debug layer is now opt-in (`D3D12_DBG=1`) and compiled shaders are cached in memory and on disk (patch `0027`). In the same demo scene the frame body went from 24.6 ms to 10 to 12 ms, and the demo from about 11 FPS to 15 to 28 FPS.
+
+The 1 frame per second in a real round is not render time. The renderer is idle for more than 2 of every 2.3 seconds and 95 percent of process time is in waits, so the game is blocked on something once per frame. That is being traced now.
+
+Open: the sampler table fills at 2048 entries in a round, after which new sampler states fall back to defaults. Large flat cyan water surfaces appear in one capture.
