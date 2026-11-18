@@ -35,12 +35,25 @@ Updated 2026-11-17.
 | SPU jobs | 16 jobs lifted. No job seen so far is missing; the last one lifted has not run yet |
 | Rendering | The title, menus and course draw. The title runs at about 60 FPS and course scenes at 19 to 60 FPS |
 | Intro movie | Skipped. The player reports the movie as finished because there is no video decoder |
-| Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
+| Input | Xbox-style controllers (XInput) and the keyboard are mapped to the PS3 pad; a test with fake controller and key states passes for every button, trigger and stick. Scripted presses drive the menus and swings. Not tested with a physical controller |
 | Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout, lit terrain with tree shadows. |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
 | Menus | Scripted Cross presses go from the title through the clubhouse menu, course select, character select and shot type to "Go to Course" |
-| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots: the swing gauge runs, the ball is hit and the first hole (par 4) is finished at +4, the leaderboard shows, and hole 2 starts. Some captured frames come out black, and in some runs the picture stops updating on the hole 1 intro while the game keeps running. Not tested with a real controller |
+| Playing a round | The round loads and reaches the first tee in under four minutes. Scripted Cross presses play shots, finish the first hole (par 4) at +4, show the leaderboard and start hole 2. Some captured frames come out black, and in some runs the picture stops updating while the game and its audio keep running. Not tested with a physical controller |
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
+
+
+## Controls
+
+| PS3 | Controller (XInput) | Keyboard |
+|---|---|---|
+| Cross, Circle, Square, Triangle | A, B, X, Y | Z, X, A, S |
+| L1, R1 | LB, RB | Q, W |
+| L2, R2 | LT, RT | 1, 2 |
+| Start, Select | Start, Back | Enter, Tab |
+| D-pad and left stick | D-pad, left stick | Arrow keys |
+
+The keyboard is used when no controller is connected, and only while the game window has focus.
 
 ## What is in this repository
 
