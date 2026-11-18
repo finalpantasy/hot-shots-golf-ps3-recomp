@@ -355,3 +355,26 @@ When the lift worker reports: check the course capture again (lighting, sky, tri
 
 Read `boot-fix-1.02-cont2-1.log` and its captures (Cross at 170 s) to see what follows the title, and find out why the title arrived late.
 
+
+## 2026-11-17 run 17: late title is not this build
+
+- `boot-fix-1.02-cont2-1.log` (240 s, Cross at 170 s): black frames with 400 to 840 draws from 120 s to 220 s, title at 240 s, so the press missed again. 0 unresolved NID, 0 `bctr to NULL`.
+- `boot-fix-1.02-noflash-1.log` (no `PS3_DEV_FLASH`): same late load, so the staged firmware folder is not the cause.
+- `boot-fix-1.02-oldexe-1.log` (previous build `build/job16-*`, same muted settings): also still loading at 100 s. The new build is not the cause.
+- Left: machine load (CPU at 70 percent, Codex builds and other projects running, the game runs at BelowNormal priority) or `PS3_MUTE=1`. Not separated yet.
+- A fixed-time `PAD_SCRIPT` cannot hit the title while load time varies by a factor of three.
+
+### Exact next action
+
+Make scripted input wait for a frame count or draw count, not wall time, then capture what follows the title.
+
+## 2026-11-18 run 18: Continue accepted, next scene is black
+
+- `PAD_CLOCK=flips` with `PAD_SCRIPT=2500:0x4000` presses Cross on the title whatever the load time. `boot-fix-1.02-flips-1.log` and `-flips2-1.log` (300 s and 430 s): "Continue" is accepted, "Now Loading" shows for about 40 s, then the window is black with 470 to 900 draws per frame at 8 to 11 FPS. 0 unresolved NID, 0 `bctr to NULL`, 0 `null-call`.
+- Milestone log `work/runtime/logs/milestone-flips.log`: `cellOskDialogExtInputDeviceLock` 1, `Unlock` 1, `cellSpursJobQueuePort2Sync` 1, `Port2Destroy` 1, `ShutdownJobQueue` 1, `JoinJobQueue` 1. These paths now have run once without a fault.
+- Demo capture in the same run shows clean foliage and a player portrait.
+- Worker `aa6ea4961e5ca21b1` (Opus, reason: RSX state and shader debugging) owns `libs/video/**`, patch `0026`: why the scene after Continue is black. Coordinator edits nothing there.
+
+### Exact next action
+
+On the worker's report: check its captures, commit `0026`, update README status.
