@@ -1,0 +1,64 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index f231ea2..3a9e4dc 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -584,13 +584,46 @@ static float audio_mix_peak(void)
+     return pk;
+ }
+ 
+-/* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
+- * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
++/* AUDIO_WAV=<file>: write the final mix (after mixing and clipping, before
++ * the PS3_MUTE device mute) as a 32-bit float stereo 48 kHz WAV. The RIFF and
++ * data sizes are patched every ~2 s of audio and on shutdown, so a killed
++ * process still leaves a readable file. Unset: nothing happens. */
++static FILE* s_wav_f;
++static int   s_wav_init;
++static unsigned long long s_wav_frames;
++
++static void audio_wav_fixup(void)
++{
++    if (!s_wav_f) return;
++    const unsigned long long db = s_wav_frames * 8ull;
++    const unsigned riff = (unsigned)(36ull + db), dsz = (unsigned)db;
++    fflush(s_wav_f);
++    if (fseek(s_wav_f, 4, SEEK_SET) == 0) fwrite(&riff, 4, 1, s_wav_f);
++    if (fseek(s_wav_f, 40, SEEK_SET) == 0) fwrite(&dsz, 4, 1, s_wav_f);
++    fflush(s_wav_f);
++    fseek(s_wav_f, 0, SEEK_END);
++}
++
+ static void audio_dump_mix(void)
+ {
+-    static FILE* wf = (FILE*)-1;
+-    if (wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); wf = e ? fopen(e, "wb") : NULL; }
+-    if (wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, wf);
++    if (!s_wav_init) {
++        const char* e = getenv("AUDIO_WAV");
++        s_wav_init = 1;
++        s_wav_f = e ? fopen(e, "wb") : NULL;
++        if (s_wav_f) {
++            const unsigned rate = CELL_AUDIO_SAMPLE_RATE;
++            unsigned char h[44] = { 'R','I','F','F',0,0,0,0,'W','A','V','E','f','m','t',' ',
++                16,0,0,0, 3,0, 2,0, 0,0,0,0, 0,0,0,0, 8,0, 32,0, 'd','a','t','a',0,0,0,0 };
++            const unsigned br = rate * 8;
++            memcpy(h + 24, &rate, 4); memcpy(h + 28, &br, 4);
++            fwrite(h, 1, 44, s_wav_f);
++            audio_wav_fixup();
++        }
++    }
++    if (!s_wav_f) return;
++    fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, s_wav_f);
++    s_wav_frames += CELL_AUDIO_BLOCK_SAMPLES;
++    if ((s_wav_frames % (CELL_AUDIO_BLOCK_SAMPLES * 375)) == 0) audio_wav_fixup();
+ }
+ 
+ #ifdef _WIN32
+@@ -808,6 +841,7 @@ s32 cellAudioQuit(void)
+ 
+     audio_stop_mix_thread();
+     audio_backend_shutdown();
++    audio_wav_fixup();   /* AUDIO_WAV: final sizes; file stays open for a re-init */
+ 
+     /* Port buffers live in the guest vm_base arena (bump-allocated, not host
+      * malloc) -- just drop the references; never free() them. */
