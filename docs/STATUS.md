@@ -125,3 +125,11 @@ Left alone at the title, the game starts its attract demo, loads a course and dr
 - The build generates the HLE import table from the library sources, so the manual `gen_hle_nids.py` step is gone.
 
 Open: course terrain is too dark, cause unknown. In the latest run the title took 140 seconds to appear (60 to 70 before), cause unknown. Menus after the title are not captured.
+
+## 2026-11-18 update 11: scenes after the title draw
+
+A scripted Cross on "Continue" is accepted and the next scene loads. That scene, and the attract demo's play before the title, drew black at first. Each gameplay frame starts with a shadow pass into a depth-only target, and the backend counted those draws as screen content, so it presented the shadow pass alone as a black frame. Depth-only draws no longer count as display draws (patch `0026`; `RSX_DEPTH_DISPLAY=1` restores the old rule).
+
+Captures after the fix show course fly-bys and the demo's shot screen with the power gauge. Scripted input now counts game frames (`PAD_CLOCK=flips`), because load time varied by a factor of three with machine load.
+
+Open: course terrain is too dark. The shot screen has a black background behind the golfer, and two captures show mostly sky; neither is compared with real hardware. Frame rate in play is 11 to 14 FPS. Line primitives are skipped.

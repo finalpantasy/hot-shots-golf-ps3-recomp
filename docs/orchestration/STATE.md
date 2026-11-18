@@ -378,3 +378,13 @@ Make scripted input wait for a frame count or draw count, not wall time, then ca
 ### Exact next action
 
 On the worker's report: check its captures, commit `0026`, update README status.
+
+## 2026-11-18 run 19: shadow pass no longer presented as a frame
+
+- Worker `aa6ea4961e5ca21b1` finished, patch `0026-rsx-menu-scene.patch` (`libs/video/rsx_d3d12_backend.c`, applies on HEAD + 0005 + 0008 + 0020 + 0024). Depth-only draws (`no_color`, or `cmask==0`) are excluded from the three display checks. Off switch `RSX_DEPTH_DISPLAY=1`. Capture manifest prints `zeta=`, `nocolor=`, `disp=` per draw.
+- Evidence: `work/runtime/rsxcap-menu/run1/frame_08` (683 shadow draws, 1-color backbuffer), `run2/frame_00..03`, `after1` (frames 09 to 18 colored). Last run, build sha8 `3915fbac`: `bctr=0 nullcall=0 regist=0 stars=0 unresNID=0 unresCall=0 garbage=0 887A=0 lines=13415`.
+- Not verified: a black capture at 240 s with the title's draw count (fade?), two mostly-sky captures, black background on the shot screen, 11 to 14 FPS in play, line primitive (prim 2) skipped.
+
+### Exact next action
+
+Send input after Continue to learn what that scene is (menu or round), and look at play frame rate.

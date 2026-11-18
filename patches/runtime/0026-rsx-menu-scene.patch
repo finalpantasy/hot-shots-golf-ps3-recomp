@@ -1,0 +1,66 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -155,6 +155,24 @@
+     int   indexed;
+     u32   ib_first, index_count;
+ } D3D12DrawRecord;
++
++/* Does this record put visible pixels on the display? The frame-boundary
++ * gates (clear, flip, present) ask this to tell a finished frame from pass
++ * work still in progress. A depth-only pass (colour target NONE, or colour
++ * writes masked off) has rt_off 0 because it names no offscreen colour
++ * surface, yet draws nothing on screen: Hot Shots Golf renders its shadow
++ * cascades that way at the start of every gameplay frame, and counting them
++ * as display content presented the shadow pass alone as a frame (black) at
++ * the next display clear, splitting each frame in two and strobing black.
++ * RSX_DEPTH_DISPLAY=1 restores the old rule (any rt_off 0 draw counts). */
++static int dr_is_display_draw(const D3D12DrawRecord* dr)
++{
++    static int old = -1;
++    if (old < 0) old = getenv("RSX_DEPTH_DISPLAY") ? 1 : 0;
++    if (dr->is_clear || dr->rt_off != 0) return 0;
++    if (old || !dr->is_vp) return 1;   /* legacy records never fill cmask/no_color */
++    return !dr->no_color && dr->cmask != 0;
++}
+ /* An indexed run (upload_tris_vp_ix) may take the next batch; cleared with the records. */
+ static int s_ix_run_valid;
+ 
+@@ -1719,8 +1737,9 @@
+                 /* Fixed-function state the PSO / fragment constants carry:
+                  * alpha test (enable<<16|func<<8|ref), depth/stencil key,
+                  * culling, SHADER_CONTROL. */
+-                fprintf(mf, "      at=0x%05X zs=0x%llX cull=%X fpctrl=0x%X\n",
+-                        r->alpha_ctl, (unsigned long long)r->zs_key, r->cull, r->fp_ctrl);
++                fprintf(mf, "      at=0x%05X zs=0x%llX cull=%X fpctrl=0x%X zeta=0x%08X nocolor=%d disp=%d\n",
++                        r->alpha_ctl, (unsigned long long)r->zs_key, r->cull, r->fp_ctrl,
++                        r->zeta_off, r->no_color, dr_is_display_draw(r));
+                 for (int u = 0; u < 16; u++)
+                     if (r->tex[u].set)
+                         fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X"
+@@ -6385,7 +6404,7 @@
+      * order, in one command list. Empty batches still present (boot/idle). */
+     int flip_has_display = (s_d3d.draw_count == 0);
+     for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
+-        if (!s_d3d.draws[_i].is_clear && s_d3d.draws[_i].rt_off == 0) {
++        if (dr_is_display_draw(&s_d3d.draws[_i])) {
+             flip_has_display = 1;
+             break;
+         }
+@@ -6459,7 +6478,7 @@
+      * until its composite draw arrives, or the screen strobes intermediates. */
+     int have_display_draws = 0;
+     for (u32 i = 0; i < s_d3d.draw_count && i < MAX_DRAWS; i++)
+-        if (!s_d3d.draws[i].is_clear && s_d3d.draws[i].rt_off == 0) {
++        if (dr_is_display_draw(&s_d3d.draws[i])) {
+             have_display_draws = 1;
+             break;
+         }
+@@ -8452,7 +8471,7 @@
+     static int s_seen_content = 0;
+     int has_display = (s_d3d.draw_count == 0 && !s_seen_content);
+     for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
+-        if (!s_d3d.draws[_i].is_clear && s_d3d.draws[_i].rt_off == 0) {
++        if (dr_is_display_draw(&s_d3d.draws[_i])) {
+             has_display = 1;
+             break;
+         }

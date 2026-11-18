@@ -28,7 +28,7 @@ Updated 2026-11-17.
 | Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
 | Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout. Terrain is too dark |
 | Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
-| Menus after the title, gameplay | Not verified |
+| After "Continue" | The load finishes and course scenes draw. No further input sent yet, so menus and play are not verified |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 
