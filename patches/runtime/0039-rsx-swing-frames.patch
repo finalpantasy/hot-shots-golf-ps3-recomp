@@ -1,0 +1,650 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -154,6 +154,8 @@
+     u32 surf_raw;       /* raw colour surface offset at record time, display buffers included
+                          * (rt_off is 0 for those), so a capture names which one a draw hit */
+     u32 disp_tex;       /* pre-pass: units that sample a display buffer (bound to s_disp_copy) */
++    int has_z;          /* the surface format has depth: zeta_off names a depth surface (0 included) */
++    u32 tex_dispz;      /* pre-pass: units that sample the display depth (the shared depth buffer) */
+     /* Guest viewport rect at draw time (target pixels). Sub-viewport layouts
+      * (wave's debug tiles) position quads with this, not with constants --
+      * forcing full-target viewports drew every tile window-sized. */
+@@ -1173,7 +1175,9 @@
+         depth_desc.Height             = 2048;
+         depth_desc.DepthOrArraySize   = 1;
+         depth_desc.MipLevels          = 1;
+-        depth_desc.Format             = DXGI_FORMAT_D24_UNORM_S8_UINT;
++        /* Typeless, so the display depth can also be read (dispz_convert:
++         * a title sampling its main depth surface as a texture). */
++        depth_desc.Format             = DXGI_FORMAT_R24G8_TYPELESS;
+         depth_desc.SampleDesc.Count   = 1;
+         depth_desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+         depth_desc.Flags              = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+@@ -2099,6 +2103,26 @@
+ 
+ static int s_present_this_frame;   /* defined with the present path below */
+ static int s_bb_continue = 0;      /* next render_frame keeps the backbuffer (batch_room) */
++
++/* Display surface persistence. On hardware a display surface is ordinary
++ * memory: a frame that does not clear it draws over what the last frame left
++ * there. Hot Shots Golf's swing draws one full frame, then several frames of
++ * only the golfer and a few scene parts with no clear, and the backend's
++ * per-batch clear of the swapchain buffer showed those as black. Each batch
++ * that drew to the display saves the backbuffer into a copy keyed by the guest
++ * colour surface offset; a batch that starts without a display colour clear
++ * copies its surface's saved image back (and keeps the shared display depth)
++ * instead of clearing. RSX_KEEP_DISPLAY=0 restores the clear. */
++#define KEEP_DISP_MAX 4
++static struct { u32 surf; ID3D12Resource* res; u64 used; } s_keep_disp[KEEP_DISP_MAX];
++static int s_disp_clear_pending = 1;  /* the next display batch starts with a guest colour clear */
++static u32 s_keep_save_surf = 0;      /* this batch's last display surface (0: none) */
++static int keep_display_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_KEEP_DISPLAY"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
+ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+ {
+     char dir[300]; const char* base = getenv("RSX_CAP_DIR");
+@@ -4643,10 +4667,12 @@
+     const rsx_state* st = s_d3d.current_rsx_state;
+     dr->zeta_off = 0;
+     dr->no_color = 0;
++    dr->has_z = 0;
+     dr->surf_raw = st ? st->surface_color_offset[st->color_target == 2 ? 1 : 0] : 0;
+     dr->surf_w = st ? st->surface_clip_w : 0;
+     dr->surf_h = st ? st->surface_clip_h : 0;
+     if (!st || !((st->surface_format >> 5) & 7u)) return;
++    dr->has_z = 1;
+     dr->zeta_off = st->surface_zeta_offset;
+     dr->no_color = st->color_target == 0 && dr->zeta_off != 0;
+     /* A depth-only pass has no colour surface to take a size from
+@@ -5265,6 +5291,277 @@
+     s_d3d.off_ds[i].conv_gen = s_d3d.off_ds[i].gen;
+ }
+ 
++/* ---- The display depth read as a texture ---------------------------------
++ * Display draws use the one shared depth buffer, so a title's main depth
++ * surface exists only on the GPU. Hot Shots Golf saves it before a swing (a
++ * full-screen draw samples zeta 0x0 as A8R8G8B8 and writes it out as depth to
++ * 0x034C0000) and restores it in every swing frame; read from guest memory the
++ * save saw zeros, the restored depth failed every later draw, and the swing
++ * frames came out black. A unit the fragment program samples whose offset is
++ * the display's zeta gets a copy of the shared depth buffer instead, in the
++ * same encodings as ds_convert, at the texture's size (the backbuffer stands
++ * in for a display surface of the guest's size, so texels are scaled).
++ * RSX_DISP_DEPTH_TEX=0 turns this off. */
++#define DISPZ_SRV_BASE (DS_SRV_BASE + MAX_OFF_DS * 2)   /* depth + stencil SRVs of the shared buffer */
++static int dispz_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_DISP_DEPTH_TEX"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++/* RSX_DISP_DEPTH_KEEP=0: clear the shared depth buffer on every switch back to
++ * a target without its own depth surface, as before. By default only a switch
++ * away from (or back from) an offscreen pass that borrowed it as scratch
++ * clears it: an offscreen pass with its own depth surface in the middle of the
++ * frame (a bloom downsample) used to wipe the display depth for the rest of
++ * the frame, and the depth the swing save reads with it. */
++static int dispz_keep_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_DISP_DEPTH_KEEP"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++static u32 s_dispz_off = 0;            /* the display's zeta offset (0 is valid) */
++static int s_dispz_known = 0;
++static u32 s_dispz_sw = 0, s_dispz_sh = 0;   /* guest display surface size */
++static u32 s_dispz_gen = 1;            /* bumped whenever the shared depth may change */
++static int s_shared_scratch = 0;       /* the shared depth holds an offscreen pass's scratch depth */
++static u32 s_dispz_batch = 0;          /* render_frame sequence, for the copies' size guard */
++typedef struct { ID3D12Resource* res; u32 w, h, dxgi, conv_gen, batch; D3D12_RESOURCE_STATES st; } DispZCopy;
++static DispZCopy s_dispz[2];           /* [0] D24S8 bytes as RGBA8, [1] depth as R32F */
++static ID3D12RootSignature* s_dispz_rs;
++static ID3D12PipelineState* s_dispz_pso[2];
++static ID3D12DescriptorHeap* s_dispz_rtv;
++static u32 s_dispz_nconv, s_dispz_nmake, s_dispz_nbind;   /* RSX_DISPZ_DBG=1: per-second counts */
++static void dispz_stats(void)
++{
++    static int on = -1; static double t0 = 0;
++    if (on < 0) on = getenv("RSX_DISPZ_DBG") ? 1 : 0;
++    if (!on) return;
++    const double now = perf_now();
++    if (!t0) t0 = now;
++    if (now - t0 < 1.0) return;
++    printf("[DISPZ] per %.1fs: conversions=%u copies made=%u draws bound=%u frame=%llu%c", now - t0,
++           s_dispz_nconv, s_dispz_nmake, s_dispz_nbind, (unsigned long long)s_d3d.frame_count, 10);
++    s_dispz_nconv = s_dispz_nmake = s_dispz_nbind = 0; t0 = now;
++}
++
++static int dispz_init(void)
++{
++    if (s_dispz_pso[0]) return 1;
++    static int failed = 0;
++    if (failed || !s_d3d.device || !s_d3d.srv_heap || !s_d3d.depth_buffer) return 0;
++    failed = 1;
++    static const char vs[] =
++        "float4 main(uint id : SV_VertexID) : SV_Position {\n"
++        "    float2 p = float2((id << 1) & 2, id & 2);\n"
++        "    return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);\n"
++        "}\n";
++    static const char ps8[] =
++        "cbuffer K : register(b0) { float4 k; };\n"
++        "Texture2D<float> dz : register(t0);\n"
++        "Texture2D<uint2> dst : register(t1);\n"
++        "float4 main(float4 pos : SV_Position) : SV_Target {\n"
++        "    int3 p = int3(min(floor(pos.xy) * k.xy, k.zw), 0);\n"
++        "    uint d = (uint)round(saturate(dz.Load(p)) * 16777215.0);\n"
++        "    uint s = dst.Load(p).y;\n"
++        "    return float4((d >> 8) & 255u, d & 255u, s & 255u, d >> 16) / 255.0;\n"
++        "}\n";
++    static const char psf[] =
++        "cbuffer K : register(b0) { float4 k; };\n"
++        "Texture2D<float> dz : register(t0);\n"
++        "float main(float4 pos : SV_Position) : SV_Target {\n"
++        "    return saturate(dz.Load(int3(min(floor(pos.xy) * k.xy, k.zw), 0)));\n"
++        "}\n";
++    ID3DBlob *vb = NULL, *pb = NULL, *pf = NULL, *err = NULL, *sig = NULL;
++    if (FAILED(D3DCompile(vs, sizeof vs - 1, "dispz_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
++        FAILED(D3DCompile(ps8, sizeof ps8 - 1, "dispz_ps8", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err)) ||
++        FAILED(D3DCompile(psf, sizeof psf - 1, "dispz_psf", NULL, NULL, "main", "ps_5_0", 0, 0, &pf, &err))) {
++        printf("[D3D12] display depth copy shader: %s%c", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
++        return 0;
++    }
++    D3D12_DESCRIPTOR_RANGE rg = {0};
++    rg.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    rg.NumDescriptors = 2;
++    D3D12_ROOT_PARAMETER rp[2] = {0};
++    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    rp[0].DescriptorTable.NumDescriptorRanges = 1;
++    rp[0].DescriptorTable.pDescriptorRanges = &rg;
++    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    rp[1].Constants.Num32BitValues = 4;
++    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_ROOT_SIGNATURE_DESC rd = {0};
++    rd.NumParameters = 2; rd.pParameters = rp;
++    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
++        FAILED(s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, sig->lpVtbl->GetBufferPointer(sig),
++               sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature, (void**)&s_dispz_rs)))
++        return 0;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
++    pd.pRootSignature = s_dispz_rs;
++    pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
++    pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
++    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
++    pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
++    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++    pd.RasterizerState.DepthClipEnable = TRUE;
++    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    pd.SampleMask = UINT_MAX;
++    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    pd.NumRenderTargets = 1;
++    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++    pd.SampleDesc.Count = 1;
++    if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
++            s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_dispz_pso[0])))
++        return 0;
++    pd.PS.pShaderBytecode = pf->lpVtbl->GetBufferPointer(pf);
++    pd.PS.BytecodeLength  = pf->lpVtbl->GetBufferSize(pf);
++    pd.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
++    if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
++            s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_dispz_pso[1]))) {
++        s_dispz_pso[0]->lpVtbl->Release(s_dispz_pso[0]); s_dispz_pso[0] = NULL;
++        return 0;
++    }
++    D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
++    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
++    hd.NumDescriptors = 2;
++    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(
++            s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_dispz_rtv))) {
++        s_dispz_pso[0]->lpVtbl->Release(s_dispz_pso[0]); s_dispz_pso[0] = NULL;
++        return 0;
++    }
++    /* Depth and stencil views of the shared buffer. */
++    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
++    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    sv.Texture2D.MipLevels = 1;
++    D3D12_CPU_DESCRIPTOR_HANDLE sh;
++    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
++    sh.ptr += (u64)DISPZ_SRV_BASE * s_d3d.srv_inc;
++    sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
++    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.depth_buffer, &sv, sh);
++    sh.ptr += s_d3d.srv_inc;
++    sv.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
++    sv.Texture2D.PlaneSlice = 1;
++    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.depth_buffer, &sv, sh);
++    failed = 0;
++    return 1;
++}
++
++/* The copy of kind `k` at w x h (made, or remade when its size changes and no
++ * draw of this batch already points at it). Returns 0 when there is none. */
++static int dispz_copy_get(int k, u32 w, u32 h)
++{
++    if (!dispz_init()) return 0;
++    if (w < 1 || h < 1 || w > 4096 || h > 4096) return 0;
++    DispZCopy* c = &s_dispz[k];
++    if (c->res && ((c->w == w && c->h == h) || c->batch == s_dispz_batch)) { c->batch = s_dispz_batch; return 1; }
++    if (c->res) { wait_for_gpu(); c->res->lpVtbl->Release(c->res); c->res = NULL; }
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC td = {0};
++    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
++    td.Format = k ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
++    td.SampleDesc.Count = 1;
++    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
++            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
++            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
++            &IID_ID3D12Resource, (void**)&c->res))) { c->res = NULL; return 0; }
++    rdoc_name((ID3D12Object*)c->res, "display depth copy %d %ux%u", k, w, h);
++    c->w = w; c->h = h; c->dxgi = (u32)td.Format; c->conv_gen = 0; c->batch = s_dispz_batch;
++    s_dispz_nmake++;
++    c->st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    D3D12_CPU_DESCRIPTOR_HANDLE rh;
++    s_dispz_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_dispz_rtv, &rh);
++    rh.ptr += (u64)k * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
++        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
++    s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, c->res, NULL, rh);
++    { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
++        printf("[D3D12] display depth 0x%X read as a texture: %s copy %ux%u%c", s_dispz_off,
++               k ? "R32F" : "D24S8-bytes", w, h, 10); }
++    return 1;
++}
++
++/* Refresh copy `k` from the shared depth buffer as it is now. Leaves the
++ * guest path's root signature, heaps and targets unbound. */
++static void dispz_convert(int k)
++{
++    DispZCopy* c = &s_dispz[k];
++    if (!c->res || !s_dispz_pso[k]) return;
++    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
++    D3D12_CPU_DESCRIPTOR_HANDLE rh;
++    s_dispz_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_dispz_rtv, &rh);
++    rh.ptr += (u64)k * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
++        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
++    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rh, FALSE, NULL);
++    D3D12_RESOURCE_BARRIER b[2] = {0};
++    b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[0].Transition.pResource   = s_d3d.depth_buffer;
++    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
++    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[1] = b[0];
++    b[1].Transition.pResource   = c->res;
++    b[1].Transition.StateBefore = c->st;
++    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    cl->lpVtbl->ResourceBarrier(cl, c->st == D3D12_RESOURCE_STATE_RENDER_TARGET ? 1 : 2, b);
++    D3D12_VIEWPORT vp = {0, 0, (float)c->w, (float)c->h, 0.0f, 1.0f};
++    D3D12_RECT sc = {0, 0, (LONG)c->w, (LONG)c->h};
++    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
++    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
++    cl->lpVtbl->SetGraphicsRootSignature(cl, s_dispz_rs);
++    cl->lpVtbl->SetPipelineState(cl, s_dispz_pso[k]);
++    ID3D12DescriptorHeap* hp[] = { s_d3d.srv_heap };
++    cl->lpVtbl->SetDescriptorHeaps(cl, 1, hp);
++    D3D12_GPU_DESCRIPTOR_HANDLE gh;
++    s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
++    gh.ptr += (u64)DISPZ_SRV_BASE * s_d3d.srv_inc;
++    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, gh);
++    /* Guest texel -> backbuffer pixel: the display draws were scaled by
++     * backbuffer / guest surface (RSX_VP_SCALE). */
++    float kk[4] = {1.0f, 1.0f, (float)s_d3d.width - 1.0f, (float)s_d3d.height - 1.0f};
++    { static int vsc = -1;
++      if (vsc < 0) { const char* e = getenv("RSX_VP_SCALE"); vsc = (e && e[0] == '0') ? 0 : 1; }
++      if (vsc && s_dispz_sw >= 16 && s_dispz_sh >= 16) {
++          kk[0] = (float)s_d3d.width / (float)s_dispz_sw;
++          kk[1] = (float)s_d3d.height / (float)s_dispz_sh;
++      } }
++    cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, kk, 0);
++    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
++    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_DEPTH_WRITE;
++    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    cl->lpVtbl->ResourceBarrier(cl, 2, b);
++    c->st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    c->conv_gen = s_dispz_gen;
++    s_dispz_nconv++;
++    { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
++        printf("[D3D12] display depth copy %d refreshed (frame %llu, scale %.3f,%.3f)%c", k,
++               (unsigned long long)s_d3d.frame_count, kk[0], kk[1], 10); }
++}
++
++/* Texture units a fragment program samples (cached per program address). */
++static u32 fp_units_cached(u32 fp_addr)
++{
++    static u32 key[64], sig[64], val[64];
++    if (!fp_addr) return 0;
++    extern uint8_t* vm_base;
++    extern u32 cellGcmResolveLocated(int local, u32 offset);
++    const u32 off = cellGcmResolveLocated((fp_addr & 0x3u) == 1, fp_addr & ~0x3u);
++    if (!vm_base || off == 0xFFFFFFFFu) return 0xFFFFu;   /* unknown: every unit */
++    u32 w0, w1;   /* the first instruction word pair: a program replaced at the same address */
++    memcpy(&w0, vm_base + off, 4); memcpy(&w1, vm_base + off + 4, 4);
++    const u32 h = (fp_addr >> 4) & 63u;
++    if (key[h] == fp_addr && sig[h] == (w0 ^ (w1 * 2654435761u))) return val[h];
++    key[h] = fp_addr; sig[h] = w0 ^ (w1 * 2654435761u);
++    val[h] = rsx_fp_texture_units(vm_base + off, 4096);
++    return val[h];
++}
++
+ /* Set by the present entry point: 1 = this batch ends with a swapchain
+  * Present, 0 = execute the recorded draws only. An OFFSCREEN-only batch (a
+  * render-to-texture pass) must still run -- it is what fills the texture a
+@@ -5433,6 +5730,89 @@
+     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
+ }
+ 
++/* The saved image of display surface `surf` (see s_keep_disp), made on first
++ * use with the backbuffer's description; NULL when there is none and !make.
++ * Saved images rest in COPY_SOURCE. A backbuffer of another size drops them. */
++static ID3D12Resource* keep_disp_res(u32 surf, int make)
++{
++    if (!surf || !s_d3d.device || !s_d3d.render_targets[0]) return NULL;
++    D3D12_RESOURCE_DESC bd;
++    s_d3d.render_targets[0]->lpVtbl->GetDesc(s_d3d.render_targets[0], &bd);
++    int free_i = -1, old_i = 0;
++    for (int i = 0; i < KEEP_DISP_MAX; i++) {
++        if (s_keep_disp[i].res) {
++            D3D12_RESOURCE_DESC kd;
++            s_keep_disp[i].res->lpVtbl->GetDesc(s_keep_disp[i].res, &kd);
++            if (kd.Width != bd.Width || kd.Height != bd.Height || kd.Format != bd.Format) {
++                wait_for_gpu();
++                s_keep_disp[i].res->lpVtbl->Release(s_keep_disp[i].res);
++                s_keep_disp[i].res = NULL; s_keep_disp[i].surf = 0;
++            }
++        }
++        if (s_keep_disp[i].res && s_keep_disp[i].surf == surf) {
++            s_keep_disp[i].used = s_d3d.frame_count;
++            return s_keep_disp[i].res;
++        }
++        if (!s_keep_disp[i].res) { if (free_i < 0) free_i = i; }
++        else if (s_keep_disp[i].used < s_keep_disp[old_i].used) old_i = i;
++    }
++    if (!make) return NULL;
++    int i = free_i;
++    if (i < 0) {   /* all in use: the least recently used surface makes way */
++        i = old_i;
++        wait_for_gpu();
++        s_keep_disp[i].res->lpVtbl->Release(s_keep_disp[i].res);
++        s_keep_disp[i].res = NULL;
++    }
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC td = {0};
++    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    td.Width = bd.Width; td.Height = bd.Height;
++    td.DepthOrArraySize = 1; td.MipLevels = 1;
++    td.Format = bd.Format; td.SampleDesc.Count = 1;
++    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
++            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
++            D3D12_RESOURCE_STATE_COPY_SOURCE, NULL,
++            &IID_ID3D12Resource, (void**)&s_keep_disp[i].res))) {
++        s_keep_disp[i].res = NULL; s_keep_disp[i].surf = 0;
++        return NULL;
++    }
++    rdoc_name((ID3D12Object*)s_keep_disp[i].res, "kept display 0x%08X", surf);
++    s_keep_disp[i].surf = surf;
++    s_keep_disp[i].used = s_d3d.frame_count;
++    return s_keep_disp[i].res;
++}
++
++/* Backbuffer (RENDER_TARGET) <-> saved image of `surf`. save=1 stores the
++ * backbuffer, save=0 loads it back. Returns 1 when a copy was recorded. */
++static int keep_disp_copy(u32 fi, u32 surf, int save)
++{
++    ID3D12Resource* k = keep_disp_res(surf, save);
++    if (!k) return 0;
++    D3D12_RESOURCE_BARRIER bb[2] = {0};
++    bb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    bb[0].Transition.pResource   = s_d3d.render_targets[fi];
++    bb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    bb[0].Transition.StateAfter  = save ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
++    bb[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    bb[1] = bb[0];
++    bb[1].Transition.pResource   = k;
++    bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    bb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
++    if (save) s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
++    else      s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, bb);
++    if (save) s_d3d.cmd_list->lpVtbl->CopyResource(s_d3d.cmd_list, k, s_d3d.render_targets[fi]);
++    else      s_d3d.cmd_list->lpVtbl->CopyResource(s_d3d.cmd_list, s_d3d.render_targets[fi], k);
++    bb[0].Transition.StateBefore = bb[0].Transition.StateAfter;
++    bb[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++    bb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    if (save) s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
++    else      s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, bb);
++    return 1;
++}
++
+ /* rsx_topology -> D3D_PRIMITIVE_TOPOLOGY. Spelled out rather than relying on
+  * the two enums happening to agree: the draw record carries the neutral value
+  * so a second backend can read it, and this is the one place it becomes a D3D
+@@ -5715,6 +6095,8 @@
+ static void render_frame(void)
+ {
+     double _rf0 = perf_on() ? perf_now() : 0.0;
++    s_dispz_batch++;
++    dispz_stats();
+     u32 fi = s_d3d.frame_index;
+ 
+     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
+@@ -5760,6 +6142,39 @@
+                 (unsigned)(s_d3d.vp_vb_offset / 256u), (unsigned)VP_MAX_VERTICES, 10); }
+       s_disp_cclears = 0; }
+ 
++    /* RSX_ZWATCH=<hex raw offset>[:<lines>[:<secs>]]: every op in a batch that
++     * targets or samples that surface (colour, depth or any texture unit), with
++     * its clear mask / depth state, plus a one-line batch header -- how a
++     * title's saved-depth or saved-colour surfaces are written and read. */
++    { static int zw_init = 0; static u32 zw_off = 0; static int zw_cap = 0, zw_n = 0; static double zw_secs = 0, zw_t0 = 0;
++      if (!zw_init) { zw_init = 1; const char* e = getenv("RSX_ZWATCH");
++          if (e) { unsigned a = 0; int b = 3000; double c = 0; sscanf(e, "%x:%d:%lf", &a, &b, &c);
++                   zw_off = a; zw_cap = b; zw_secs = c; zw_t0 = perf_now(); } }
++      if (zw_off && zw_n < zw_cap && perf_now() - zw_t0 >= zw_secs) {
++        int any = 0;
++        for (u32 i = 0; i < s_d3d.draw_count && i < MAX_DRAWS && zw_n < zw_cap; i++) {
++            const D3D12DrawRecord* r = &s_d3d.draws[i];
++            int hit = (r->rt_off == zw_off) || (r->zeta_off == zw_off) || (r->surf_raw == zw_off);
++            int tu = -1;
++            for (int u = 0; u < 16 && !r->is_clear; u++)
++                if (r->tex[u].set && r->tex[u].raw == zw_off) { hit = 1; tu = u; }
++            if (!hit) continue;
++            if (!any) { any = 1; zw_n++;
++                printf("[zwatch] batch frame=%llu why=%s ops=%u present=%d dispclr=%d%c",
++                       (unsigned long long)s_d3d.frame_count, s_rf_why ? s_rf_why : "?",
++                       s_d3d.draw_count, s_present_this_frame, s_disp_clear_pending, 10); }
++            zw_n++;
++            if (r->is_clear)
++                printf("[zwatch]  op%u CLEAR rt=0x%X zeta=0x%X mask=0x%X z=%g s=%u%c", i, r->rt_off,
++                       r->zeta_off, r->clear_mask, r->clear_z, r->clear_s, 10);
++            else
++                printf("[zwatch]  op%u DRAW rt=0x%X zeta=0x%X surf=0x%X zs=0x%llX cmask=%X fpctrl=0x%X fp=0x%08X"
++                       " n=%u tex_unit=%d fmt=0x%02X remap=0x%04X%c", i, r->rt_off, r->zeta_off, r->surf_raw,
++                       (unsigned long long)r->zs_key, r->cmask, r->fp_ctrl, r->fp_addr, r->vertex_count, tu,
++                       tu >= 0 ? r->tex[tu].fmt : 0, tu >= 0 ? (r->tex[tu].ctrl1 & 0xFFFF) : 0, 10);
++        }
++      } }
++
+     /* Compile the real vertex program once its microcode is captured, and keep
+      * the constant bank uploaded for the VS. */
+     /* The base VP pipeline gates the ENTIRE vertex-program draw pass below
+@@ -6164,6 +6579,12 @@
+          * texture, or a null SRV. */
+         double _sv0 = pf2_on() ? perf_now() : 0.0;
+         dr->disp_tex = 0;
++        dr->tex_dispz = 0;
++        /* The display's depth surface, as of this draw (see dispz_convert). */
++        if (dr->rt_off == 0 && dr->has_z && !dr->no_color) {
++            s_dispz_off = dr->zeta_off; s_dispz_known = 1;
++            s_dispz_sw = dr->surf_w; s_dispz_sh = dr->surf_h;
++        }
+         srv_stage_begin(DRAW_SRV_BASE + _d * DRAW_SRV_STRIDE);
+         for (int _u = 0; _u < DRAW_SRV_STRIDE; _u++) {
+             u32 wslot = DRAW_SRV_BASE + _d * DRAW_SRV_STRIDE + (u32)_u;
+@@ -6179,6 +6600,30 @@
+                     continue;
+                 }
+             }
++            /* The display's own depth surface read as a texture: a copy of the
++             * shared depth buffer, refreshed just before this draw. Only for a
++             * unit the program samples -- this title leaves zeta 0x0 bound on
++             * a spare unit for every draw. */
++            if (dr->tex[_u].set && _u < 16 && dispz_on() && s_dispz_known &&
++                dr->tex[_u].raw == s_dispz_off && off_ds_find(dr->tex[_u].raw) < 0 &&
++                ((fp_units_cached(dr->fp_addr) >> _u) & 1u)) {
++                const u32 _bf = dr->tex[_u].fmt & 0x9Fu;
++                const int _k = (_bf >= 0x90 && _bf <= 0x93) ? 1 : 0;
++                if (dispz_copy_get(_k, dr->tex[_u].w, dr->tex[_u].h)) {
++                    dr->tex_dispz |= 1u << (_u + 16 * _k);
++                    s_dispz_nbind++;
++                    { static int dbg = -1; static u32 seen[32]; static int ns = 0;
++                      if (dbg < 0) dbg = getenv("RSX_DISPZ_DBG") ? 1 : 0;
++                      int known = 0; for (int q = 0; q < ns; q++) if (seen[q] == dr->fp_addr) known = 1;
++                      if (dbg && !known && ns < 32) { seen[ns++] = dr->fp_addr;
++                          printf("[DISPZ] fp=0x%08X unit %d fmt=0x%02X %ux%u -> rt=0x%X zeta=0x%X zs=0x%llX cmask=%X n=%u%c",
++                                 dr->fp_addr, _u, dr->tex[_u].fmt, dr->tex[_u].w, dr->tex[_u].h, dr->rt_off,
++                                 dr->zeta_off, (unsigned long long)dr->zs_key, dr->cmask, dr->vertex_count, 10); } }
++                    srv_write(wslot, s_dispz[_k].res, (DXGI_FORMAT)s_dispz[_k].dxgi,
++                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
++                    continue;
++                }
++            }
+             /* A depth surface read as a texture: its colour copy (made in the
+              * RT pre-pass), refreshed from the depth buffer just before this
+              * draw (ds_convert). */
+@@ -6324,14 +6769,41 @@
+     /* Clear color and depth -- unless this batch continues one batch_room
+      * executed early with display draws in it (same backbuffer: no Present
+      * came between). */
++    /* The display surface this batch draws to first and last (rt 0, colour
++     * not off), for the kept-image restore here and the save at the end. */
++    u32 keep_first = 0;
++    s_keep_save_surf = 0;
++    if (keep_display_on())
++        for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
++            const D3D12DrawRecord* r = &s_d3d.draws[_d];
++            if (r->is_clear || r->rt_off || (r->is_vp && r->no_color)) continue;
++            const u32 sf = r->surf_raw ? r->surf_raw : 0xFFFFFFFFu;  /* legacy records: one key */
++            if (!keep_first) keep_first = sf;
++            s_keep_save_surf = sf;
++        }
+     if (!s_bb_continue) {
++    /* No guest colour clear since the last display batch: the surface keeps
++     * what is in it (see s_keep_disp). */
++    if (keep_first && !s_disp_clear_pending && keep_disp_copy(fi, keep_first, 0)) {
++        if (s_shared_scratch) {   /* an offscreen pass left scratch depth in it */
++            s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
++                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
++            s_dispz_gen++; s_shared_scratch = 0;
++        }
++        static int _kl = 0;
++        if (PS3_LOG_FIRST(_kl, 4))
++            printf("[D3D12] display 0x%08X kept across a frame with no colour clear%c", keep_first, 10);
++    } else {
+     s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
+         s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
+     s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(
+         s_d3d.cmd_list, dsv_handle,
+         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+         1.0f, 0, 0, NULL);
++    s_dispz_gen++; s_shared_scratch = 0;
++    }
+     }
++    if (keep_first) s_disp_clear_pending = 0;   /* this batch took the clear (or kept the image) */
+     s_bb_continue = 0;
+ 
+     /* Set viewport and scissor */
+@@ -6524,6 +6996,16 @@
+                     for (int _s = 0; _s < 16; _s++) samp_bound[_s] = -1;
+                     force_rebind = 1;
+                 }
++                for (int _k = 0; _k < 2 && dr->tex_dispz; _k++) {
++                    if (!(dr->tex_dispz & (0xFFFFu << (16 * _k))) ||
++                        s_dispz[_k].conv_gen == s_dispz_gen) continue;
++                    dispz_convert(_k);
++                    s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
++                    { ID3D12DescriptorHeap* hp2[] = { s_d3d.srv_heap, s_d3d.samp_heap };
++                      s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, s_d3d.samp_heap ? 2 : 1, hp2); }
++                    for (int _s = 0; _s < 16; _s++) samp_bound[_s] = -1;
++                    force_rebind = 1;
++                }
+                 /* The reduced-viewport passes (this title's reflection, drawn
+                  * into a region of the same target) finish here -- snapshot
+                  * before the full-screen scene overwrites them. */
+@@ -6601,8 +7083,18 @@
+                             s_d3d.off_ds[wantz].gen++;
+                         }
+                     } else if (!force_rebind) {
+-                        s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
+-                            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
++                        /* The shared buffer IS the display depth for a display
++                         * target, or any pass whose zeta is the display's; any
++                         * other pass borrows it as scratch (see dispz_keep_on). */
++                        const int disp_user = dr->has_z
++                            ? (s_dispz_known && dr->zeta_off == s_dispz_off)
++                            : (want < 0);
++                        if (!dispz_keep_on() || !disp_user || s_shared_scratch) {
++                            s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
++                                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
++                            s_dispz_gen++;
++                        }
++                        s_shared_scratch = !disp_user;
+                     }
+                     cur_z = wantz; cur_nc = dr->no_color; force_rebind = 0;
+                     /* RT_CLEARDBG=2: magenta-clear the surface the DRAWS bind,
+@@ -6669,6 +7161,7 @@
+                              ((dr->clear_mask & 0x2u) ? D3D12_CLEAR_FLAG_STENCIL : 0));
+                         s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, cur_dsv,
+                             zf, dr->clear_z, dr->clear_s, 0, NULL);
++                        if (cur_z < 0) s_dispz_gen++;
+                         if (cur_z >= 0) { s_d3d.off_ds[cur_z].cleared = 1; s_d3d.off_ds[cur_z].gen++;
+                             if (dsconv_dbg_on(s_d3d.off_ds[cur_z].off, 1))
+                                 fprintf(stderr, "[DSCLEAR] frame=%llu op %u ds 0x%08X mask=0x%X z=%f s=%u gen=%u%c",
+@@ -6714,6 +7207,7 @@
+                                                          dpso ? dpso : vpso);
+                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
+                 if (cur_z >= 0 && (dr->zs_key & (2u | (1u << 5)))) s_d3d.off_ds[cur_z].gen++;
++                else if (cur_z < 0 && (dr->zs_key & (2u | (1u << 5)))) s_dispz_gen++;   /* shared depth written */
+                 /* Per-draw viewport: the guest rect when sane, else the
+                  * full target. Scissor tracks the same rect. */
+                 {
+@@ -7063,6 +7557,9 @@
+       if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
+     if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
+ skip_dump_consider: ;
++    /* Save the display surface as the guest left it (before any host-side
++     * present composite below replaces the backbuffer). */
++    if (s_keep_save_surf) keep_disp_copy(fi, s_keep_save_surf, 1);
+     guest_fb_present(fi);
+     scanout_auto_present(fi);
+     composite_present(fi);
+@@ -7478,6 +7975,10 @@
+ 
+     memcpy(s_d3d.clear_color, cc, sizeof(cc));
+     s_disp_cclears++;
++    /* The batch this clear starts begins cleared; one presented below first
++     * keeps the flag it had. */
++    const int disp_clear_was = s_disp_clear_pending;
++    s_disp_clear_pending = 1;
+ 
+     /* A DISPLAY clear marks the start of a new visible frame. If a completed
+      * frame is still accumulated (the drain gulped across a frame boundary --
+@@ -7550,7 +8051,9 @@
+             printf("[CLEAR] presenting %u accumulated draws at frame boundary\n",
+                    s_d3d.draw_count);
+         s_rf_why = "clear";
++        s_disp_clear_pending = disp_clear_was;
+         render_frame();
++        s_disp_clear_pending = 1;
+         s_clear_presents++;
+         s_last_clear_presented_flip = s_last_clear_boundary_flip;
+     }

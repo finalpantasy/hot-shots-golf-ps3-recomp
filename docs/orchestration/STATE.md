@@ -525,3 +525,8 @@ Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-f
 
 - Worker `a2845cc475f943a16` finished, no patch. Black captures (41 shots, every 6 s): current 5, 0037 off 6, `GCM_FIFO_KICK=0` 5, round36 build 3. `RSX_CAP`: 42 of 150 presented frames black in swing runs. Cause: no-clear golfer frames get a black clear; depth at guest 0x0 is GPU-only so the 0x034C0000 copy reads 0. Evidence scratchpad `regress\` (`around.png`, `cap1\`, `cap36\`, sheets).
 - Swing-frames worker started (Opus): owns `libs/video/**`, output `0039-rsx-swing-frames.patch` (persistent color surfaces without clear, GPU depth copy, hole 2 reflection rectangle).
+
+## 2026-11-18 run 34: swing black frames fixed, patch 0039
+
+- Worker `ad4be5c8a2b3ae6f2` finished. `0039-rsx-swing-frames.patch` (`rsx_d3d12_backend.c`): `RSX_DISP_DEPTH_TEX`, `RSX_DISP_DEPTH_KEEP`, `RSX_KEEP_DISPLAY` (each `=0` off); debug `RSX_ZWATCH`, `RSX_DISPZ_DBG`. Black 4/41 (sw1) to 0/41 (sw4); sheets scratchpad `swing\sw1-sheet.png`, `sw4-sheet.png`. CPU 95% during sw4.
+- Open: inverted impact frames (2 per run, present with and without 0039); hole 2 upside-down rectangle; sw2 ran at 7 FPS once, cause unknown.

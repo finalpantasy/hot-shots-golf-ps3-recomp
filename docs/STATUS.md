@@ -251,3 +251,9 @@ Update 23 said a 450-second run had no black frames. That run took a capture eve
 Cause, found by a worker: during the swing the game draws one background frame, then for several frames draws only the golfer on top of it, starting without a clear and restoring depth from a saved copy at `0x034C0000`. The backend clears the color target to black at the start of those frames, and its main depth buffer lives only on the GPU, so the saved copy reads as zero and every later draw fails the depth test. The inverted-color frames at impact may be the game's own flash effect; that is not proven. A worker is changing the backend to keep surfaces across frames and to copy depth on the GPU.
 
 The upside-down rectangle at the bottom left of hole 2 is probably the river's reflection render showing on screen; it is not fixed.
+
+## 2026-11-18 update 26: swing frames no longer go black
+
+Patch `0039` copies the real depth buffer when the game saves it for the swing, stops a bloom pass from clearing the shared depth buffer mid-frame, and keeps display surfaces across frames that start without a clear. Switches: `RSX_DISP_DEPTH_TEX=0`, `RSX_DISP_DEPTH_KEEP=0`, `RSX_KEEP_DISPLAY=0`. Over two 450-second runs with a capture every 6 seconds, black captures went from 4 of 41 to 0 of 41. The two runs reached different points of the round, so they are not the same scenes. In-round frame rate was about 22 FPS with the system CPU 95% busy.
+
+Still wrong: 2 frames per run at impact have inverted colors (purple grass, orange sky). The upside-down rectangle on hole 2 is not fixed.
