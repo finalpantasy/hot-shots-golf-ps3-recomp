@@ -26,8 +26,9 @@ Updated 2026-11-17.
 | Rendering | Works up to the title screen, with a few wrong squares in the sky. 8 to 20 FPS there |
 | Intro movie | Skipped. The player reports the movie as finished because there is no video decoder |
 | Input | A scripted Cross press starts "New Game": the game writes a save and loads the next scene. Not tested with a real controller |
-| Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout. Terrain is too dark and foliage has black boxes |
-| Menus after the title, gameplay, audio | Not verified |
+| Course scene | The attract demo plays shots on a course: golfer, ball flight, distance readout. Terrain is too dark |
+| Audio | The mixer produces sound (peak 0.20 in a muted run). Not listened to |
+| Menus after the title, gameplay | Not verified |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
 

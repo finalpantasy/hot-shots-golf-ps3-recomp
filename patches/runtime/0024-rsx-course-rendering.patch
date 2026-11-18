@@ -1,0 +1,624 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -1716,13 +1716,31 @@
+                         r->vp_x, r->vp_y, r->vp_w, r->vp_h,
+                         r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend, r->blend_key,
+                         r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw);
+-                for (int u = 0; u < 4; u++)
++                /* Fixed-function state the PSO / fragment constants carry:
++                 * alpha test (enable<<16|func<<8|ref), depth/stencil key,
++                 * culling, SHADER_CONTROL. */
++                fprintf(mf, "      at=0x%05X zs=0x%llX cull=%X fpctrl=0x%X\n",
++                        r->alpha_ctl, (unsigned long long)r->zs_key, r->cull, r->fp_ctrl);
++                for (int u = 0; u < 16; u++)
+                     if (r->tex[u].set)
+-                        fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X\n", u,
++                        fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X"
++                                    " c0=0x%08X filt=0x%08X addr=0x%08X\n", u,
+                                 r->tex[u].off, r->tex[u].fmt,
+                                 (r->tex[u].fmt & 0x20) ? "LN" : "SZ",
+                                 (r->tex[u].fmt & 0x40) ? ",NR" : "",
+-                                r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF);
++                                r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF,
++                                r->tex[u].ctrl0, r->tex[u].filter, r->tex[u].addr);
++                /* The program's inline constants as this draw's b1 slot holds
++                 * them (fp_k, from offset 20 floats). Written at record time
++                 * with the pre-flip parity. */
++                if (s_d3d.vp_fpcb_mapped) {
++                    const float* k = (const float*)((const char*)s_d3d.vp_fpcb_mapped
++                        + ((u64)(s_d3d.vp_parity ^ 1) * MAX_DRAWS + r->cb_slot) * VP_FPCB_STRIDE) + 20;
++                    fprintf(mf, "      k:");
++                    for (int q = 0; q < 6; q++)
++                        fprintf(mf, " (%.3g %.3g %.3g %.3g)", k[q*4], k[q*4+1], k[q*4+2], k[q*4+3]);
++                    fprintf(mf, "\n");
++                }
+             }
+         }
+         /* Per-draw VP constant banks for the first few offscreen-RT geometry
+@@ -1761,6 +1779,38 @@
+         fclose(mf);
+     }
+ 
++    /* RSX_CAP_TEX=1: the guest bytes of mip 0 of every distinct texture the
++     * frame's draws bound, as tex_<vmoff>_<fmt>_<w>x<h>_p<pitch>.raw, so a
++     * texture can be decoded offline and told apart from how it is sampled. */
++    { static int ct = -1;
++      if (ct < 0) ct = getenv("RSX_CAP_TEX") ? 1 : 0;
++      extern uint8_t* vm_base;
++      if (ct && vm_base) {
++          u32 seen[96]; int ns = 0;
++          for (u32 d = 0; d < ndraws && d < MAX_DRAWS && ns < 96; d++) {
++              const D3D12DrawRecord* r = &s_d3d.draws[d];
++              if (r->is_clear) continue;
++              for (int u = 0; u < 16 && ns < 96; u++) {
++                  if (!r->tex[u].set || !r->tex[u].off) continue;
++                  int known = 0;
++                  for (int k = 0; k < ns; k++) if (seen[k] == r->tex[u].off) known = 1;
++                  if (known) continue;
++                  seen[ns++] = r->tex[u].off;
++                  rsx_tex_layout L;
++                  rsx_texture_layout(r->tex[u].fmt, r->tex[u].w, r->tex[u].h, &L);
++                  u32 bytes = L.face_bytes;
++                  if ((r->tex[u].fmt & 0x20) && !L.compressed && r->tex[u].pitch > L.row_bytes)
++                      bytes = r->tex[u].pitch * r->tex[u].h;
++                  if (!bytes || bytes > 16u * 1024u * 1024u) continue;
++                  snprintf(path, sizeof path, "%s/tex_%08X_%02X_%ux%u_p%u.raw", dir,
++                           r->tex[u].off, r->tex[u].fmt, r->tex[u].w, r->tex[u].h,
++                           r->tex[u].pitch);
++                  FILE* tf = fopen(path, "wb");
++                  if (tf) { fwrite(vm_base + r->tex[u].off, 1, bytes, tf); fclose(tf); }
++              }
++          }
++      } }
++
+     /* Backbuffer (in PRESENT state at capture time) + every used offscreen RT. */
+     snprintf(path, sizeof path, "%s/backbuffer.bmp", dir);
+     cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
+@@ -2334,6 +2384,167 @@
+     return mask;
+ }
+ 
++/* b1 per-draw slot layout (vp_record_cb): rsx_texscale[4], rsx_alphatest,
++ * then the program's inline constants. FP_K_SLOTS is what fits the stride. */
++#define FP_K_SLOTS ((int)(VP_FPCB_STRIDE / 16) - 5)
++
++static int fp_constbuf_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("FP_CONSTBUF"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++
++/* Does the program's constant count fit fp_k[]? */
++static int fp_buffered_ok(const u8* ucode)
++{
++    float tmp[(FP_K_SLOTS + 1) * 4];
++    return rsx_fp_extract_consts(ucode, 4096, tmp, FP_K_SLOTS + 1) <= FP_K_SLOTS;
++}
++
++/* The buffered decompiler declares b1 as { fp_constants[n]; fp_alpha; }.
++ * This backend's b1 slot is { rsx_texscale[4]; rsx_alphatest; fp_k[] }, so
++ * rewrite the declaration to that layout. fp_alpha (the WPOS origin/centre
++ * terms) is not supplied here and stays zero, which is the host position the
++ * literal path always used. */
++static int fp_rebind_b1(char* hlsl, size_t cap, u32 nk)
++{
++    static const char head[] = "cbuffer PSConstants : register(b1) {\n";
++    char* a = strstr(hlsl, head);
++    if (!a) return -1;
++    char* b = strstr(a, "};\n");
++    if (!b) return -1;
++    b += 3;
++    char decl[256];
++    const int dn = snprintf(decl, sizeof decl,
++        "cbuffer PSConstants : register(b1) {\n"
++        "    float4 rsx_texscale[4];\n"
++        "    float4 rsx_alphatest;\n"
++        "    float4 fp_constants[%u];\n"
++        "};\n"
++        "static const float4 fp_alpha = float4(0, 0, 0, 0);\n", nk ? nk : 1u);
++    if (dn <= 0 || (size_t)dn >= sizeof decl) return -1;
++    const size_t len = strlen(hlsl), old = (size_t)(b - a);
++    if (len - old + (size_t)dn + 1 > cap) return -1;
++    memmove(a + dn, b, strlen(b) + 1);
++    memcpy(a, decl, (size_t)dn);
++    return 1;
++}
++
++/* Append the RSX alpha test to a program: colour 0's alpha against
++ * rsx_alphatest (x enable, y ref, z CELL_GCM func - 0x200), discard on fail.
++ * Same placement as rsx_fp_apply_alpha_test_buffered, but the function is a
++ * per-draw value rather than baked in, so the pipeline key does not grow. */
++static int fp_apply_dynamic_alpha_test(char* hlsl, size_t cap)
++{
++    char* marker = NULL;
++    for (char* p = strstr(hlsl, "    return "); p; p = strstr(p + 1, "    return "))
++        marker = p;
++    if (!marker) return -1;
++    char* expr = marker + strlen("    return ");
++    char* term = strstr(expr, ";\n}\n");
++    if (!term || term == expr || (size_t)(term - expr) >= 96) return -1;
++    char output[96];
++    memcpy(output, expr, (size_t)(term - expr));
++    output[term - expr] = '\0';
++    const int mrt = strstr(hlsl, "struct PSOutput") != NULL;
++    char suffix[768];
++    const int n = snprintf(suffix, sizeof suffix,
++        "    %s _rsx_out = %s;\n"
++        "    if (rsx_alphatest.x != 0.0) {\n"
++        "        const float _rsx_a = %s.a, _rsx_r = rsx_alphatest.y;\n"
++        "        const uint _rsx_f = (uint)rsx_alphatest.z;\n"
++        "        const bool _rsx_pass =\n"
++        "            _rsx_f == 1u ? _rsx_a <  _rsx_r : _rsx_f == 2u ? _rsx_a == _rsx_r :\n"
++        "            _rsx_f == 3u ? _rsx_a <= _rsx_r : _rsx_f == 4u ? _rsx_a >  _rsx_r :\n"
++        "            _rsx_f == 5u ? _rsx_a != _rsx_r : _rsx_f == 6u ? _rsx_a >= _rsx_r :\n"
++        "            _rsx_f == 7u;\n"
++        "        if (!_rsx_pass) discard;\n"
++        "    }\n"
++        "    return _rsx_out;\n}\n",
++        mrt ? "PSOutput" : "float4", output, mrt ? "_rsx_out.t0" : "_rsx_out");
++    if (n <= 0 || (size_t)n >= sizeof suffix) return -1;
++    if ((size_t)(marker - hlsl) + (size_t)n + 1 > cap) return -1;
++    memcpy(marker, suffix, (size_t)n + 1);
++    return 1;
++}
++
++/* Texture alpha kill (TEXTURE_CONTROL0 bit 2): the RSX drops the fragment when
++ * a fetch from that unit returns alpha 0 (RPCS3 RSXFragmentTextureOps.glsl
++ * _process_texel: ALPHAKILL, rgba.a < 0.000001 -> _kill()). Cut-out foliage
++ * relies on it with DXT1's 1-bit alpha. Every fetch from units 0-3 is wrapped
++ * in _rsx_akill(unit, sample); the per-draw flag is rsx_texscale[unit].z, so
++ * the pipeline key does not change. NO_ALPHAKILL=1 zeroes the flag. */
++static int fp_apply_alpha_kill(char* hlsl, size_t cap)
++{
++    char* at_main = strstr(hlsl, " main(PSInput input)");
++    if (!at_main) return -1;
++    int wrapped = 0;
++    for (u32 u = 0; u < 4; u++) {
++        char needle[2][24];
++        snprintf(needle[0], sizeof needle[0], "rsx_tex[%u].Sample", u);
++        snprintf(needle[1], sizeof needle[1], "rsx_tex%u.Sample", u);
++        for (int v = 0; v < 2; v++) {
++            char* p = strstr(at_main, needle[v]);
++            while (p) {
++                char* open = strchr(p + strlen(needle[v]), '(');
++                if (!open) return -1;
++                int depth = 0; char* q = open;
++                for (; *q; q++) {
++                    if (*q == '(') depth++;
++                    else if (*q == ')' && --depth == 0) break;
++                }
++                if (!*q) return -1;
++                char pre[24];
++                const int pn = snprintf(pre, sizeof pre, "_rsx_akill(%uu, ", u);
++                const size_t len = strlen(hlsl);
++                if (len + (size_t)pn + 2 > cap) return -1;
++                /* Close after the call, then open before it. */
++                memmove(q + 2, q + 1, strlen(q + 1) + 1);
++                q[1] = ')';
++                memmove(p + pn, p, strlen(p) + 1);
++                memcpy(p, pre, (size_t)pn);
++                wrapped++;
++                p = strstr(q + 2 + pn, needle[v]);
++            }
++        }
++    }
++    if (!wrapped) return 0;
++    /* The helper goes in front of main's line (after the cbuffer it reads). */
++    char* line = at_main;
++    while (line > hlsl && line[-1] != '\n') line--;
++    static const char helper[] =
++        "float4 _rsx_akill(uint u, float4 v) {\n"
++        "    if (rsx_texscale[u].z != 0.0 && v.a < 0.000001) discard;\n"
++        "    return v;\n}\n";
++    const size_t hn = sizeof helper - 1, len = strlen(hlsl);
++    if (len + hn + 1 > cap) return -1;
++    memmove(line + hn, line, strlen(line) + 1);
++    memcpy(line, helper, hn);
++    return wrapped;
++}
++
++/* Debug: make colour 0 of a program `expr` (after its alpha test, so only
++ * fragments that survive are painted). For FP_SHOW / FP_IDCOLOR, whose old
++ * "_po.c0 = " anchor the current decompiler no longer emits. */
++static int fp_override_output(char* hlsl, size_t cap, const char* expr)
++{
++    char* marker = NULL;
++    for (char* p = strstr(hlsl, "    return "); p; p = strstr(p + 1, "    return "))
++        marker = p;
++    if (!marker) return -1;
++    const char* var = strstr(hlsl, "PSOutput _rsx_out") ? "_rsx_out.t0"
++                    : strstr(hlsl, "float4 _rsx_out") ? "_rsx_out"
++                    : strstr(hlsl, "PSOutput _out;") ? "_out.t0" : NULL;
++    if (!var) return -1;
++    char ins[320];
++    const int n = snprintf(ins, sizeof ins, "    %s = %s;\n", var, expr);
++    if (n <= 0 || (size_t)n >= sizeof ins || strlen(hlsl) + (size_t)n + 1 > cap) return -1;
++    memmove(marker + n, marker, strlen(marker) + 1);
++    memcpy(marker, ins, (size_t)n);
++    return 1;
++}
++
+ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
+                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
+                                           u32 cube_mask, u32 unnorm_mask, const u32 unnorm_dim[16][3], u64 zs)
+@@ -2368,10 +2579,9 @@
+         u32 usz = rsx_fp_program_size(vm_base + off, 4096);
+         if (usz == 0) usz = 64;
+         s_perf_pso_hashbytes += (int)usz;
+-        static int consts_inline = -1;
+-        if (consts_inline < 0) { const char* e = getenv("FP_CONSTBUF");
+-                                 consts_inline = (e && e[0] == '0') ? 1 : 0; }
+-        if (consts_inline) {
++        /* Literal constants (FP_CONSTBUF=0, or a program with more than fp_k[]
++         * holds) are part of the compiled shader, so they must be hashed. */
++        if (!fp_constbuf_on() || !fp_buffered_ok(vm_base + off)) {
+             uhash = 2166136261u;
+             const u8* up = vm_base + off;
+             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
+@@ -2461,8 +2671,46 @@
+     static int ctrl_auto = -1;
+     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
+     u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : ctrl;
+-    int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
++    /* Inline constants come from the draw's b1 slot (fp_k[], refilled from the
++     * ucode every draw by vp_record_cb), not baked in as literals: the pipeline
++     * cache is keyed on rsx_fp_code_hash, which leaves the constants out, so a
++     * literal shader kept whatever constants the program held at its FIRST
++     * compile. Titles patch a program's constants per material / per sprite
++     * (cellGcmSetFragmentProgramParameter writes into the ucode), and every
++     * later draw of it then rendered with the first one's colours.
++     * FP_CONSTBUF=0 restores literal constants (and a byte hash). */
++    int n;
++    if (fp_constbuf_on() && fp_buffered_ok(vm_base + off)) {
++        u32 nk = 0;
++        n = rsx_fp_decompile_buffered_ex(vm_base + off, 4096, fp_ctrl, 0u, hlsl, sizeof(hlsl), &nk);
++        if (n > 0 && fp_rebind_b1(hlsl, sizeof(hlsl), nk) < 0) n = -1;
++        if (n <= 0) {
++            static int _eb = 0;
++            if (PS3_LOG_FIRST(_eb, 8))
++                printf("[FP] buffered decompile failed, literal constants (fp=0x%08X)\n", fp_addr);
++            n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
++        }
++    } else
++        n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
+     if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
++    /* Alpha test. D3D12 has none in fixed function and the guest program
++     * does not do it itself: the RSX tests colour 0's alpha after the program
++     * against ALPHA_FUNC/ALPHA_REF (RPCS3 appends the same comparison and a
++     * discard to every fragment program). Read per draw from b1's
++     * rsx_alphatest so one pipeline serves every alpha state. NO_ALPHATEST=1
++     * zeroes the enable. */
++    if (fp_constbuf_on() && strstr(hlsl, "float4 rsx_alphatest;"))
++        if (fp_apply_dynamic_alpha_test(hlsl, sizeof(hlsl)) < 0) {
++            static int _ea = 0;
++            if (PS3_LOG_FIRST(_ea, 8))
++                printf("[FP] alpha test not applied (fp=0x%08X)\n", fp_addr);
++        }
++    if (fp_constbuf_on() && strstr(hlsl, "float4 rsx_texscale[4];"))
++        if (fp_apply_alpha_kill(hlsl, sizeof(hlsl)) < 0) {
++            static int _ek = 0;
++            if (PS3_LOG_FIRST(_ek, 8))
++                printf("[FP] texture alpha kill not applied (fp=0x%08X)\n", fp_addr);
++        }
+     if (unnorm_mask) {
+         rsx_fp_apply_unnorm_scale(hlsl, sizeof(hlsl), unnorm_mask, (const u32 (*)[3])unnorm_dim, cube_mask, 0);
+     }
+@@ -2537,6 +2785,9 @@
+     { const char* kf = getenv("FP_KILL");
+       if (kf && (u32)strtoul(kf, NULL, 16) == fp_addr) {
+           char* rp = strstr(hlsl, "PSOut _po;");
++          /* The current decompiler has no _po: open main's body instead. */
++          if (!rp && (rp = strstr(hlsl, " main(PSInput input)")) && (rp = strstr(rp, "{\n")))
++              rp += 2;
+           if (rp) {
+               const char* ins = "discard; ";
+               size_t nl = strlen(ins), tail = strlen(rp) + 1;
+@@ -2551,6 +2802,12 @@
+       const char* only = getenv("FP_TEX_FP");
+       if (sh && (!only || (u32)strtoul(only, NULL, 16) == fp_addr)) {
+           char* rp = strstr(hlsl, "_po.c0 = ");
++          if (!rp) {
++              char ex[256];
++              snprintf(ex, sizeof ex, "float4((%s).xyz, 1.0)", sh);
++              if (fp_override_output(hlsl, sizeof(hlsl), ex) > 0)
++                  fprintf(stderr, "[FPSHOW] fp=0x%X output replaced with %s%c", fp_addr, sh, 10);
++          }
+           if (rp) { char* semi = strchr(rp, ';');
+             if (semi) {
+                 char rep[256];
+@@ -2591,6 +2848,18 @@
+      * instead of one run per candidate to test them by elimination. */
+     if (getenv("FP_IDCOLOR")) {
+         char* rp = strstr(hlsl, "_po.c0 = ");
++        if (!rp) {
++            u32 hsh = fp_addr * 2654435761u;
++            hsh ^= hsh >> 13; hsh *= 0x5BD1E995u; hsh ^= hsh >> 15;
++            const u32 c8[3] = { ((hsh >> 16) & 0x7F) | 0x80, ((hsh >> 8) & 0x7F) | 0x80,
++                                (hsh & 0x7F) | 0x80 };
++            char ex[96];
++            snprintf(ex, sizeof ex, "float4(%.3f,%.3f,%.3f,1.0)",
++                     c8[0] / 255.0f, c8[1] / 255.0f, c8[2] / 255.0f);
++            if (fp_override_output(hlsl, sizeof(hlsl), ex) > 0)
++                fprintf(stderr, "[FPID] fp=0x%X -> rgb(%u,%u,%u)%c",
++                        fp_addr, c8[0], c8[1], c8[2], 10);
++        }
+         if (rp) {
+             char* semi = strchr(rp, ';');
+             if (semi) {
+@@ -3526,7 +3795,13 @@
+                 sx = 1.0f / (float)dr->tex[_u].w;
+                 sy = 1.0f / (float)dr->tex[_u].h;
+             }
+-            ts[_u*4+0] = sx; ts[_u*4+1] = sy; ts[_u*4+2] = 0.0f; ts[_u*4+3] = 0.0f;
++            /* .z: texture alpha kill for this unit (CONTROL0 bit 2, on an
++             * enabled unit -- bit 31). Read by _rsx_akill. */
++            static int s_noakill = -1;
++            if (s_noakill < 0) s_noakill = getenv("NO_ALPHAKILL") ? 1 : 0;
++            const int akill = !s_noakill && dr && dr->tex[_u].set &&
++                              (dr->tex[_u].ctrl0 & 0x80000004u) == 0x80000004u;
++            ts[_u*4+0] = sx; ts[_u*4+1] = sy; ts[_u*4+2] = akill ? 1.0f : 0.0f; ts[_u*4+3] = 0.0f;
+         }
+         /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
+          * has no fixed alpha test; guest FPs discard on it dynamically
+@@ -3556,7 +3831,7 @@
+             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
+                                              dr->fp_addr & ~0x3u);
+             if (vm_base && foff != 0xFFFFFFFFu)
+-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 64);   /* fp_k[64] */
++                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], FP_K_SLOTS);   /* fp_k[] */
+             /* FPK_DBG=1: the fragment constants as the shader will see them.
+              * A program whose only output is fp_k[0].xxxx renders black if
+              * those constants never arrive, which looks identical from the
+@@ -4755,6 +5030,27 @@
+       if (lim < 0) { const char* e = getenv("DRAW_LIMIT"); lim = e ? atoi(e) : 0; }
+       if (lim > 0 && s_d3d.draw_count > (u32)lim) s_d3d.draw_count = (u32)lim; }
+ 
++    /* DRAW_SKIP_SWEEP=<div>:<width>: drop the non-clear ops in a window of
++     * <width> op indices that moves every <div> frames, so one run with a
++     * matching RSX_CAP stride shows which ops paint a given artifact. Diagnostic. */
++    { static int sw_div = -1, sw_w = 0, sw_base = 0, sw_n = 0;
++      if (sw_div < 0) { const char* e = getenv("DRAW_SKIP_SWEEP"); sw_div = 0;
++          if (e) sscanf(e, "%d:%d:%d:%d", &sw_div, &sw_w, &sw_base, &sw_n); }
++      if (sw_div > 0 && sw_w > 0) {
++        u32 nwin = sw_n > 0 ? (u32)sw_n : (s_d3d.draw_count + (u32)sw_w - 1) / (u32)sw_w;
++        if (!nwin) nwin = 1;
++        u32 lo = (u32)sw_base + (u32)((s_d3d.frame_count / (u64)sw_div) % nwin) * (u32)sw_w, keep = 0;
++        for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
++            if (!s_d3d.draws[_d].is_clear && _d >= lo && _d < lo + (u32)sw_w) continue;
++            if (keep != _d) s_d3d.draws[keep] = s_d3d.draws[_d];
++            keep++;
++        }
++        if (s_d3d.frame_count % (u64)sw_div == 0)
++            fprintf(stderr, "[SWEEP] frame=%llu draws=%u skip=%u-%u%c",
++                    (unsigned long long)s_d3d.frame_count, s_d3d.draw_count, lo, lo + sw_w - 1, 10);
++        s_d3d.draw_count = keep;
++      } }
++
+     /* DRAW_SKIP_TEX=<hex raw offset>: drop every op binding that texture on
+      * unit 0. The ducks sit behind the water's slab geometry, so removing the
+      * occluder is the way to see whether the duck itself renders. Diagnostic. */
+@@ -7229,6 +7525,102 @@
+     return o;
+ }
+ 
++/* Strip continuation across draw batches. One BEGIN/END may carry a strip,
++ * fan, polygon or quad strip split over several DRAW_ARRAYS / DRAW_INDEX_ARRAY
++ * entries (each at most 256 vertices). The RSX concatenates contiguous ranges
++ * into one primitive stream before assembly (RPCS3 draw_clause::append merges
++ * a range whose first equals the previous first + count), so the primitives
++ * that straddle a batch boundary exist on hardware. Expanding each batch as
++ * its own strip dropped those: two triangles of every 256-vertex strip batch,
++ * which showed as a diagonal line of holes in the title's sky dome.
++ * RSX_STRIP_JOIN=0 restores the per-batch expansion. */
++static struct { int valid, indexed; u32 epoch, prim, start, end, ixoff, ixdma; } s_strip;
++
++static int strip_join_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_STRIP_JOIN"); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++static int strip_like(u32 prim)
++{
++    return prim == RSX_PRIMITIVE_TRIANGLE_STRIP || prim == RSX_PRIMITIVE_TRIANGLE_FAN ||
++           prim == RSX_PRIMITIVE_POLYGON || prim == RSX_PRIMITIVE_QUAD_STRIP;
++}
++
++/* Returns the strip's first vertex/index position when [first, first+count)
++ * continues the previous batch of the same strip, else first; then records
++ * this batch as the strip's latest. *prev_end gets the previous batch end. */
++static u32 strip_track(const rsx_state* st, u32 prim, int indexed, u32 first, u32 count,
++                       u32* prev_end)
++{
++    const u32 ep = st ? st->begin_epoch : 0;
++    const u32 ixo = (st && indexed) ? st->index_array_offset : 0;
++    const u32 ixd = (st && indexed) ? st->index_array_dma : 0;
++    u32 start = first;
++    *prev_end = first;
++    if (strip_join_on() && s_strip.valid && s_strip.epoch == ep && s_strip.prim == prim &&
++        s_strip.indexed == indexed && s_strip.end == first &&
++        s_strip.ixoff == ixo && s_strip.ixdma == ixd) {
++        start = s_strip.start;
++        *prev_end = s_strip.end;
++    }
++    s_strip.valid = 1; s_strip.indexed = indexed; s_strip.epoch = ep; s_strip.prim = prim;
++    s_strip.start = start; s_strip.end = first + count; s_strip.ixoff = ixo; s_strip.ixdma = ixd;
++    return start;
++}
++
++/* Emit the primitives of the strip starting at position s whose last vertex
++ * lies in [prev_end, end): strip/fan triangle t uses positions up to s+t+2,
++ * quad q up to s+2q+3. Winding parity is kept relative to s. */
++static u32 upload_strip_join_vp(const rsx_state* state, u32 prim, int indexed,
++                                u32 s, u32 prev_end, u32 end)
++{
++    extern uint8_t* vm_base;
++    if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
++    if (!state->vertex_attribs[0].enabled) return 0;
++    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
++        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
++    u32 o = 0;
++#define SJ_IDX(p) (indexed ? read_guest_index(state, (p)) : (p))
++    if (prim == RSX_PRIMITIVE_QUAD_STRIP) {
++        u32 q0 = prev_end >= s + 4 ? (prev_end - s - 2) / 2 : 0;
++        u32 q1 = end >= s + 4 ? (end - s - 2) / 2 : 0;
++        for (u32 q = q0; q < q1 && o + 6 <= maxv; q++) {
++            u32 b = s + q * 2;
++            VPSlot v0[16], v1[16], v2[16], v3[16];
++            read_vp_vertex(state, SJ_IDX(b + 0), v0);
++            read_vp_vertex(state, SJ_IDX(b + 1), v1);
++            read_vp_vertex(state, SJ_IDX(b + 2), v2);
++            read_vp_vertex(state, SJ_IDX(b + 3), v3);
++            memcpy(&out[(o + 0)*16], v0, sizeof(v0));
++            memcpy(&out[(o + 1)*16], v1, sizeof(v1));
++            memcpy(&out[(o + 2)*16], v3, sizeof(v3));
++            memcpy(&out[(o + 3)*16], v0, sizeof(v0));
++            memcpy(&out[(o + 4)*16], v3, sizeof(v3));
++            memcpy(&out[(o + 5)*16], v2, sizeof(v2));
++            o += 6;
++        }
++    } else {
++        const int fan = prim != RSX_PRIMITIVE_TRIANGLE_STRIP;
++        u32 t0 = prev_end >= s + 3 ? prev_end - s - 2 : 0;
++        u32 t1 = end >= s + 3 ? end - s - 2 : 0;
++        vc_begin_draw();
++        for (u32 t = t0; t < t1 && o + 3 <= maxv; t++) {
++            u32 i0 = fan ? 0 : t, i1 = t + 1, i2 = t + 2;
++            if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
++            read_vp_vertex_cached(state, SJ_IDX(s + i0), &out[o*16]); o++;
++            read_vp_vertex_cached(state, SJ_IDX(s + i1), &out[o*16]); o++;
++            read_vp_vertex_cached(state, SJ_IDX(s + i2), &out[o*16]); o++;
++        }
++    }
++#undef SJ_IDX
++    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
++    return o;
++}
++
+ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+ {
+     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
+@@ -7367,8 +7759,14 @@
+         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
+         u32 rec = s_d3d.vp_vb_offset;
+         u32 emitted = 0;
++        u32 sj_prev = first, sj_start = first;
++        if (strip_like(primitive))
++            sj_start = strip_track(s_d3d.current_rsx_state, primitive, 0, first, count, &sj_prev);
+         if (primitive == RSX_PRIMITIVE_TRIANGLES)
+             emitted = upload_tris_vp(s_d3d.current_rsx_state, first, count);
++        else if (sj_start != first)
++            emitted = upload_strip_join_vp(s_d3d.current_rsx_state, primitive, 0,
++                                           sj_start, sj_prev, first + count);
+         else if (primitive == RSX_PRIMITIVE_QUAD_STRIP)
+             emitted = upload_quad_strip_vp(s_d3d.current_rsx_state, first, count);
+         else
+@@ -7526,8 +7924,14 @@
+         emitted = upload_tris_vp_ix(s_d3d.current_rsx_state, first, count, ix_cont);
+         ix_used = emitted != 0;
+     }
++    u32 sj_prev = first, sj_start = first;
++    if (strip_like(primitive))
++        sj_start = strip_track(s_d3d.current_rsx_state, primitive, 1, first, count, &sj_prev);
+     if (ix_used) { /* the indexed run took it */ }
+-    else if (primitive == RSX_PRIMITIVE_QUADS)        emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
++    else if (sj_start != first)
++        emitted = upload_strip_join_vp(s_d3d.current_rsx_state, primitive, 1,
++                                       sj_start, sj_prev, first + count);
++    else if (primitive == RSX_PRIMITIVE_QUADS)       emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
+     else if (primitive == RSX_PRIMITIVE_TRIANGLES)    emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
+     else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0);
+     else if (primitive == RSX_PRIMITIVE_TRIANGLE_FAN ||
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -1675,11 +1675,10 @@
+         u32 w2 = rsx_fp_read_word(ucode + off + 8);
+         u32 w3 = rsx_fp_read_word(ucode + off + 12);
+         off += 16;
+-        int is_branch = (w2 & FP_BRANCH) != 0;
+-        int has_k = !is_branch &&
+-            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+-             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+-             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
++        /* Same test as the decompiler's own walk (decode_src on all three
++         * words, branch or not) and rsx_fp_collect_constants: the slot index
++         * the shader reads fp_constants[] with must be the one filled here. */
++        int has_k = fp_instruction_has_constant(w1, w2, w3);
+         if (has_k) {
+             if (off + 16 <= max_bytes) {
+                 for (int i = 0; i < 4; i++) {
+@@ -1721,11 +1720,7 @@
+         u32 w3 = rsx_fp_read_word(ucode + off + 12);
+         for (u32 i = 0; i < 16; i++) { h ^= ucode[off + i]; h *= 16777619u; }
+         off += 16;
+-        int is_branch = (w2 & FP_BRANCH) != 0;
+-        int has_k = !is_branch &&
+-            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+-             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+-             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
++        int has_k = fp_instruction_has_constant(w1, w2, w3);
+         if (has_k) off += 16;            /* skip the constant, do not hash it */
+         if (w0 & FP_END) break;
+     }
+diff --git a/libs/video/rsx_texture_layout.c b/libs/video/rsx_texture_layout.c
+--- a/libs/video/rsx_texture_layout.c
++++ b/libs/video/rsx_texture_layout.c
+@@ -372,8 +372,18 @@
+     static const u8 lanes_g8b8[4]  = {1, 0, 1, 0};
+     static const u8 lanes_b8[4]    = {RSX_REMAP_ONE, 0, 0, 0};
+     static const u8 lanes_depth[4] = {0, 0, 0, 0};
++    /* X16 presents its one channel as A and G, with R and B reading 1.0
++     * (RPCS3 VKFormats.cpp get_component_mapping, ARGB order: R, ONE, R, ONE).
++     * Presented B8-style (1, X, X, X) a program reading .a got a constant 1
++     * and one reading .r/.b got X where the hardware gives 1. The 0xAAEE font
++     * crossbar above (outputs from G and B) still sees X in G.
++     * RSX_X16_AS_B8=1 restores the old presentation. */
++    static const u8 lanes_x16[4]   = {0, RSX_REMAP_ONE, 0, RSX_REMAP_ONE};
++    static int x16_old = -1;
++    if (x16_old < 0) x16_old = getenv("RSX_X16_AS_B8") ? 1 : 0;
+     const u32 base = rsx_fmt & 0x9Fu;
+     const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
++                      : (base == 0x94u && !x16_old) ? lanes_x16
+                       : (base == 0x81u || base == 0x94u) ? lanes_b8
+                       : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
+ 
+diff --git a/libs/video/tests/test_texture_layout.c b/libs/video/tests/test_texture_layout.c
+--- a/libs/video/tests/test_texture_layout.c
++++ b/libs/video/tests/test_texture_layout.c
+@@ -744,21 +744,23 @@
+     CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
+ }
+ 
+-/* X16 decodes to a one-channel R16 resource and is presented like B8: the
+- * value in R, G and B, A opaque. GoW:A's font atlas is X16 sampled through
+- * 0xAAEE (G and B sources only); with the ARGB lanes every output read the
+- * resource's empty G/B components and all text was transparent. */
++/* X16 decodes to a one-channel R16 resource presented as A and G, with R and
++ * B reading 1.0 (RPCS3 VKFormats.cpp get_component_mapping: R, ONE, R, ONE in
++ * ARGB order). GoW:A's font atlas is X16 sampled through 0xAAEE (G and B
++ * sources only); with the plain ARGB lanes every output read the resource's
++ * empty G/B components and all text was transparent -- through G it now gets
++ * the value in A and G. */
+ static void test_remap_x16_lanes(void)
+ {
+     u8 m[4];
+     rsx_texture_component_remap(0xAAEEu, FMT_X16 | FMT_LN, m);
+-    CHECK_EQ(m[A_], 0); CHECK_EQ(m[R_], 0);
+-    CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0);
++    CHECK_EQ(m[A_], 0); CHECK_EQ(m[R_], RSX_REMAP_ONE);
++    CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], RSX_REMAP_ONE);
+ 
+     u8 n[4];
+     rsx_texture_component_remap(0xAAE4u, FMT_X16, n);
+-    CHECK_EQ(n[A_], RSX_REMAP_ONE); CHECK_EQ(n[R_], 0);
+-    CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
++    CHECK_EQ(n[A_], 0); CHECK_EQ(n[R_], RSX_REMAP_ONE);
++    CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], RSX_REMAP_ONE);
+ }
+ 
+ /* The depth formats decode to one channel and present it on every source,

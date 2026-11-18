@@ -115,3 +115,13 @@ Left alone at the title, the game starts its attract demo, loads a course and dr
 
 - `cellSpursJq` (the SPURS job queue) is implemented: queues, ports, push, sync, shutdown and join, with one worker thread per queue that runs jobs through the existing SPU job dispatch. The demo pushes about 32 jobs a frame. All of them use one SPU binary at `0x00CAB400` (9536 bytes, fingerprint `B24195A9C86BC758`) that is not lifted yet, so each is logged as not run. `cellSpursJobQueuePort2Sync` has not been called at runtime, so its wait is untested.
 - A job chain parked on a closed guard now waits until shutdown. It gave up after 20 seconds, which ended chains during the course load.
+
+## 2026-11-17 update 10: foliage and sky fixed, no unresolved imports
+
+- Foliage draws cut out. The D3D12 backend ignored the RSX alpha test; it now runs in the pixel shader.
+- The title sky has no holes. A triangle strip split across vertex batches lost two triangles at each join.
+- The two `cellOskExtUtility` imports are implemented (they record the input device lock). A 160 second boot logs 0 unresolved imports.
+- The audio mixer produces sound: peak 0.20 in a muted run. Nobody has listened to the output.
+- The build generates the HLE import table from the library sources, so the manual `gen_hle_nids.py` step is gone.
+
+Open: course terrain is too dark, cause unknown. In the latest run the title took 140 seconds to appear (60 to 70 before), cause unknown. Menus after the title are not captured.

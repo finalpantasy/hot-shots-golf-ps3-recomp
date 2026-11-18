@@ -62,6 +62,7 @@ file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS
     "${RECOMP_DIR}/*.c"
     "${RECOMP_DIR}/*.cpp"
 )
+list(REMOVE_ITEM RECOMP_SOURCES "${RECOMP_DIR}/ppu_hle_nids.cpp")
 if(NOT RECOMP_SOURCES)
     message(FATAL_ERROR
         "${RECOMP_DIR} has a ppu_recomp.h but no .c or .cpp beside it. The "
@@ -89,7 +90,11 @@ add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
 # it. A port may keep a hand-curated one beside its lift; otherwise generate
 # the canonical every-module table, which is what the toolkit's own boot
 # harness uses.
-if(EXISTS "${RECOMP_DIR}/ppu_hle_nids.cpp")
+option(USE_CURATED_HLE_NID_TABLE "Use the HLE table in the lift directory" OFF)
+if(USE_CURATED_HLE_NID_TABLE)
+    if(NOT EXISTS "${RECOMP_DIR}/ppu_hle_nids.cpp")
+        message(FATAL_ERROR "USE_CURATED_HLE_NID_TABLE requires ppu_hle_nids.cpp in RECOMP_DIR")
+    endif()
     set(HLE_NID_TABLE "${RECOMP_DIR}/ppu_hle_nids.cpp")
     message(STATUS "HLE NID table:   ${HLE_NID_TABLE}")
 else()

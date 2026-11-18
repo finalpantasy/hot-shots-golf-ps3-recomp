@@ -1,0 +1,38 @@
+diff --git a/libs/misc/cellOskDialog.c b/libs/misc/cellOskDialog.c
+index 17e7c67..0a3cdc0 100644
+--- a/libs/misc/cellOskDialog.c
++++ b/libs/misc/cellOskDialog.c
+@@ -275,3 +275,20 @@ s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* result)
+ 
+     return CELL_OK;
+ }
++
++/* cellOskExtUtility: input device lock. No arguments on either call. The
++ * state is kept so a host keyboard overlay can honour it once one exists;
++ * there is no live dialog to update today. */
++static int s_osk_input_device_locked = 0;
++
++s32 cellOskDialogExtInputDeviceLock(void)
++{
++    s_osk_input_device_locked = 1;
++    return CELL_OK;
++}
++
++s32 cellOskDialogExtInputDeviceUnlock(void)
++{
++    s_osk_input_device_locked = 0;
++    return CELL_OK;
++}
+diff --git a/libs/misc/cellOskDialog.h b/libs/misc/cellOskDialog.h
+index 77e31bc..8287480 100644
+--- a/libs/misc/cellOskDialog.h
++++ b/libs/misc/cellOskDialog.h
+@@ -113,6 +113,8 @@ s32 cellOskDialogAbort(void);
+ 
+ s32 cellOskDialogSetInitialInputDevice(u32 device);
+ s32 cellOskDialogSetInitialKeyLayout(u32 layout);
++s32 cellOskDialogExtInputDeviceLock(void);
++s32 cellOskDialogExtInputDeviceUnlock(void);
+ s32 cellOskDialogSetLayoutMode(u32 mode);
+ s32 cellOskDialogSetSeparateWindowOption(u32 option);
+ 

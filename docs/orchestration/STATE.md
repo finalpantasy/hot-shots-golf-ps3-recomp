@@ -338,3 +338,20 @@ When the lift worker reports: check the course capture again (lighting, sky, tri
 
 - Worker `aa354238187c29d59` finished: `16CB89234CCC254E` added as job 16 (`ea 0x00CB1F80`, EA inferred from the EBOOT file offset, not from a log line). `boot-fix-1.02-job16-1.log` (170 s): 0 `dispatch MISS`, `ran=8160 MISS=0`, error markers 0, but the job was never pushed in that boot, so the lift has not run. All 16 dumps in `analysis/spu-miss` are now in `tools/spu_jobs.json`.
 - Rendering worker `a5185470777d90621` still out.
+
+## 2026-11-17 run 16: alpha test, strip join, keyboard calls, generated HLE table
+
+- Rendering worker `a5185470777d90621` finished, patch `0024` (`libs/video/rsx_d3d12_backend.c`, `rsx_fp_decompiler.c`, `rsx_texture_layout.c` and its test). The patch applies on HEAD plus `0005`, `0008`, `0020`.
+  - Foliage boxes fixed: the backend never applied the RSX alpha test. It now runs in the shader on color 0 alpha, with texture alpha kill, and fragment constants arrive per draw. Off switches: `NO_ALPHATEST=1`, `NO_ALPHAKILL=1`, `FP_CONSTBUF=0`.
+  - Title sky squares fixed: a strip split over several 256-vertex batches in one draw lost two triangles at each join. Batches are joined now. Off switch: `RSX_STRIP_JOIN=0`.
+  - Dark terrain is open. Ground program `0x015DC881` multiplies sunlight by a shadow-map sample on unit 12, which the game never binds in the captured frames. Whether that causes the darkness is not verified. The before and after course captures are different holes.
+- Coordinator: `cellOskDialogExtInputDeviceLock` and `Unlock` added to `libs/misc/cellOskDialog.c` (patch `0025`). They record the lock state; no host keyboard uses it yet.
+- Coordinator: Codex's `port/CMakeLists.txt` change applied. The build generates the HLE NID table (`HLE NID table: generated (every module)`); the copy in the lift directory is used only with `-DUSE_CURATED_HLE_NID_TABLE=ON`. The `pipeline.toml` half is not applied, so the lift stage still writes the unused copy.
+- Build `build/cont-675c97e1/`, `boot-fix-1.02-cont-1.log` (160 s, muted, `PS3_DEV_FLASH` set to Codex's staged firmware folder): 0 unresolved NID (was 1 to 2), 0 `bctr to NULL`, 0 `null-call`, 0 `887A0005`. 146 `[audio-peak]` lines, highest peak 0.1964, so the mixer produces sound; nobody has listened to it.
+- In that run the title appeared after 140 s, not 60 to 70 s, and the scripted Cross at 90 s missed it. Cause not known (machine load or this build).
+- Boot script now sets `PS3_MUTE=1` and `AUDIO_PEAK=1`. Boots before 22:42 were not muted.
+
+### Exact next action
+
+Read `boot-fix-1.02-cont2-1.log` and its captures (Cross at 170 s) to see what follows the title, and find out why the title arrived late.
+
