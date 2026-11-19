@@ -283,3 +283,9 @@ A/B over a 450-second scripted round on one build, packing off, then on: course 
 Patch `0043` applies three of Codex's proposals: seven offline `sceNpTus` imports, five `cellSsl` getters, and syscall 988 returning `CELL_ENOSYS` for a null buffer instead of reading address zero. Only the `cellL10n.c` half of the UCS-2 proposal is in; its registrations belong in `port/stubs.cpp`, which Codex owns.
 
 Four 400-second scripted rounds ran on the patched build. Three ran the full time with every marker at zero; two of those reached hole 3 or later. One exited silently at about 255 seconds on hole 1, with no crash line in the log and no Windows error event. An unpatched run did not exit. The cause is unknown, so this exit is an open question, not a known regression.
+
+## 2026-11-18 update 31: the silent exit was an outside kill (patch 0044)
+
+The run that stopped at about 255 seconds in update 30 did not exit on its own. A process search by another tool on the same PC matched this run's launcher and ended it by PID, which also ended the game. Patch `0043` is not involved.
+
+Patch `0044` adds an exit trace, on by default (`RT_EXIT_TRACE=0` turns it off, `RT_EXIT_TRACE_FILE=<path>` copies it to a file). Every way out of the process now logs one `[exit-trace]` line with time and thread: guest `sys_process_exit` with its caller, `exit`, `ExitProcess`, abort, unhandled exceptions, host quit, window close messages, Present failures and D3D12 device removal. A run killed from outside shows only the start-up line. Three more 400-second rounds ran to the end with no early exit.

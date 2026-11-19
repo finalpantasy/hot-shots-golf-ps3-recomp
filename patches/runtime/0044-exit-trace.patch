@@ -1,0 +1,361 @@
+--- a/runtime/platform/ps3_stdio.c
++++ b/runtime/platform/ps3_stdio.c
+@@ -36,6 +36,177 @@
+ static LPTOP_LEVEL_EXCEPTION_FILTER s_prev_filter;
+ static void (*s_prev_abort)(int);
+ 
++/* ---------------------------------------------------------------------------
++ * Exit trace (RT_EXIT_TRACE, default on; RT_EXIT_TRACE=0 turns it off).
++ *
++ * A run that ends without a crash line leaves no way to tell a guest exit,
++ * a host exit(), an abort, an unhandled fault or an outside kill apart. Each
++ * of those paths now writes one "[exit-trace]" line, straight to the stderr
++ * handle with WriteFile (not through the CRT buffer, so a fault inside printf
++ * or a kill a moment later cannot lose it): wall clock, ms since init, thread
++ * id and name, what happened. Covered: exit()/atexit (with the host return
++ * addresses as image RVAs), ExitProcess/_exit/abort's _exit (a TLS callback
++ * sees DLL_PROCESS_DETACH), SIGABRT (std::terminate's default ends there),
++ * the unhandled-exception filter, a last vectored handler (faults no runtime
++ * handler resolved), and the call sites that use ps3_exit_trace() (guest
++ * sys_process_exit, WM_CLOSE/WM_DESTROY/WM_QUIT, a failed Present).
++ * TerminateProcess from outside and __fastfail run none of this: a log with
++ * no [exit-trace] exit line at all means the process was killed from outside
++ * (or fast-failed, which WER records unless the launcher turned WER off).
++ * RT_EXIT_TRACE_FILE=<path> also appends every line to that file.
++ * -----------------------------------------------------------------------*/
++#ifdef _WIN32
++#include <stdarg.h>
++#include <stdint.h>
++
++static int       s_xt_on = -1;          /* -1: not decided yet */
++static HANDLE    s_xt_file = INVALID_HANDLE_VALUE;
++static ULONGLONG s_xt_t0;
++static long      s_xt_veh_lines;
++
++static int ps3_exit_trace_enabled(void)
++{
++    if (s_xt_on < 0) {
++        const char* e = getenv("RT_EXIT_TRACE");
++        s_xt_on = !(e && e[0] == '0');
++    }
++    return s_xt_on;
++}
++
++static void ps3_xt_write(const char* s, DWORD n)
++{
++    DWORD w;
++    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
++    if (h && h != INVALID_HANDLE_VALUE) WriteFile(h, s, n, &w, NULL);
++    if (s_xt_file != INVALID_HANDLE_VALUE) WriteFile(s_xt_file, s, n, &w, NULL);
++}
++
++void ps3_exit_trace(const char* fmt, ...)
++{
++    if (!ps3_exit_trace_enabled()) return;
++    char line[1400];
++    SYSTEMTIME st;
++    GetLocalTime(&st);
++    char tn[48] = "";
++    {
++        typedef HRESULT (WINAPI *get_desc_fn)(HANDLE, PWSTR*);
++        static get_desc_fn get_desc;
++        static int looked_up;
++        if (!looked_up) {
++            get_desc = (get_desc_fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"),
++                                                          "GetThreadDescription");
++            looked_up = 1;
++        }
++        PWSTR w = NULL;
++        if (get_desc && SUCCEEDED(get_desc(GetCurrentThread(), &w)) && w) {
++            int i = 0;
++            for (; w[i] && i < (int)sizeof tn - 1; i++) tn[i] = (w[i] < 128) ? (char)w[i] : '?';
++            tn[i] = 0;
++            LocalFree(w);
++        }
++    }
++    int p = snprintf(line, sizeof line, "\n[exit-trace] %02u:%02u:%02u.%03u +%llums tid=%lu(%s) ",
++                     st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
++                     (unsigned long long)(GetTickCount64() - s_xt_t0),
++                     (unsigned long)GetCurrentThreadId(), tn[0] ? tn : "-");
++    if (p < 0) return;
++    va_list ap;
++    va_start(ap, fmt);
++    int q = vsnprintf(line + p, sizeof line - (size_t)p - 2, fmt, ap);
++    va_end(ap);
++    if (q < 0) q = 0;
++    p += q;
++    if (p > (int)sizeof line - 2) p = (int)sizeof line - 2;
++    line[p++] = '\n';
++    ps3_xt_write(line, (DWORD)p);
++}
++
++/* Host return addresses as RVAs of the exe (resolve with the map or llvm-symbolizer). */
++static void ps3_exit_trace_bt(const char* tag)
++{
++    if (!ps3_exit_trace_enabled()) return;
++    void* bt[24];
++    USHORT n = RtlCaptureStackBackTrace(1, 24, bt, NULL);
++    uintptr_t mb = (uintptr_t)GetModuleHandleA(NULL);
++    char b[24 * 20 + 16];
++    int p = 0;
++    for (USHORT i = 0; i < n && p < (int)sizeof b - 20; i++) {
++        uintptr_t a = (uintptr_t)bt[i];
++        if (a >= mb && a - mb < 0x40000000u)
++            p += snprintf(b + p, sizeof b - (size_t)p, " %llX", (unsigned long long)(a - mb));
++        else
++            p += snprintf(b + p, sizeof b - (size_t)p, " x%llX", (unsigned long long)a);
++    }
++    b[p] = 0;
++    ps3_exit_trace("%s host-bt rva:%s", tag, b);
++}
++
++static void ps3_exit_trace_atexit(void)
++{
++    ps3_exit_trace("exit() called: atexit handlers running");
++    ps3_exit_trace_bt("exit()");
++}
++
++static LONG WINAPI ps3_exit_trace_veh(EXCEPTION_POINTERS* ep)
++{
++    DWORD code = ep->ExceptionRecord->ExceptionCode;
++    /* Only error-severity codes nothing ahead of this handler resolved; C++
++     * throws (0xE06D7363) are normal control flow and skipped. A later frame
++     * handler may still catch it, so this is "seen", not "fatal". */
++    if ((code & 0xC0000000u) == 0xC0000000u && code != 0xE06D7363u &&
++        __atomic_add_fetch(&s_xt_veh_lines, 1, __ATOMIC_ACQ_REL) <= 16) {
++        uintptr_t mb = (uintptr_t)GetModuleHandleA(NULL);
++        uintptr_t a = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
++        ULONG_PTR i0 = ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0;
++        ULONG_PTR i1 = ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0;
++        ps3_exit_trace("unresolved exception code=0x%08lX addr=0x%llX (rva 0x%llX) info=%llX,%llX",
++                       (unsigned long)code, (unsigned long long)a, (unsigned long long)(a - mb),
++                       (unsigned long long)i0, (unsigned long long)i1);
++        ps3_exit_trace_bt("exception");
++    }
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
++/* ExitProcess (and so exit, _exit, abort's _exit, quick_exit) runs the exe's
++ * TLS callbacks with DLL_PROCESS_DETACH. TerminateProcess and __fastfail do not. */
++static void NTAPI ps3_exit_trace_tls(PVOID h, DWORD reason, PVOID reserved)
++{
++    (void)h; (void)reserved;
++    if (reason != DLL_PROCESS_DETACH || s_xt_on != 1) return;
++    DWORD code = 0;
++    GetExitCodeProcess(GetCurrentProcess(), &code);
++    ps3_exit_trace("process detach (ExitProcess path) exit code=%lu (0x%lX)",
++                   (unsigned long)code, (unsigned long)code);
++}
++#if defined(__GNUC__) || defined(__clang__)
++extern const IMAGE_TLS_DIRECTORY _tls_used;          /* the CRT's TLS directory: keep it linked */
++__attribute__((used)) static const void* s_xt_tls_ref = &_tls_used;
++__attribute__((used, section(".CRT$XLY"))) PIMAGE_TLS_CALLBACK ps3_exit_trace_tls_cb = ps3_exit_trace_tls;
++#elif defined(_MSC_VER)
++#pragma comment(linker, "/INCLUDE:_tls_used")
++#pragma comment(linker, "/INCLUDE:ps3_exit_trace_tls_cb")
++#pragma section(".CRT$XLY", long, read)
++__declspec(allocate(".CRT$XLY")) const PIMAGE_TLS_CALLBACK ps3_exit_trace_tls_cb = ps3_exit_trace_tls;
++#endif
++
++static void ps3_exit_trace_init(void)
++{
++    s_xt_t0 = GetTickCount64();
++    if (!ps3_exit_trace_enabled()) return;
++    const char* f = getenv("RT_EXIT_TRACE_FILE");
++    if (f && *f)
++        s_xt_file = CreateFileA(f, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
++    atexit(ps3_exit_trace_atexit);
++    AddVectoredExceptionHandler(0, ps3_exit_trace_veh);   /* last: after every resolver */
++    ps3_exit_trace("on (pid %lu); RT_EXIT_TRACE=0 turns it off", (unsigned long)GetCurrentProcessId());
++}
++#else
++void ps3_exit_trace(const char* fmt, ...) { (void)fmt; }
++static void ps3_exit_trace_bt(const char* tag) { (void)tag; }
++static void ps3_exit_trace_init(void) {}
++#endif
++
+ static DWORD WINAPI ps3_stdio_flusher(LPVOID arg)
+ {
+     (void)arg;
+@@ -77,6 +248,8 @@
+  * end the process as it would have. */
+ static void ps3_stdio_on_abort(int sig)
+ {
++    ps3_exit_trace("SIGABRT: abort() (std::terminate's default ends here too)");
++    ps3_exit_trace_bt("abort");
+     ps3_stdio_flush_crash();
+     if (s_prev_abort && s_prev_abort != SIG_DFL && s_prev_abort != SIG_IGN)
+         s_prev_abort(sig);
+@@ -86,6 +259,9 @@
+  * report, then flush its report too (unless it resolved the exception). */
+ static LONG WINAPI ps3_stdio_on_crash(EXCEPTION_POINTERS* ep)
+ {
++    ps3_exit_trace("unhandled exception filter: code=0x%08lX addr=%p",
++                   (unsigned long)ep->ExceptionRecord->ExceptionCode,
++                   ep->ExceptionRecord->ExceptionAddress);
+     ps3_stdio_flush_crash();
+     LONG r = s_prev_filter ? s_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+     if (r != EXCEPTION_CONTINUE_EXECUTION) ps3_stdio_flush_crash();
+@@ -109,6 +285,7 @@
+ void ps3_stdio_init(void)
+ {
+     if (__atomic_exchange_n(&s_init_done, 1, __ATOMIC_ACQ_REL)) return;
++    ps3_exit_trace_init();
+ 
+     const char* unbuf = getenv("PS3_STDIO_UNBUFFERED");
+     if (unbuf && unbuf[0] == '1') {
+--- a/runtime/platform/ps3_stdio.h
++++ b/runtime/platform/ps3_stdio.h
+@@ -53,6 +53,11 @@
+  * ends the process (ExitProcess, _exit) calls this first. */
+ void ps3_stdio_flush_crash(void);
+ 
++/* One "[exit-trace]" line (timestamp, thread id and name), written straight to
++ * the stderr handle so it survives a kill right after. RT_EXIT_TRACE=0: no-op.
++ * See ps3_stdio.c "Exit trace" for what calls it. */
++void ps3_exit_trace(const char* fmt, ...);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -22,6 +22,7 @@
+ #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
+ #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+ #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: spans of HLE import calls */
++extern "C" void ps3_exit_trace(const char* fmt, ...);   /* runtime/platform/ps3_stdio.c */
+ #include <stdlib.h>       /* getenv */
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -407,6 +408,9 @@
+      * abort is usually a race that will not reproduce on demand, so capture it
+      * whenever it fires. Clean code=0 exits (normal shutdown) stay quiet;
+      * PS3_EXIT_CHAIN=1 dumps those too. */
++    if (nid == 0xE6F2C1E7u)   /* RT_EXIT_TRACE: every guest sys_process_exit, with its caller */
++        ps3_exit_trace("guest sys_process_exit (import) code=0x%X lr=0x%08X",
++                       (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
+     if (nid == 0xE6F2C1E7u && ((uint32_t)ctx->gpr[3] != 0 || getenv("PS3_EXIT_CHAIN"))) {
+         uint32_t sp = (uint32_t)ctx->gpr[1];
+         fprintf(stderr, "[exit-chain] code=0x%X lr=0x%08X sp=0x%08X\n", (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, sp);
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -2319,8 +2319,12 @@
+ extern void sys_process_exit(int32_t exitcode);   /* libs/system/sysPrxForUser.c */
+ extern int32_t sys_process_getpid(void);
+ 
++extern void ps3_exit_trace(const char* fmt, ...);   /* runtime/platform/ps3_stdio.c */
++
+ static int64_t sys_process_exit_handler(ppu_context* ctx)
+ {
++    ps3_exit_trace("guest sys_process_exit (syscall %u) code=0x%X lr=0x%08X",
++                   (unsigned)ctx->gpr[11], (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
+     sys_process_exit((int32_t)ctx->gpr[3]);   /* does not return */
+     return 0;
+ }
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -21,6 +21,8 @@
+ #include "ps3emu/log_first.h"
+ #include "rsx_d3d12_backend.h"
+ #include "rsx_present_policy.h"
++
++extern void ps3_exit_trace(const char* fmt, ...);   /* runtime/platform/ps3_stdio.c (RT_EXIT_TRACE) */
+ #include "rsx_primitives.h"
+ #include "rsx_vertex_fetch.h"
+ #include "rsx_texture_layout.h"
+@@ -994,14 +996,17 @@
+ {
+     switch (msg) {
+     case WM_CLOSE:
++        ps3_exit_trace("WM_CLOSE received (hwnd=%p): window closing", (void*)hwnd);
+         s_d3d.window_closed = 1;
+         DestroyWindow(hwnd);
+         return 0;
+     case WM_DESTROY:
++        ps3_exit_trace("WM_DESTROY received (hwnd=%p): posting WM_QUIT", (void*)hwnd);
+         PostQuitMessage(0);
+         return 0;
+     case WM_KEYDOWN:
+         if (wp == VK_ESCAPE) {
++            ps3_exit_trace("Escape key: window closing");
+             s_d3d.window_closed = 1;
+             DestroyWindow(hwnd);
+         }
+@@ -1960,8 +1965,10 @@
+                    (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
+                    (long)rr);
+             fflush(stdout);
+-            if (rr != 0 /* S_OK: device still alive, keep waiting a bit */)
++            if (rr != 0 /* S_OK: device still alive, keep waiting a bit */) {
++                ps3_exit_trace("D3D12 device removed reason=0x%08lX (wait_for_gpu)", (unsigned long)rr);
+                 break;
++            }
+         }
+     }
+ }
+@@ -8052,11 +8059,20 @@
+     if (_pf0) _pf4 = perf_now();   /* debug dumps above are not "submit" */
+     stall_mark("rf:Present");
+     if (s_present_this_frame) {
++        HRESULT phr;
+         if (!d3d12_vsync_off())
+-            s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
++            phr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+         else
+-            s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0,
+-                                              s_d3d.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
++            phr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0,
++                                                    s_d3d.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
++        if (FAILED(phr)) {   /* RT_EXIT_TRACE: DXGI present errors, device removal */
++            static long s_present_fail;
++            if (++s_present_fail <= 8)
++                ps3_exit_trace("Present failed hr=0x%08lX device removed reason=0x%08lX (failure %ld)",
++                               (unsigned long)phr,
++                               (unsigned long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device),
++                               s_present_fail);
++        }
+         if (_pf0) s_prof_frames++;
+     }
+     rdoc_frame_end();
+@@ -10630,7 +10646,11 @@
+     MSG msg;
+     stall_mark("pump");
+     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+-        if (msg.message == WM_QUIT) return -1;
++        if (msg.message == WM_QUIT) {
++            ps3_exit_trace("WM_QUIT received by the message pump (wParam=%llu)",
++                           (unsigned long long)msg.wParam);
++            return -1;
++        }
+         TranslateMessage(&msg);
+         DispatchMessageA(&msg);
+     }
+--- a/libs/system/cellSysutil.c
++++ b/libs/system/cellSysutil.c
+@@ -729,6 +729,8 @@
+  * game. Runs on its own thread, so the caller (the main thread, the frame
+  * clock) returns at once; a second request is ignored.
+  * -----------------------------------------------------------------------*/
++extern void ps3_exit_trace(const char* fmt, ...);   /* runtime/platform/ps3_stdio.c (RT_EXIT_TRACE) */
++
+ #ifdef _WIN32
+ static DWORD WINAPI host_quit_thread(LPVOID unused)
+ #else
+@@ -770,6 +772,7 @@
+     }
+     printf("[quit] the game did not exit on its own; ending it (save in flight: %s, waited %d ms) -> exit 0\n",
+            ps3_savedata_busy() ? "yes, gave up" : "no", waited);
++    ps3_exit_trace("host quit: grace over, game did not exit; calling exit(0)");
+     fflush(NULL);
+     exit(0);
+ #ifdef _WIN32
+@@ -786,6 +789,7 @@
+ void ps3_host_quit(const char* why)
+ {
+     if (__atomic_exchange_n(&s_host_quit, 1, __ATOMIC_ACQ_REL)) return;
++    ps3_exit_trace("host quit requested (%s)", why ? why : "host");
+     printf("[quit] requested (%s)\n", why ? why : "host");
+     fflush(stdout);
+ #ifdef _WIN32
