@@ -551,3 +551,5 @@ Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-f
 - 2026-11-18 23:20 run 42 (workers a31c31a590fb370df, a239724824915f09e): blank menu text = no firmware font in test runs (harness now sets PS3_DEV_FLASH; port fallback sent to Codex). Missing letters = stale glyph atlas (sparse tex_csum); 0046 dense hash for 8-bit 1-2 channel textures. Roadmap doc added; measurement worker a7fd3791c3e3081e2 started.
 
 - 2026-11-19 01:10 run 43 (workers a7fd3791c3e3081e2 measure, adb95aae5ec966cb7 texrep): course ~39 FPS, walker idles ~60% (guest/walker serialized), 4K clips at x=2047 (2048 depth); 0047 texture dump/replace committed; Real-ESRGAN in work/tools.
+
+- 2026-11-19 03:00 run 44 (worker aef1995516fcec7da): HD pack v1, 541 textures 4x/2x via realesrgan-x4plus (tools/make_hd_pack.py), indexed 541 replaced 1150, 0 failures; needs TEX_REPLACE_MB=3072. At 720p grass is softer, not sharper; first-load stalls 23.9 s total over 300 s (PNG). Next: judge at 4K, DDS packs, detail-preserving terrain.
