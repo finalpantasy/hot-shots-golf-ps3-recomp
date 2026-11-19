@@ -545,3 +545,5 @@ Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-f
 - 2026-11-18 19:16 run 39 (worker a44c8e1b9e6089462): silent exit = external taskkill by another chat matching ghost_launch; 0044 exit trace committed.
 
 - 2026-11-18 20:02 run 40 (menu survey, worker a1665996013dc4b22): title, main menu, Multiplayer, Customize, Shop, Select Character, Changing Room render ok. Hang A: load after Select Character (mn8) stops flips. Hang B (once): second Cross during Continue load. Yes/No dialog over main menu has empty message text. Worker a38911612677fdaa8 on hangs (0045).
+
+- 2026-11-18 22:10 run 41 (worker a38911612677fdaa8, hg3-hg19): Hang A = SPURS job-chain registry leak (32 slots, never freed); 0045 reclaims on join and adds HANG_WD; hg11/hg14 load past Select Character, hg17 New Game to hole 4. Hang B not reproduced (cellSail movie close race, open).

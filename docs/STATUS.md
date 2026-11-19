@@ -289,3 +289,11 @@ Four 400-second scripted rounds ran on the patched build. Three ran the full tim
 The run that stopped at about 255 seconds in update 30 did not exit on its own. A process search by another tool on the same PC matched this run's launcher and ended it by PID, which also ended the game. Patch `0043` is not involved.
 
 Patch `0044` adds an exit trace, on by default (`RT_EXIT_TRACE=0` turns it off, `RT_EXIT_TRACE_FILE=<path>` copies it to a file). Every way out of the process now logs one `[exit-trace]` line with time and thread: guest `sys_process_exit` with its caller, `exit`, `ExitProcess`, abort, unhandled exceptions, host quit, window close messages, Present failures and D3D12 device removal. A run killed from outside shows only the start-up line. Three more 400-second rounds ran to the end with no early exit.
+
+## 2026-11-18 update 32: menus no longer hang the course load (patch 0045)
+
+After Select Character or the Changing Room, the course load stopped and the screen froze. The SPURS job-chain table had 32 slots and never freed one. Select Character and the Changing Room create a job chain for each model and shut it down when the model goes away, but the slot stayed taken. Chain 33 was refused. `CreateJobChainWithAttribute` still returned success, so the game waited on work that never ran. At most 24 chains were alive at once, so the leak caused the hang, not a lack of slots.
+
+Patch `0045` frees a chain's slot when the game joins it after shutdown, once its walker thread has exited, and raises the table to 256 slots (`JC_RECLAIM=0` restores the old behavior). A full table now logs `registry full ... this chain will NOT run`. It also adds `HANG_WD=<seconds>`: when no frame has been shown for that long, it prints every guest thread's wait and every job-chain walker. It is off unless set.
+
+Two runs through Select Character loaded and played the round, with chains past number 32 running. A New Game round reached hole 3 and went on to load hole 4 without a stall. Nothing froze. Hang B (a second Cross during the Continue load) did not happen in two tries. It is still open. The likely cause is a timing race in the movie player when the press lands while the intro movie is closing, since in the one failing run the player closed the stream but never finished shutting down.

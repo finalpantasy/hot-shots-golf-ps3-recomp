@@ -1,0 +1,367 @@
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2606,7 +2606,25 @@
+ 
+ /* Host-side jobchain registry (the CellSpursJobChain guest struct is opaque
+  * to the game; we track what we need beside it). */
+-#define MAX_JOBCHAINS 32
++/* JC_RECLAIM (default on; JC_RECLAIM=0 = the old fixed 32 slots, never freed).
++ *
++ * A slot used to live forever: nothing released it, so the 33rd distinct chain
++ * EA found the registry full, Create still returned CELL_OK, and the title's
++ * Run then hit "UNKNOWN chain (no Create seen)" and walked nothing. Hot Shots
++ * Golf creates a new chlib Spu.cpp chain (fresh heap EA) for every character
++ * and dress-up model it loads, and Shutdown+Joins it when the model goes away,
++ * so a few trips through Select Character / Changing Room fill 32 slots; the
++ * course load after that queues its jobs on a chain nobody walks and waits for
++ * their done counter forever ("Now Loading" never ends). Join now frees the
++ * slot once the walker has fully left, and the table has room for 256. */
++#define MAX_JOBCHAINS 256
++#define MAX_JOBCHAINS_LEGACY 32
++static int jc_reclaim_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("JC_RECLAIM"); v = !(e && e[0] == '0'); }
++    return v;
++}
+ static struct {
+     u32 jc_ea;        /* CellSpursJobChain EA (0 = free) */
+     u32 entry_ea;     /* first command word EA */
+@@ -2616,7 +2634,12 @@
+     volatile long running;   /* 1 while a host thread walks this chain */
+     volatile long stop;      /* Shutdown asked the walker to leave */
+     u32 spurs_ea;     /* CellSpurs instance the chain was created on */
++    volatile long walker_live;  /* 1 from Run until the walker thread has returned */
++    volatile u32 wd_pc;         /* HANG_WD: command the walker is on */
++    volatile int wd_state;      /* HANG_WD: 0 walk, 1 parked, 2 guard, 3 barrier, 4 done */
++    volatile u32 wd_aux;        /* HANG_WD: guard EA */
+ } s_jobchains[MAX_JOBCHAINS];
++static volatile long s_jc_full_count;
+ static u32 s_jc_reg_spurs;   /* set by the Create forms just before jc_register */
+ 
+ static void jc_dump_commands(const char* tag, u32 ea, int max_words)
+@@ -2676,7 +2699,13 @@
+ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
+                        const char* who)
+ {
+-    for (int i = 0; i < MAX_JOBCHAINS; i++) {
++    int cap = jc_reclaim_on() ? MAX_JOBCHAINS : MAX_JOBCHAINS_LEGACY;
++    /* JC_REG_CAP=<n>: test knob, a smaller registry, so a short scripted run
++     * can push past it (the menu path that fills 32 slots is not repeatable). */
++    { static int s_cap = -1;
++      if (s_cap < 0) { const char* e = getenv("JC_REG_CAP"); s_cap = e ? atoi(e) : 0; }
++      if (s_cap > 0 && s_cap < cap) cap = s_cap; }
++    for (int i = 0; i < cap; i++) {
+         if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
+             s_jobchains[i].jc_ea     = jc_ea;
+             s_jobchains[i].entry_ea  = entry_ea;
+@@ -2684,10 +2713,20 @@
+             s_jobchains[i].max_grab  = max_grab;
+             s_jobchains[i].run_count = 0;
+             s_jobchains[i].spurs_ea  = s_jc_reg_spurs;
++            /* High-water mark of chains registered at once (logged from 24
++             * up), so a title that really keeps that many alive is visible. */
++            { static int s_hw = 0; int used = 0;
++              for (int k = 0; k < MAX_JOBCHAINS; k++) if (s_jobchains[k].jc_ea) used++;
++              if (used > s_hw) { s_hw = used;
++                  if (used >= 24) fprintf(stderr, "[cellSpurs] job chain registry high-water: %d live\n", used); } }
+             return CELL_OK;
+         }
+     }
+-    printf("[cellSpurs] %s: registry full\n", who);
++    /* Still CELL_OK (real SPURS has no such table), but loud: every Run of
++     * this chain will walk nothing. */
++    fprintf(stderr, "[cellSpurs] %s(jc=0x%08X): registry full (%d slots, #%ld) -- "
++            "this chain will NOT run\n", who, jc_ea, cap,
++            (long)_InterlockedIncrement(&s_jc_full_count));
+     return CELL_OK;
+ }
+ 
+@@ -2960,6 +2999,15 @@
+ #else
+ static __thread volatile long* t_jc_stop;
+ #endif
++/* Registry slot of the chain this host thread walks (-1 off a walker). */
++#if defined(_MSC_VER)
++static __declspec(thread) int t_jc_slot = -1;
++#else
++static __thread int t_jc_slot = -1;
++#endif
++#define JC_WD(st, pcv, aux) do { if (t_jc_slot >= 0) { \
++        s_jobchains[t_jc_slot].wd_state = (st); s_jobchains[t_jc_slot].wd_pc = (pcv); \
++        s_jobchains[t_jc_slot].wd_aux = (aux); } } while (0)
+ 
+ static int jg_wait(u32 ea)
+ {
+@@ -3433,6 +3481,7 @@
+         if (idle > 4096) break;
+         if (t_jc_stop && *t_jc_stop) return;         /* chain shut down */
+         u64 cmd = vm_read64(pc);
++        JC_WD(0, pc, 0);
+         if (cmd != 0 || !hist_n || hist_cmd[(hist_n - 1) & 31] != 0) {
+             hist_pc[hist_n & 31] = pc; hist_cmd[hist_n & 31] = cmd; hist_n++;
+         }
+@@ -3475,6 +3524,7 @@
+             !(op == 7 && ext == (7 | (14 << 3))) &&
+             !(op == 7 && ext == (7 | (1 << 3)))) {
+             if (pon && jp->pending_job && !jp->batch_open) prof.brk[ext]++;
++            JC_WD(3, pc, 0);
+             jc_par_barrier(jp);
+         }
+         /* A NEXT or RESET_PC that targets its own slot is the chain parking:
+@@ -3492,6 +3542,7 @@
+             /* Start a held job before parking; what is already on the lanes
+              * keeps running while the PPU appends (parking is not a barrier). */
+             jc_par_release(jp);
++            JC_WD(1, pc, 0);
+             while (vm_read64(pc) == cmd) {
+                 if (t_jc_stop && *t_jc_stop) return;
+                 if (++spins < 200) SwitchToThread(); else Sleep(1);
+@@ -3527,6 +3578,7 @@
+             u64 pg0 = pon ? jc_now_ns() : 0;
+             /* A held job starts now: it must not wait on the guard. */
+             jc_par_release(jp);
++            JC_WD(2, pc, g_ea);
+             if (!jg_wait(g_ea)) return;                  /* still closed */
+             if (pon) prof.guard_ns += jc_now_ns() - pg0;
+             pc += 8; continue;
+@@ -3556,13 +3608,19 @@
+     { const char* d = getenv("SPURS_JC_DELAY");
+       if (d && *d) Sleep((unsigned)atoi(d)); }
+     t_jc_stop = &s_jobchains[slot].stop;
+-    jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
++    t_jc_slot = slot;
++    const u32 jc_ea = s_jobchains[slot].jc_ea;
++    jc_execute(s_jobchains[slot].entry_ea, jc_ea,
+                s_jobchains[slot].size_desc);
++    JC_WD(4, 0, 0);
+     t_jc_stop = NULL;
++    t_jc_slot = -1;
+     s_jobchains[slot].running = 0;
+     /* Tell the application the chain is done. Without this the walk finishes
+-     * in silence and a thread waiting on the attached queue never runs again. */
+-    jc_signal_done(s_jobchains[slot].jc_ea, -1);
++     * in silence and a thread waiting on the attached queue never runs again.
++     * The slot is still ours (Join frees it only once walker_live drops). */
++    jc_signal_done(jc_ea, -1);
++    _InterlockedExchange(&s_jobchains[slot].walker_live, 0);
+     return 0;
+ }
+ 
+@@ -3595,10 +3653,13 @@
+         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
+         /* Coalesce: a chain already being walked must not start twice. */
+         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
++            /* The previous walker may still be in its final jc_signal_done. */
++            while (jc_reclaim_on() && s_jobchains[i].walker_live) Sleep(0);
+             s_jobchains[i].stop = 0;
++            s_jobchains[i].walker_live = 1;
+             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
+             if (th) CloseHandle(th);
+-            else s_jobchains[i].running = 0;
++            else { s_jobchains[i].walker_live = 0; s_jobchains[i].running = 0; }
+         }
+         return CELL_OK;
+     }
+@@ -3668,10 +3729,55 @@
+             usleep(0);
+ #endif
+         }
++        /* A joined chain is finished for good (real SPURS removes its
++         * workload; the title must Create again to reuse the memory), so the
++         * slot goes back to the registry. See JC_RECLAIM. */
++        if (jc_reclaim_on() && s_jobchains[i].stop) {
++            while (s_jobchains[i].walker_live) Sleep(0);
++            if (s_jobchains[i].jc_ea == (u32)jc_ea && !s_jobchains[i].running) {
++                static int _f = 0;
++                if (PS3_LOG_FIRST(_f, 4))
++                    fprintf(stderr, "[cellSpurs] JoinJobChain(jc=0x%08X): slot %d freed\n",
++                            (u32)jc_ea, i);
++                s_jobchains[i].jc_ea = 0;
++                s_jobchains[i].entry_ea = 0;
++                s_jobchains[i].run_count = 0;
++                s_jobchains[i].stop = 0;
++            }
++        }
+     }
+     return CELL_OK;
+ }
+ 
++/* HANG_WD dump (called by the flip watchdog in cellGcmSys.c): every registered
++ * chain, whether a walker is on it, and where that walker is. */
++void spurs_wd_dump(void)
++{
++    static const char* st[] = { "walk", "PARKED", "GUARD", "barrier", "done" };
++    int used = 0;
++    for (int i = 0; i < MAX_JOBCHAINS; i++) {
++        if (!s_jobchains[i].jc_ea && !s_jobchains[i].walker_live) continue;
++        used++;
++        int g = s_jobchains[i].wd_state;
++        u32 aux = s_jobchains[i].wd_aux, pc = s_jobchains[i].wd_pc;
++        fprintf(stderr, "[WATCHDOG]   jc slot %3d ea=0x%08X spurs=0x%08X runs=%d running=%ld "
++                "live=%ld stop=%ld state=%s pc=0x%08X cmd=0x%016llX",
++                i, s_jobchains[i].jc_ea, s_jobchains[i].spurs_ea, s_jobchains[i].run_count,
++                (long)s_jobchains[i].running, (long)s_jobchains[i].walker_live,
++                (long)s_jobchains[i].stop, (g >= 0 && g <= 4) ? st[g] : "?", pc,
++                (unsigned long long)(pc ? vm_read64(pc) : 0));
++        if (g == 2) {
++            int k = jg_find(aux);
++            if (k >= 0)
++                fprintf(stderr, " guard=0x%08X count=%u pending=%u reset=%u",
++                        aux, s_jobguards[k].count, s_jobguards[k].pending, s_jobguards[k].reset);
++        }
++        fprintf(stderr, "\n");
++    }
++    fprintf(stderr, "[WATCHDOG]   job chains registered: %d, Create calls refused (registry full): %ld, "
++            "JC_RECLAIM=%d\n", used, (long)s_jc_full_count, jc_reclaim_on());
++}
++
+ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
+ {
+     static int _n = 0;
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -105,6 +105,55 @@
+ {
+     return s_flip_request_count;
+ }
++
++/* HANG_WD=<s>: once guest flips have stopped for <s> seconds, dump every guest
++ * thread (guest lr, the lv2 syscall or HLE it is inside, with its object id)
++ * and every SPURS job chain walker, then again at 2x and 3x <s>. A load that
++ * never ends leaves the vblank ticker and audio running, so "no flip" is the
++ * one signal that names the stall. Started on the first flip. */
++#ifdef _WIN32
++extern void ppu_report_hang(void);   /* ppu_loader.cpp */
++extern void spurs_wd_dump(void);     /* cellSpurs.c */
++static DWORD WINAPI gcm_hang_wd(LPVOID p)
++{
++    const unsigned long long lim = (unsigned long long)(uintptr_t)p * 1000ull;
++    u32 last = s_flip_request_count;
++    unsigned long long since = GetTickCount64();
++    int dumps = 0;
++    for (;;) {
++        Sleep(500);
++        u32 c = s_flip_request_count;
++        unsigned long long now = GetTickCount64();
++        if (c != last) {
++            if (dumps) fprintf(stderr, "[WATCHDOG] flips resumed after %llums (flips=%u)\n",
++                               now - since, c);
++            last = c; since = now; dumps = 0; continue;
++        }
++        if (dumps < 3 && now - since >= lim * (unsigned long long)(dumps + 1)) {
++            dumps++;
++            fprintf(stderr, "[WATCHDOG] no guest flip for %llums (flips=%u), dump %d\n",
++                    now - since, c, dumps);
++            ppu_report_hang();
++            spurs_wd_dump();
++            fflush(stderr);
++        }
++    }
++    return 0;
++}
++static void gcm_hang_wd_start(void)
++{
++    static volatile long started = 0;
++    if (started || InterlockedCompareExchange(&started, 1, 0) != 0) return;
++    const char* e = getenv("HANG_WD");
++    int s = e ? atoi(e) : 0;
++    if (s <= 0) return;
++    fprintf(stderr, "[WATCHDOG] flip watchdog armed: %ds\n", s);
++    HANDLE h = CreateThread(NULL, 0, gcm_hang_wd, (LPVOID)(uintptr_t)s, 0, NULL);
++    if (h) CloseHandle(h);
++}
++#else
++static void gcm_hang_wd_start(void) {}
++#endif
+ static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+ 
+ /* Display buffers */
+@@ -2653,6 +2702,7 @@
+                 gcm_set_current_display_buffer(w & 7u);
+                 s_flip_pending = 1;
+                 s_flip_request_count++;
++                gcm_hang_wd_start();
+                 /* Not past `queued`: a resync may already have written off
+                  * this flip. */
+                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -996,6 +996,69 @@
+     fflush(stderr);
+ }
+ 
++/* HANG_WD: the lv2 syscall each guest thread is inside right now (num + 1;
++ * 0 = none), its first two arguments (the object id for most waits) and when
++ * it entered. g_hle_inflight covers HLE handlers; this covers the lv2 waits
++ * (mutex/cond/semaphore/event queue/event flag/join) that it cannot see.
++ * Unlocked, like ppu_report_guest_lrs: a torn read only garbles a log line. */
++#define PPU_SC_INFLIGHT_MAX 64
++extern "C" volatile uint32_t g_sc_inflight_num[PPU_SC_INFLIGHT_MAX] = {0};
++extern "C" volatile uint32_t g_sc_inflight_a3[PPU_SC_INFLIGHT_MAX] = {0};
++extern "C" volatile uint32_t g_sc_inflight_a4[PPU_SC_INFLIGHT_MAX] = {0};
++extern "C" volatile uint64_t g_sc_inflight_t0[PPU_SC_INFLIGHT_MAX] = {0};
++extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
++struct PpuScInflight {
++    unsigned t;
++    PpuScInflight(ppu_context* c, uint64_t num) : t((unsigned)c->thread_id) {
++        if (t < PPU_SC_INFLIGHT_MAX) {
++            g_sc_inflight_a3[t] = (uint32_t)c->gpr[3]; g_sc_inflight_a4[t] = (uint32_t)c->gpr[4];
++            g_sc_inflight_t0[t] = GetTickCount64(); g_sc_inflight_num[t] = (uint32_t)num + 1;
++        }
++    }
++    ~PpuScInflight() { if (t < PPU_SC_INFLIGHT_MAX) g_sc_inflight_num[t] = 0; }
++};
++
++static const char* ppu_sc_name(uint32_t n)
++{
++    switch (n) {
++    case 41: return "ppu_thread_exit"; case 44: return "ppu_thread_join";
++    case 82: return "event_flag_create"; case 85: return "event_flag_wait";
++    case 92: return "semaphore_wait"; case 94: return "semaphore_post";
++    case 95: return "lwmutex_create"; case 97: return "_lwmutex_lock";
++    case 98: return "_lwmutex_unlock"; case 102: return "mutex_lock";
++    case 104: return "mutex_unlock"; case 107: return "cond_wait";
++    case 108: return "cond_signal"; case 109: return "cond_signal_all";
++    case 113: return "_lwcond_queue_wait"; case 130: return "event_queue_receive";
++    case 138: return "event_port_send"; case 141: return "timer_usleep";
++    case 142: return "timer_sleep"; case 801: return "fs_open"; case 802: return "fs_read";
++    default: return "?";
++    }
++}
++
++/* Called by the flip watchdog (cellGcmSys.c) when presented flips stop. */
++extern "C" void ppu_report_hang(void)
++{
++    uint64_t now = GetTickCount64();
++    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
++    for (long i = 0; i < n; i++) {
++        ppu_context* c = g_resv_ctxs[i];
++        if (!c) continue;
++        unsigned t = (unsigned)c->thread_id;
++        char sc[160] = "";
++        if (t < PPU_SC_INFLIGHT_MAX && g_sc_inflight_num[t]) {
++            uint32_t s = g_sc_inflight_num[t] - 1;
++            snprintf(sc, sizeof sc, " IN sc %u %s(0x%X, 0x%X) for %llums", s, ppu_sc_name(s),
++                     g_sc_inflight_a3[t], g_sc_inflight_a4[t],
++                     (unsigned long long)(now - g_sc_inflight_t0[t]));
++        }
++        const char* h = t < 64u ? g_hle_inflight[t] : nullptr;
++        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X r3=0x%08X r4=0x%08X sp=0x%08X%s%s%s\n",
++                t, (uint32_t)c->lr, (uint32_t)c->gpr[3], (uint32_t)c->gpr[4], (uint32_t)c->gpr[1],
++                h ? " IN hle " : "", h ? h : "", sc);
++    }
++    fflush(stderr);
++}
++
+ /* Break every reservation on ea's word (real-PPC granule semantics on a store).
+  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
+  * recheck reads reserve_addr under its slot lock and the value-CAS backstops the
+@@ -3524,6 +3587,7 @@
+          * guest thread runs ~42,000 R3000 instructions in 30 ms, then parks in
+          * ntdll forever with no further [sc] line. The last ENTER without a
+          * matching exit names the call that blocked. */
++        PpuScInflight _sci(ctx, num);   /* HANG_WD: which lv2 call each thread sits in */
+         { static int _se = -1; if (_se < 0) _se = getenv("PS3_SCENTER") ? 1 : 0;
+           if (_se) { static unsigned long _n = 0;
+             fprintf(stderr, "[sc-enter] #%lu num=%llu tid=%u a3=0x%llX a4=0x%llX lr=0x%08X\n",
