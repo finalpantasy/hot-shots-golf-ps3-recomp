@@ -543,3 +543,5 @@ Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-f
 - 2026-11-18 18:43 run 38 (c43, worker a38f8763427d8f029): 0043 committed; 1 of 4 patched runs exited silently at ~255 s (open). UCS-2 port half sent to Codex.
 
 - 2026-11-18 19:16 run 39 (worker a44c8e1b9e6089462): silent exit = external taskkill by another chat matching ghost_launch; 0044 exit trace committed.
+
+- 2026-11-18 20:02 run 40 (menu survey, worker a1665996013dc4b22): title, main menu, Multiplayer, Customize, Shop, Select Character, Changing Room render ok. Hang A: load after Select Character (mn8) stops flips. Hang B (once): second Cross during Continue load. Yes/No dialog over main menu has empty message text. Worker a38911612677fdaa8 on hangs (0045).

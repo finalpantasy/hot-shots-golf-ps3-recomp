@@ -1,8 +1,7 @@
 diff --git a/tools/nid_database.py b/tools/nid_database.py
-index a52e592..fb16b05 100644
 --- a/tools/nid_database.py
 +++ b/tools/nid_database.py
-@@ -470,6 +471,20 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
+@@ -470,6 +471,79 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
      ("sceNp", "sceNpBasicGetEvent"),                         # 0xe035f7d6 x4
      ("sceNp", "sceNpBasicRegisterContextSensitiveHandler"),  # 0x4026eac5 x3
      ("sceNp", "sceNpDrmIsAvailable"),                        # 0xad218faf x4
@@ -18,8 +17,67 @@ index a52e592..fb16b05 100644
 +    ("cellFontFT", "cellFontInitLibraryFreeTypeWithRevision"),
 +    ("libgem", "cellGemGetImageState"),
 +    ("libgem", "cellGemPrepareCamera"),
++    ("cellHttp", "cellHttpTransactionAbortConnection"),
++    ("cellHttp", "cellHttpEndCookie"),
++    ("cellHttp", "cellHttpInitCookie"),
++    ("cellHttp", "cellHttpRequestSetContentLength"),
++    ("cellHttp", "cellHttpRequestAddHeader"),
++    ("sceNp", "sceNpBasicAddPlayersHistory"),
++    ("sceNp", "sceNpProfileAbortGui"),
++    ("sceNp", "sceNpManagerGetEntitlementById"),
++    ("sceNp", "sceNpScoreGetRankingByNpIdPcId"),
++    ("sceNp", "sceNpProfileCallGui"),
++    ("sceNp", "sceNpFriendlist"),
++    ("sceNp", "sceNpBasicGetBlockListEntry"),
++    ("sceNp", "sceNpScoreGetBoardInfo"),
++    ("sceNp", "sceNpFriendlistAbortGui"),
++    ("sceNp", "sceNpScoreGetRankingByRange"),
++    ("libgem", "cellGemGetTrackerHue"),
++    ("libgem", "cellGemConvertVideoFinish"),
++    ("libgem", "cellGemSetRumble"),
++    ("libgem", "cellGemConvertVideoStart"),
++    ("libgem", "cellGemPrepareVideoConvert"),
++    ("libgem", "cellGemForceRGB"),
++    ("libgem", "cellGemInvalidateCalibration"),
 +    ("cellCamera", "cellCameraGetBufferInfoEx"),
 +    ("sys_crashdump", "sys_crash_dump_set_user_log_area"),
++    # cellSail imports of Hot Shots Golf (fix 1.02) that had no name; each
++    # confirmed by hashing the export names in RPCS3 cellSail.cpp.
++    ("cellSail", "cellSailSoundAdapterSetPreferredFormat"),  # 0x1c9d5e5a
++    ("cellSail", "cellSailAuReceiverInitialize"),            # 0x3dd9639a
++    ("cellSail", "cellSailAuReceiverFinalize"),              # 0xed58e3ec
++    ("cellSail", "cellSailPlayerSetAuReceiver"),             # 0xf5747e1f
++    ("cellSail", "cellSailPlayerSetPaused"),                 # 0xd1d55a90
++    ("cellOskExtUtility", "cellOskDialogExtInputDeviceLock"),
++    ("cellOskExtUtility", "cellOskDialogExtInputDeviceUnlock"),
++    ("cellOskExtUtility", "cellOskDialogExtSetInitialScale"),
++    ("cellOskExtUtility", "cellOskDialogExtRegisterForceFinishCallback"),
++    ("cellMic", "cellMicRemoveNotifyEventQueue"),
++    ("cellMic", "cellMicSetNotifyEventQueue"),
++    ("cellVideoExportUtility", "cellVideoExportInitialize2"),
++    ("cellVideoExportUtility", "cellVideoExportFromFile"),
++    ("cellVideoExportUtility", "cellVideoExportFinalize"),
++    ("sys_io", "cellPadLddRegisterController"),
++    ("sys_io", "cellPadLddGetPortNo"),
++    ("sys_io", "cellPadLddDataInsert"),
++    ("sys_io", "cellPadLddUnregisterController"),
++    ("cellL10n", "UCS2stoUTF8s"),
++    ("cellL10n", "UTF8stoUCS2s"),
++    ("cellRtc", "cellRtcFormatRfc3339LocalTime"),
++    ("cellRtc", "cellRtcTickAddWeeks"),
++    ("cellRtc", "cellRtcParseDateTime"),
++    ("cellSsl", "cellSslCertGetRsaPublicKeyExponent"),
++    ("cellSsl", "cellSslCertGetSubjectName"),
++    ("cellSsl", "cellSslCertGetMd5Fingerprint"),
++    ("cellSsl", "cellSslCertGetRsaPublicKeyModulus"),
++    ("cellSsl", "cellSslCertGetIssuerName"),
++    ("sceNpTus", "sceNpTusSetMultiSlotVariableAsync"),
++    ("sceNpTus", "sceNpTusGetMultiSlotVariableAsync"),
++    ("sceNpTus", "sceNpTusTryAndSetVariableAsync"),
++    ("cellSysutil", "cellWebBrowserWakeupWithGameExit"),
++    ("cellSysutil", "cellOskDialogDisableDimmer"),
++    ("cellSysutil", "cellOskDialogAddSupportLanguage"),
++    ("sys_net", "inet_aton"),
  ]
  
  # ---------------------------------------------------------------------------

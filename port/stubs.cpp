@@ -21,8 +21,14 @@
 #include "../external/ps3recomp/libs/font/cellFont.h"
 #include "../external/ps3recomp/libs/font/cellFontFT.h"
 #include "../external/ps3recomp/libs/network/cellHttp.h"
+#include "../external/ps3recomp/libs/network/sceNp.h"
+#include "../external/ps3recomp/libs/network/sysNet.h"
+#include "../external/ps3recomp/libs/system/cellRtc.h"
+#include "win32_compat.h"
+#include "../external/ps3recomp/libs/hardware/cellGem.h"
 
 extern "C" {
+extern u8* vm_base;
 void ps3_hle_register(u32 nid, const char* name, void* function);
 void ps3_hle_register_ctx(u32 nid, const char* name, void (*function)(ppu_context*));
 u32 vm_read32(u64 address);
@@ -41,6 +47,43 @@ static T* guest_arg(const ppu_context* ctx, unsigned reg)
     return reinterpret_cast<T*>(static_cast<uintptr_t>(static_cast<u32>(ctx->gpr[reg])));
 }
 
+static bool rtc_tick_accessible(u32 address, DWORD accepted_protections)
+{
+    if (!vm_base || !address || address > UINT32_MAX - (sizeof(CellRtcTick) - 1))
+        return false;
+
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(vm_base) + address;
+    const uintptr_t end = cursor + sizeof(CellRtcTick);
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION page{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &page, sizeof(page)) ||
+            page.State != MEM_COMMIT || (page.Protect & PAGE_GUARD) || !(page.Protect & accepted_protections))
+            return false;
+        cursor = reinterpret_cast<uintptr_t>(page.BaseAddress) + page.RegionSize;
+    }
+    return true;
+}
+
+static void hle_rtc_tick_add_weeks(ppu_context* ctx)
+{
+    constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    constexpr DWORD readable = writable | PAGE_READONLY | PAGE_EXECUTE_READ;
+    constexpr s32 invalid_pointer = static_cast<s32>(0x80010602u);
+    if (!rtc_tick_accessible(static_cast<u32>(ctx->gpr[3]), writable) ||
+        !rtc_tick_accessible(static_cast<u32>(ctx->gpr[4]), readable)) {
+        ctx->gpr[3] = static_cast<u64>(static_cast<s64>(invalid_pointer));
+        return;
+    }
+
+    constexpr u64 microseconds_per_week = 7ull * 24 * 60 * 60 * 1000000;
+    const auto weeks = static_cast<s32>(ctx->gpr[5]);
+    const u64 delta = static_cast<u64>(weeks) * microseconds_per_week;
+    const s32 result = cellRtcTickAddMicroseconds(guest_arg<CellRtcTick>(ctx, 3), guest_arg<const CellRtcTick>(ctx, 4),
+                                                static_cast<s64>(delta));
+    ctx->gpr[3] = static_cast<u64>(static_cast<s64>(result));
+}
+
+
 extern "C" void ps3_register_peripheral_imports(void)
 {
 #define REGISTER(name) ps3_hle_register(ps3_compute_nid(#name), #name, reinterpret_cast<void*>(name))
@@ -50,15 +93,40 @@ extern "C" void ps3_register_peripheral_imports(void)
     REGISTER(cellHttpClientSetSendTimeout);
     REGISTER(cellHttpClientSetUserAgent);
     REGISTER(cellHttpClientSetConnTimeout);
+    REGISTER(cellHttpInitCookie);
+    REGISTER(cellHttpEndCookie);
+    REGISTER(cellHttpTransactionAbortConnection);
+    REGISTER(cellHttpRequestSetContentLength);
+    REGISTER(cellHttpRequestAddHeader);
     REGISTER(sceNpCustomMenuRegisterActions);
     REGISTER(sceNpCustomMenuActionSetActivation);
+    REGISTER(sceNpBasicAddPlayersHistory);
+    REGISTER(sceNpBasicGetBlockListEntry);
+    REGISTER(sceNpProfileCallGui);
+    REGISTER(sceNpProfileAbortGui);
+    REGISTER(sceNpFriendlist);
+    REGISTER(sceNpFriendlistAbortGui);
+    REGISTER(sceNpManagerGetEntitlementById);
+    REGISTER(sceNpScoreGetBoardInfo);
     REGISTER(cellFontEndLibrary);
     REGISTER(cellFontInitLibraryFreeTypeWithRevision);
     REGISTER(cellGemGetImageState);
+    REGISTER(cellGemGetTrackerHue);
+    REGISTER(cellGemConvertVideoFinish);
+    REGISTER(cellGemConvertVideoStart);
+    REGISTER(cellGemPrepareVideoConvert);
+    REGISTER(cellGemSetRumble);
+    REGISTER(cellGemInvalidateCalibration);
     REGISTER(cellCameraGetBufferInfoEx);
     REGISTER(sys_crash_dump_set_user_log_area);
     REGISTER(sys_crash_dump_get_user_log_area);
 
+    REGISTER_CONTEXT(cellRtcTickAddWeeks, hle_rtc_tick_add_weeks);
+
+    /* Address conversion works with the offline socket backend. */
+    REGISTER_CONTEXT(inet_aton, [](ppu_context* ctx) {
+        ctx->gpr[3] = sys_net_bnet_inet_aton(guest_arg<const char>(ctx, 3), guest_arg<u32>(ctx, 4));
+    });
     REGISTER_CONTEXT(cellFontRenderSurfaceInit, [](ppu_context* ctx) {
         cellFontRenderSurfaceInit(guest_arg<CellFontRenderSurface>(ctx, 3), guest_arg<void>(ctx, 4),
                                   static_cast<s32>(ctx->gpr[5]), static_cast<s32>(ctx->gpr[6]),
@@ -66,6 +134,10 @@ extern "C" void ps3_register_peripheral_imports(void)
     });
     REGISTER_CONTEXT(cellGemPrepareCamera, [](ppu_context* ctx) {
         ctx->gpr[3] = cellGemPrepareCamera(static_cast<s32>(ctx->gpr[3]), ctx->fpr[1]);
+    });
+    REGISTER_CONTEXT(cellGemForceRGB, [](ppu_context* ctx) {
+        ctx->gpr[3] = cellGemForceRGB(static_cast<u32>(ctx->gpr[3]),
+                                       ctx->fpr[1], ctx->fpr[2], ctx->fpr[3]);
     });
 
     // The generic HLE adapter only passes integer registers. Float parameters
@@ -87,6 +159,7 @@ extern "C" void ps3_register_peripheral_imports(void)
     });
     REGISTER_CONTEXT(cellFontCreateRenderer, [](ppu_context* ctx) {
         ctx->gpr[3] = cellFontCreateRenderer(static_cast<u32>(ctx->gpr[3]),
+                                            guest_arg<const void>(ctx, 4),
                                             guest_arg<CellFontRenderer>(ctx, 5));
     });
     REGISTER_CONTEXT(cellFontDestroyRenderer, [](ppu_context* ctx) {

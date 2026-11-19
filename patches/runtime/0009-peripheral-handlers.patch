@@ -1,18 +1,20 @@
 diff --git a/libs/font/cellFont.c b/libs/font/cellFont.c
-index 4e239b5..d3ecf5a 100644
+index 4e239b5..4aca5e5 100644
 --- a/libs/font/cellFont.c
 +++ b/libs/font/cellFont.c
-@@ -7,7 +7,9 @@
+@@ -7,7 +7,11 @@
   */
  
  #include "cellFont.h"
 +#include "cellFontFT.h"
++#include "ps3emu/milestone.h"
  #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
 +#include "../../runtime/platform/ps3_dev_flash.h"
++#include "../../runtime/syscalls/sys_memory.h"
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
-@@ -39,6 +41,7 @@ typedef struct {
+@@ -39,6 +43,7 @@ typedef struct {
      float   effect_weight;
      float   effect_slant;
      u32     renderer;       /* bound renderer index, or 0xFFFFFFFF */
@@ -20,16 +22,44 @@ index 4e239b5..d3ecf5a 100644
      /* Font data */
      u8*     font_data;      /* TTF file data (owned if loaded from file) */
      u32     font_data_size;
-@@ -51,6 +54,7 @@ typedef struct {
+@@ -51,6 +56,10 @@ typedef struct {
  
  typedef struct {
      int in_use;
 +    CellFontLibrary library;
++    u32 buffer;
++    u32 capacity;
++    int owns_buffer;
  } RendererSlot;
  
  static int          s_font_initialized = 0;
-@@ -97,13 +101,32 @@ enum {
+@@ -58,6 +67,21 @@ static u32          s_open_mode = CELL_FONT_OPEN_MODE_DEFAULT;
+ static FontSlot     s_fonts[CELL_FONT_MAX_OPENED];
+ static RendererSlot s_renderers[CELL_FONT_MAX_RENDERERS];
+ 
++static s32 font_release_renderer(u32 index)
++{
++    RendererSlot* renderer = &s_renderers[index];
++    if (renderer->owns_buffer) {
++        ppu_context release = {0};
++        release.gpr[3] = renderer->buffer;
++        if (sys_memory_free(&release) != CELL_OK) return CELL_FONT_ERROR_FATAL;
++    }
++    *renderer = (RendererSlot){0};
++    for (u32 i = 0; i < CELL_FONT_MAX_OPENED; ++i)
++        if (s_fonts[i].in_use && s_fonts[i].renderer == index)
++            s_fonts[i].renderer = 0xFFFFFFFF;
++    return CELL_OK;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Helpers
+  * -----------------------------------------------------------------------*/
+@@ -95,15 +119,35 @@ static FontSlot* font_alloc_slot(void)
+  * -----------------------------------------------------------------------*/
+ enum {
      FONT_O_HANDLE = 0,  FONT_O_TYPE = 4,  FONT_O_SCALEX = 8, FONT_O_SCALEY = 12,
++    RENDER_CFG_O_BUFFER = 0, RENDER_CFG_O_INIT = 4, RENDER_CFG_O_MAX = 8,
      SURF_O_BUFFER = 0,  SURF_O_WIDTHBYTE = 4, SURF_O_PIXELSIZE = 8,
      SURF_O_WIDTH  = 12, SURF_O_HEIGHT = 16,
 -    IMG_O_BUFFER  = 0,  IMG_O_WIDTHBYTE = 4,  IMG_O_PIXELSIZE = 8,
@@ -63,8 +93,14 @@ index 4e239b5..d3ecf5a 100644
  /* CellFontGlyphMetrics is eight consecutive floats in guest order. */
  static void font_metrics_store(CellFontGlyphMetrics* guest_ea,
                                 const CellFontGlyphMetrics* h)
-@@ -134,18 +157,17 @@ static void font_surface_load(CellFontRenderSurface* h,
+@@ -132,20 +176,23 @@ static void font_surface_load(CellFontRenderSurface* h,
+     h->pixelSizeByte = (s32)vm_read32(ea + SURF_O_PIXELSIZE);
+     h->width         = (s32)vm_read32(ea + SURF_O_WIDTH);
      h->height        = (s32)vm_read32(ea + SURF_O_HEIGHT);
++    h->sc_x0         = vm_read32(ea + SURF_O_X0);
++    h->sc_y0         = vm_read32(ea + SURF_O_Y0);
++    h->sc_x1         = vm_read32(ea + SURF_O_X1);
++    h->sc_y1         = vm_read32(ea + SURF_O_Y1);
  }
  
 -/* buffer is left as the title set it -- we render into the surface, never
@@ -90,7 +126,19 @@ index 4e239b5..d3ecf5a 100644
  }
  
  static void font_store(CellFont* guest_ea, u32 handle, u32 type,
-@@ -226,13 +248,26 @@ s32 cellFontEnd(void)
+@@ -216,6 +263,11 @@ s32 cellFontEnd(void)
+     if (!s_font_initialized)
+         return CELL_FONT_ERROR_UNINITIALIZED;
+ 
++    for (u32 i = 0; i < CELL_FONT_MAX_RENDERERS; ++i) {
++        if (!s_renderers[i].in_use) continue;
++        s32 rc = font_release_renderer(i);
++        if (rc) return rc;
++    }
+     for (int i = 0; i < CELL_FONT_MAX_OPENED; i++) {
+         if (s_fonts[i].in_use && s_fonts[i].font_data_owned && s_fonts[i].font_data)
+             free(s_fonts[i].font_data);
+@@ -226,13 +278,28 @@ s32 cellFontEnd(void)
      return CELL_OK;
  }
  
@@ -101,6 +149,11 @@ index 4e239b5..d3ecf5a 100644
 -    (void)uniqueId;
 -    fontPath = GUEST_PTR(fontPath, const char*);
 -    printf("[cellFont] OpenFontFile(%s)\n", fontPath ? fontPath : "(null)");
++    for (u32 i = 0; i < CELL_FONT_MAX_RENDERERS; ++i) {
++        if (!s_renderers[i].in_use || s_renderers[i].library != lib) continue;
++        s32 rc = font_release_renderer(i);
++        if (rc) return rc;
++    }
 +    s32 result = cellFontFTReleaseLibrary(lib);
 +    if (result) return result;
 +    for (u32 i = 0; i < CELL_FONT_MAX_OPENED; ++i) {
@@ -109,9 +162,6 @@ index 4e239b5..d3ecf5a 100644
 +            if (slot->font_data_owned) free(slot->font_data);
 +            slot->in_use = 0;
 +        }
-+    }
-+    for (u32 i = 0; i < CELL_FONT_MAX_RENDERERS; ++i) {
-+        if (s_renderers[i].library == lib) s_renderers[i].in_use = 0;
 +    }
 +    return CELL_OK;
 +}
@@ -122,7 +172,7 @@ index 4e239b5..d3ecf5a 100644
      if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
      if (!font || !fontPath)  return CELL_FONT_ERROR_INVALID_PARAMETER;
  
-@@ -250,6 +285,11 @@ s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 u
+@@ -250,6 +317,11 @@ s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 u
      fseek(f, 0, SEEK_END);
      long size = ftell(f);
      fseek(f, 0, SEEK_SET);
@@ -134,7 +184,7 @@ index 4e239b5..d3ecf5a 100644
  
      slot->font_data = (u8*)malloc((size_t)size);
      if (!slot->font_data) {
-@@ -263,20 +303,31 @@ s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 u
+@@ -263,20 +335,31 @@ s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 u
      fclose(f);
  
  #if FONT_HAS_STB
@@ -173,7 +223,7 @@ index 4e239b5..d3ecf5a 100644
  s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 subNum, s32 uniqueId)
  {
      (void)subNum;
-@@ -309,23 +360,30 @@ s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 s
+@@ -309,23 +392,30 @@ s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 s
  
  s32 cellFontOpenFontset(CellFontLibrary lib, CellFontType* fontType, CellFont* font)
  {
@@ -210,7 +260,7 @@ index 4e239b5..d3ecf5a 100644
 +    case CELL_FONT_TYPE_SEURAT_MARU_GOTHIC_LATIN2: file = "SCE-PS3-SR-R-LATIN2.TTF"; break;
 +    default:
 +        printf("[cellFont] Unsupported firmware font set 0x%X\n", type);
-+        return (s32)0x80540008; /* CELL_FONT_ERROR_NO_SUPPORT_FONTSET */
++        return (s32)CELL_FONT_ERROR_NO_SUPPORT_FONTSET;
 +    }
 +    char relative[128], path[1024];
 +    snprintf(relative, sizeof(relative), "data/font/%s", file);
@@ -220,35 +270,132 @@ index 4e239b5..d3ecf5a 100644
  }
  
  s32 cellFontCloseFont(CellFont* font)
-@@ -350,13 +408,13 @@ s32 cellFontSetFontOpenMode(u32 openMode)
+@@ -348,30 +438,50 @@ s32 cellFontSetFontOpenMode(u32 openMode)
+     return CELL_OK;
+ }
  
- s32 cellFontCreateRenderer(CellFontLibrary lib, CellFontRenderer* renderer)
+-s32 cellFontCreateRenderer(CellFontLibrary lib, CellFontRenderer* renderer)
++s32 cellFontCreateRenderer(CellFontLibrary lib, const void* config, CellFontRenderer* renderer)
  {
 -    (void)lib;
      if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
-     if (!renderer) return CELL_FONT_ERROR_INVALID_PARAMETER;
+-    if (!renderer) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    if (!lib || !config || !renderer) return CELL_FONT_ERROR_INVALID_PARAMETER;
++
++    const u32 cfg = FONT_EA(config);
++    const u32 initial = vm_read32(cfg + RENDER_CFG_O_INIT);
++    const u32 maximum = vm_read32(cfg + RENDER_CFG_O_MAX);
++    u32 buffer = vm_read32(cfg + RENDER_CFG_O_BUFFER);
++    if ((maximum && initial > maximum) || (buffer && !initial) ||
++        (buffer && (u64)buffer + initial > UINT64_C(0x100000000)))
++        return CELL_FONT_ERROR_INVALID_PARAMETER;
  
-     for (u32 i = 0; i < CELL_FONT_MAX_RENDERERS; i++) {
-         if (!s_renderers[i].in_use) {
-             s_renderers[i].in_use = 1;
-+            s_renderers[i].library = lib;
-             vm_write32(FONT_EA(renderer), i);
-             return CELL_OK;
+-    for (u32 i = 0; i < CELL_FONT_MAX_RENDERERS; i++) {
+-        if (!s_renderers[i].in_use) {
+-            s_renderers[i].in_use = 1;
+-            vm_write32(FONT_EA(renderer), i);
+-            return CELL_OK;
++    /* Caller storage is bounded by its initial size. Allocate renderer storage
++     * once up to the configured limit so transfers stay in guest memory. */
++    const u32 capacity = buffer || !maximum ? initial : maximum;
++    for (u32 i = 0; i < CELL_FONT_MAX_RENDERERS; ++i) {
++        if (s_renderers[i].in_use) continue;
++
++        int owns_buffer = !buffer && capacity;
++        if (owns_buffer) {
++            ppu_context allocate = {0};
++            allocate.gpr[3] = capacity;
++            allocate.gpr[4] = SYS_MEMORY_PAGE_SIZE_64K;
++            allocate.gpr[5] = FONT_EA(renderer);
++            if (sys_memory_allocate(&allocate) != CELL_OK)
++                return CELL_FONT_ERROR_RENDERER_ALLOCATION_FAILED;
++            buffer = vm_read32(FONT_EA(renderer));
          }
-@@ -559,31 +617,44 @@ s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
++        s_renderers[i] = (RendererSlot){1, lib, buffer, capacity, owns_buffer};
++        vm_write32(FONT_EA(renderer), i);
++        return CELL_OK;
+     }
+ 
+-    return CELL_FONT_ERROR_ALLOCATION_FAILED;
++    return CELL_FONT_ERROR_RENDERER_ALLOCATION_FAILED;
+ }
+ 
+ s32 cellFontDestroyRenderer(CellFontRenderer renderer)
+ {
+     if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+-    if (renderer >= CELL_FONT_MAX_RENDERERS) return CELL_FONT_ERROR_INVALID_PARAMETER;
++    if (renderer >= CELL_FONT_MAX_RENDERERS || !s_renderers[renderer].in_use)
++        return CELL_FONT_ERROR_RENDERER_INVALID;
+ 
+-    s_renderers[renderer].in_use = 0;
+-    return CELL_OK;
++    return font_release_renderer(renderer);
+ }
+ 
+ s32 cellFontBindRenderer(CellFont* font, CellFontRenderer renderer)
+@@ -401,21 +511,26 @@ s32 cellFontUnbindRenderer(CellFont* font)
+     return CELL_OK;
+ }
+ 
+-s32 cellFontSetScalePixel(CellFont* font, float w, float h)
++static s32 font_set_scale(CellFont* font, float w, float h, int inherit_zero)
+ {
+     if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
+ 
+     FontSlot* slot = font_get_slot(font);
+     if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
+ 
+-    slot->scale_x = w;
+-    slot->scale_y = h;
+-    vm_write_f32(FONT_EA(font) + FONT_O_SCALEX, w);
+-    vm_write_f32(FONT_EA(font) + FONT_O_SCALEY, h);
++    if (!inherit_zero || w != 0.0f) slot->scale_x = w;
++    if (!inherit_zero || h != 0.0f) slot->scale_y = h;
++    vm_write_f32(FONT_EA(font) + FONT_O_SCALEX, slot->scale_x);
++    vm_write_f32(FONT_EA(font) + FONT_O_SCALEY, slot->scale_y);
+ 
+     return CELL_OK;
+ }
+ 
++s32 cellFontSetScalePixel(CellFont* font, float w, float h)
++{
++    return font_set_scale(font, w, h, 0);
++}
++
+ s32 cellFontSetEffectWeight(CellFont* font, float weight)
+ {
+     FontSlot* slot = font_get_slot(font);
+@@ -559,58 +674,91 @@ s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
  
      CellFontRenderSurface hs;
      font_surface_load(&hs, surface);
 +    font_image_store(image, 0, 0, 0, 0, 0);
-+    if (!hs.buffer || hs.width <= 0 || hs.height <= 0 || hs.pixelSizeByte <= 0 ||
++    if (hs.width <= 0 || hs.height <= 0 || hs.pixelSizeByte <= 0 ||
 +        (s64)hs.width * hs.pixelSizeByte > hs.widthByte || !isfinite(x) || !isfinite(y))
 +        return CELL_FONT_ERROR_INVALID_PARAMETER;
-+    u32 buffer = (u32)(hs.buffer - vm_base);
-+    if ((u64)buffer + (u64)hs.widthByte * hs.height > UINT64_C(0x100000000))
++
++    const u64 surface_size = (u64)hs.widthByte * hs.height;
++    const int uses_renderer_buffer = !hs.buffer;
++    if (uses_renderer_buffer) {
++        if (slot->renderer >= CELL_FONT_MAX_RENDERERS || !s_renderers[slot->renderer].in_use)
++            return CELL_FONT_ERROR_RENDERER_UNBIND;
++        RendererSlot* renderer = &s_renderers[slot->renderer];
++        if (!renderer->buffer || surface_size > renderer->capacity)
++            return CELL_FONT_ERROR_ENOUGH_RENDERING_BUFFER;
++        hs.buffer = vm_base + renderer->buffer;
++    }
++    const u32 buffer = (u32)(hs.buffer - vm_base);
++    if ((u64)buffer + surface_size > UINT64_C(0x100000000))
 +        return CELL_FONT_ERROR_INVALID_PARAMETER;
  
  #if FONT_HAS_STB
      if (slot->stb_valid && hs.buffer) {
++        const int clip_x0 = hs.sc_x0 > (u32)hs.width ? hs.width : (int)hs.sc_x0;
++        const int clip_y0 = hs.sc_y0 > (u32)hs.height ? hs.height : (int)hs.sc_y0;
++        const int clip_x1 = hs.sc_x1 > (u32)hs.width ? hs.width : (int)hs.sc_x1;
++        const int clip_y1 = hs.sc_y1 > (u32)hs.height ? hs.height : (int)hs.sc_y1;
++        if (clip_x0 >= clip_x1 || clip_y0 >= clip_y1) return CELL_OK;
++
          float scale = font_get_stb_scale(slot);
          int glyph = stbtt_FindGlyphIndex(&slot->stb_info, (int)code);
 -        if (glyph == 0) goto done;
@@ -258,50 +405,70 @@ index 4e239b5..d3ecf5a 100644
          u8* bitmap = stbtt_GetGlyphBitmap(&slot->stb_info, scale, scale,
                                             glyph, &bw, &bh, &bx, &by);
 -        if (!bitmap) goto done;
-+        if (!bitmap) return CELL_OK;
- 
-         /* Blit glyph bitmap to surface */
+-
+-        /* Blit glyph bitmap to surface */
 -        int dx = (int)(x + hm.h_bearing_x);
 -        int dy = (int)(y - hm.h_bearing_y);
+-
+-        for (int row = 0; row < bh; row++) {
+-            int sy = dy + row;
+-            if (sy < 0 || sy >= hs.height) continue;
+-            for (int col = 0; col < bw; col++) {
+-                int sx = dx + col;
+-                if (sx < 0 || sx >= hs.width) continue;
+-                u8 alpha = bitmap[row * bw + col];
+-                if (alpha > 0) {
+-                    int offset = sy * hs.widthByte + sx * hs.pixelSizeByte;
+-                    /* Alpha-blend (simple overwrite for alpha-only surface) */
+-                    hs.buffer[offset] = alpha;
++        if (!bitmap) return CELL_OK;
++
++        /* The draw position is relative to the line origin. */
++        int ascent;
++        stbtt_GetFontVMetrics(&slot->stb_info, &ascent, NULL, NULL);
 +        double left = (double)x + hm.h_bearing_x;
-+        double top = (double)y - hm.h_bearing_y;
-+        if (left <= -bw || top <= -bh || left >= hs.width || top >= hs.height) {
++        double top = (double)y + (double)ascent * scale + by;
++        if (left <= (double)clip_x0 - bw || top <= (double)clip_y0 - bh ||
++            left >= clip_x1 || top >= clip_y1) {
 +            stbtt_FreeBitmap(bitmap, NULL);
 +            return CELL_OK;
 +        }
 +        int dx = (int)left;
 +        int dy = (int)top;
- 
-         for (int row = 0; row < bh; row++) {
--            int sy = dy + row;
-+            s64 sy = (s64)dy + row;
-             if (sy < 0 || sy >= hs.height) continue;
-             for (int col = 0; col < bw; col++) {
--                int sx = dx + col;
-+                s64 sx = (s64)dx + col;
-                 if (sx < 0 || sx >= hs.width) continue;
-                 u8 alpha = bitmap[row * bw + col];
-                 if (alpha > 0) {
--                    int offset = sy * hs.widthByte + sx * hs.pixelSizeByte;
-+                    size_t offset = (size_t)sy * hs.widthByte + (size_t)sx * hs.pixelSizeByte;
-                     /* Alpha-blend (simple overwrite for alpha-only surface) */
-                     hs.buffer[offset] = alpha;
++        s64 right = (s64)dx + bw;
++        s64 bottom = (s64)dy + bh;
++        int draw_x0 = dx < clip_x0 ? clip_x0 : dx;
++        int draw_y0 = dy < clip_y0 ? clip_y0 : dy;
++        int draw_x1 = right > clip_x1 ? clip_x1 : (int)right;
++        int draw_y1 = bottom > clip_y1 ? clip_y1 : (int)bottom;
++
++        if (draw_x0 < draw_x1 && draw_y0 < draw_y1) {
++            if (uses_renderer_buffer) memset(hs.buffer, 0, (size_t)surface_size);
++            int wrote_pixels = 0;
++            for (int sy = draw_y0; sy < draw_y1; ++sy) {
++                const u8* source = bitmap + (size_t)(sy - dy) * bw;
++                u8* destination = hs.buffer + (size_t)sy * hs.widthByte;
++                for (int sx = draw_x0; sx < draw_x1; ++sx) {
++                    u8 alpha = source[sx - dx];
++                    if (alpha) {
++                        destination[(size_t)sx * hs.pixelSizeByte] = alpha;
++                        wrote_pixels = 1;
++                    }
                  }
-@@ -592,22 +663,18 @@ s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
+             }
+-        }
  
++            u32 pixels = buffer + (u32)((u64)draw_y0 * hs.widthByte + (u64)draw_x0 * hs.pixelSizeByte);
++            font_image_store(image, pixels, hs.widthByte, draw_x1 - draw_x0, draw_y1 - draw_y0,
++                             FONT_EA(surface));
++            if (wrote_pixels) ps3_ms("font:glyph-pixels-written");
++        }
          stbtt_FreeBitmap(bitmap, NULL);
- 
+-
 -        /* Fill image output if requested */
 -        if (image)
 -            font_image_store(image, bw, 1, bw, bh);
 -
-+        int minX = dx < 0 ? 0 : dx;
-+        int minY = dy < 0 ? 0 : dy;
-+        s64 right = (s64)dx + bw, bottom = (s64)dy + bh;
-+        u32 width = (u32)((right > hs.width ? hs.width : right) - minX);
-+        u32 height = (u32)((bottom > hs.height ? hs.height : bottom) - minY);
-+        u32 pixels = buffer + (u32)((u64)minY * hs.widthByte + (u64)minX * hs.pixelSizeByte);
-+        font_image_store(image, pixels, hs.widthByte, width, height, FONT_EA(surface));
          return CELL_OK;
      }
  #endif
@@ -314,15 +481,50 @@ index 4e239b5..d3ecf5a 100644
 -    }
 -
 -    return CELL_OK;
-+    return (s32)0x8054000b; /* CELL_FONT_ERROR_FONT_OPEN_FAILED */
++    return (s32)CELL_FONT_ERROR_FONT_OPEN_FAILED;
  }
  
  s32 cellFontSetupRenderScalePixel(CellFont* font, float w, float h)
+ {
+-    return cellFontSetScalePixel(font, w, h);
++    /* Zero uses the configured size for that axis. */
++    return font_set_scale(font, w, h, 1);
+ }
 diff --git a/libs/font/cellFont.h b/libs/font/cellFont.h
-index 6a107a2..2bde41c 100644
+index 6a107a2..b673397 100644
 --- a/libs/font/cellFont.h
 +++ b/libs/font/cellFont.h
-@@ -45,8 +45,9 @@ extern "C" {
+@@ -22,16 +22,20 @@ extern "C" {
+ #define CELL_FONT_ERROR_FATAL               (CELL_ERROR_BASE_FONT | 0x01)
+ #define CELL_FONT_ERROR_INVALID_PARAMETER   (CELL_ERROR_BASE_FONT | 0x02)
+ #define CELL_FONT_ERROR_UNINITIALIZED       (CELL_ERROR_BASE_FONT | 0x03)
+-#define CELL_FONT_ERROR_ALREADY_INITIALIZED (CELL_ERROR_BASE_FONT | 0x04)
+-#define CELL_FONT_ERROR_ALLOCATION_FAILED   (CELL_ERROR_BASE_FONT | 0x05)
+-#define CELL_FONT_ERROR_NO_SUPPORT_FUNCTION (CELL_ERROR_BASE_FONT | 0x06)
+-#define CELL_FONT_ERROR_OPEN_FAILED         (CELL_ERROR_BASE_FONT | 0x07)
+-#define CELL_FONT_ERROR_NOT_FOUND           (CELL_ERROR_BASE_FONT | 0x08)
+-#define CELL_FONT_ERROR_FILE_DECOMPRESSION  (CELL_ERROR_BASE_FONT | 0x09)
+-#define CELL_FONT_ERROR_NO_SUPPORT_FONTSET  (CELL_ERROR_BASE_FONT | 0x0A)
++#define CELL_FONT_ERROR_ALREADY_INITIALIZED (CELL_ERROR_BASE_FONT | 0x06)
++#define CELL_FONT_ERROR_ALLOCATION_FAILED   (CELL_ERROR_BASE_FONT | 0x07)
++#define CELL_FONT_ERROR_NO_SUPPORT_FUNCTION (CELL_ERROR_BASE_FONT | 0x10)
++#define CELL_FONT_ERROR_OPEN_FAILED         (CELL_ERROR_BASE_FONT | 0x09)
++#define CELL_FONT_ERROR_NOT_FOUND           (CELL_ERROR_BASE_FONT | 0x0C)
++#define CELL_FONT_ERROR_FILE_DECOMPRESSION  (CELL_ERROR_BASE_FONT | 0x0A)
++#define CELL_FONT_ERROR_NO_SUPPORT_FONTSET  (CELL_ERROR_BASE_FONT | 0x08)
++#define CELL_FONT_ERROR_FONT_OPEN_FAILED    (CELL_ERROR_BASE_FONT | 0x0B)
+ #define CELL_FONT_ERROR_RENDERER            (CELL_ERROR_BASE_FONT | 0x10)
+-#define CELL_FONT_ERROR_RENDERER_ALREADY_BIND (CELL_ERROR_BASE_FONT | 0x11)
+-#define CELL_FONT_ERROR_RENDERER_UNBIND     (CELL_ERROR_BASE_FONT | 0x12)
++#define CELL_FONT_ERROR_RENDERER_ALREADY_BIND (CELL_ERROR_BASE_FONT | 0x20)
++#define CELL_FONT_ERROR_RENDERER_UNBIND     (CELL_ERROR_BASE_FONT | 0x21)
++#define CELL_FONT_ERROR_RENDERER_INVALID    (CELL_ERROR_BASE_FONT | 0x22)
++#define CELL_FONT_ERROR_RENDERER_ALLOCATION_FAILED (CELL_ERROR_BASE_FONT | 0x23)
++#define CELL_FONT_ERROR_ENOUGH_RENDERING_BUFFER (CELL_ERROR_BASE_FONT | 0x24)
+ 
+ /* ---------------------------------------------------------------------------
+  * Constants
+@@ -45,8 +49,9 @@ extern "C" {
  #define CELL_FONT_TYPE_RODIN_SANS_SERIF_LIGHT_LATIN 0x00000001
  #define CELL_FONT_TYPE_RODIN_SANS_SERIF_BOLD_LATIN  0x00000002
  #define CELL_FONT_TYPE_RODIN_SANS_SERIF_LATIN2     0x00000018
@@ -334,7 +536,15 @@ index 6a107a2..2bde41c 100644
  
  /* Open mode flags */
  #define CELL_FONT_OPEN_MODE_DEFAULT         0
-@@ -126,6 +127,9 @@ typedef struct CellFontConfig {
+@@ -98,6 +103,7 @@ typedef struct CellFontRenderSurface {
+     s32  pixelSizeByte; /* bytes per pixel (1 for alpha-only) */
+     s32  width;         /* surface width in pixels */
+     s32  height;        /* surface height in pixels */
++    u32  sc_x0, sc_y0, sc_x1, sc_y1; /* exclusive lower-right corner */
+ } CellFontRenderSurface;
+ 
+ /* Image glyph output */
+@@ -126,6 +132,9 @@ typedef struct CellFontConfig {
  s32 cellFontInit(const CellFontConfig* config);
  s32 cellFontInitializeWithRevision(u64 revisionFlags, const CellFontConfig* config);
  s32 cellFontEnd(void);
@@ -344,8 +554,17 @@ index 6a107a2..2bde41c 100644
  
  s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 uniqueId);
  s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 subNum, s32 uniqueId);
+@@ -134,7 +143,7 @@ s32 cellFontCloseFont(CellFont* font);
+ 
+ s32 cellFontSetFontOpenMode(u32 openMode);
+ 
+-s32 cellFontCreateRenderer(CellFontLibrary lib, CellFontRenderer* renderer);
++s32 cellFontCreateRenderer(CellFontLibrary lib, const void* config, CellFontRenderer* renderer);
+ s32 cellFontDestroyRenderer(CellFontRenderer renderer);
+ s32 cellFontBindRenderer(CellFont* font, CellFontRenderer renderer);
+ s32 cellFontUnbindRenderer(CellFont* font);
 diff --git a/libs/font/cellFontFT.c b/libs/font/cellFontFT.c
-index 89a0525..b4eb0d4 100644
+index 89a0525..20fa664 100644
 --- a/libs/font/cellFontFT.c
 +++ b/libs/font/cellFontFT.c
 @@ -7,6 +7,106 @@
@@ -402,7 +621,7 @@ index 89a0525..b4eb0d4 100644
 +        }
 +    }
 +    unlock_libraries();
-+    if (!slot) return (s32)0x80540007; /* CELL_FONT_ERROR_ALLOCATION_FAILED */
++    if (!slot) return (s32)CELL_FONT_ERROR_ALLOCATION_FAILED;
 +
 +    enum { LIBRARY_SIZE = 12 };
 +    u32 address = 0;
@@ -423,7 +642,7 @@ index 89a0525..b4eb0d4 100644
 +    lock_libraries();
 +    *slot = (FontLibrarySlot){address, free_opd, arg, address != 0};
 +    unlock_libraries();
-+    if (!address) return (s32)0x80540007;
++    if (!address) return (s32)CELL_FONT_ERROR_ALLOCATION_FAILED;
 +    vm_write32(out, address);
 +    printf("[cellFontFT] InitLibraryFreeType: revision=0x%llX library=0x%08X\n",
 +           (unsigned long long)revision, address);
@@ -560,10 +779,82 @@ index e1b1a3e..5efe10a 100644
  /* Camera types */
  #define CELL_CAMERA_TYPE_UNKNOWN        0
 diff --git a/libs/hardware/cellGem.c b/libs/hardware/cellGem.c
-index 001fd5a..18aace8 100644
+index 001fd5a..eeed13c 100644
 --- a/libs/hardware/cellGem.c
 +++ b/libs/hardware/cellGem.c
-@@ -58,6 +58,31 @@ s32 cellGemGetState(u32 gemNum, u32 flag, u64 timestamp, CellGemState* state)
+@@ -5,33 +5,64 @@
+  */
+ 
+ #include "cellGem.h"
++#include "cellCamera.h"
++#include <math.h>
++#include <stdatomic.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
+ 
+ /* Internal state */
+ 
+-static int s_initialized = 0;
+-static u32 s_max_connect = 0;
++enum {
++    GEM_ERROR_UNINITIALIZED = 0x80121803,
++    GEM_ERROR_INVALID_PARAMETER = 0x80121804,
++    GEM_DONT_TRACK_HUE = 2u << 24,
++    GEM_DONT_CARE_HUE = 4u << 24,
++    GEM_DONT_CHANGE_HUE = 8u << 24,
++};
++
++static atomic_int s_initialized = 0;
++static atomic_uint s_max_connect = 0;
++static atomic_flag s_hue_lock = ATOMIC_FLAG_INIT;
++static u32 s_selected_hues[CELL_GEM_MAX_NUM];
++
++static void lock_hues(void)
++{
++    while (atomic_flag_test_and_set_explicit(&s_hue_lock, memory_order_acquire)) {}
++}
++
++static void unlock_hues(void)
++{
++    atomic_flag_clear_explicit(&s_hue_lock, memory_order_release);
++}
+ 
+ /* API */
+ 
+ s32 cellGemInit(const CellGemAttribute* attr)
+ {
+     printf("[cellGem] Init()\n");
+-    if (s_initialized)
+-        return (s32)CELL_GEM_ERROR_ALREADY_INITIALIZED;
+-    if (!attr) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
+-    s_max_connect = vm_read32((u32)(uintptr_t)attr + 4);   /* maxConnect */
+-    if (s_max_connect > CELL_GEM_MAX_NUM) s_max_connect = CELL_GEM_MAX_NUM;
++    lock_hues();
++    if (s_initialized || !attr) {
++        const s32 error = s_initialized ? (s32)CELL_GEM_ERROR_ALREADY_INITIALIZED
++                                        : (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
++        unlock_hues();
++        return error;
++    }
++    u32 max_connect = vm_read32((u32)(uintptr_t)attr + 4); /* maxConnect */
++    s_max_connect = max_connect > CELL_GEM_MAX_NUM ? CELL_GEM_MAX_NUM : max_connect;
++    for (u32 i = 0; i < CELL_GEM_MAX_NUM; ++i) s_selected_hues[i] = GEM_DONT_TRACK_HUE;
+     s_initialized = 1;
++    unlock_hues();
+     return CELL_OK;
+ }
+ 
+ s32 cellGemEnd(void)
+ {
+     printf("[cellGem] End()\n");
++    lock_hues();
+     s_initialized = 0;
++    unlock_hues();
+     return CELL_OK;
+ }
+ 
+@@ -58,6 +89,29 @@ s32 cellGemGetState(u32 gemNum, u32 flag, u64 timestamp, CellGemState* state)
      return (s32)CELL_GEM_ERROR_NOT_CONNECTED;
  }
  
@@ -580,8 +871,6 @@ index 001fd5a..18aace8 100644
 +    return 1; /* CELL_GEM_NOT_CONNECTED */
 +}
 +
-+extern s32 cellCameraIsOpen(s32 device);
-+
 +s32 cellGemPrepareCamera(s32 maxExposure, float quality)
 +{
 +    if (!s_initialized) return (s32)0x80121803; /* CELL_GEM_ERROR_UNINITIALIZED */
@@ -595,8 +884,135 @@ index 001fd5a..18aace8 100644
  s32 cellGemIsTrackableHue(u32 hue)
  {
      (void)hue;
+@@ -75,8 +129,33 @@ s32 cellGemGetHue(u32 gemNum, u32* hue)
+ 
+ s32 cellGemTrackHues(const u32* reqHues, u32* resHues)
+ {
+-    (void)reqHues; (void)resHues;
+-    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
++    static const u32 default_hues[CELL_GEM_MAX_NUM] = {240, 0, 120, 300};
++    const u32 req_ea = (u32)(uintptr_t)reqHues;
++    const u32 res_ea = (u32)(uintptr_t)resHues;
++    u32 result[CELL_GEM_MAX_NUM];
++
++    lock_hues();
++    if (!s_initialized || !req_ea) {
++        const s32 error = s_initialized ? (s32)GEM_ERROR_INVALID_PARAMETER
++                                        : (s32)GEM_ERROR_UNINITIALIZED;
++        unlock_hues();
++        return error;
++    }
++
++    /* Hue requests configure slots even when no controller is connected. */
++    for (u32 i = 0; i < CELL_GEM_MAX_NUM; ++i) {
++        const u32 requested = vm_read32(req_ea + i * sizeof(u32));
++        if (requested != GEM_DONT_CHANGE_HUE)
++            s_selected_hues[i] = requested == GEM_DONT_CARE_HUE ? default_hues[i] : requested;
++        result[i] = s_selected_hues[i];
++    }
++    unlock_hues();
++
++    /* All requests have been read, so the guest may reuse the input buffer. */
++    if (res_ea) {
++        for (u32 i = 0; i < CELL_GEM_MAX_NUM; ++i)
++            vm_write32(res_ea + i * sizeof(u32), result[i]);
++    }
+     return CELL_OK;
+ }
+ 
+@@ -140,3 +219,72 @@ s32 cellGemGetMemorySize(s32 max_connect)
+         return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
+     return max_connect <= 2 ? 0x120000 : 0x140000;
+ }
++
++#define GEM_UNINITIALIZED   ((s32)0x80121803)
++#define GEM_BAD_PARAMETER   ((s32)0x80121804)
++#define GEM_BAD_ALIGNMENT   ((s32)0x80121805)
++#define GEM_NOT_CONVERTING  ((s32)0x80121809)
++#define GEM_NOT_A_HUE       ((s32)0x8012180B)
++#define GEM_DISCONNECTED    1
++#define GEM_NO_VIDEO        6
++
++static s32 gem_controller_check(u32 gemNum)
++{
++    if (!s_initialized) return GEM_UNINITIALIZED;
++    return gemNum < CELL_GEM_MAX_NUM ? CELL_OK : GEM_BAD_PARAMETER;
++}
++
++s32 cellGemGetTrackerHue(u32 gemNum, u32* hue)
++{
++    const s32 status = gem_controller_check(gemNum);
++    if (status) return status;
++    if (!hue) return GEM_BAD_PARAMETER;
++    vm_write32((u32)(uintptr_t)hue, 2u << 24); /* CELL_GEM_DONT_TRACK_HUE */
++    return GEM_NOT_A_HUE;
++}
++
++s32 cellGemConvertVideoFinish(void)
++{
++    return s_initialized ? GEM_NOT_CONVERTING : GEM_UNINITIALIZED;
++}
++
++s32 cellGemConvertVideoStart(const void* frame)
++{
++    if (!s_initialized) return GEM_UNINITIALIZED;
++    if (!frame) return GEM_BAD_PARAMETER;
++    if ((uintptr_t)frame & 127u) return GEM_BAD_ALIGNMENT;
++    return GEM_NO_VIDEO;
++}
++
++s32 cellGemPrepareVideoConvert(const void* attribute)
++{
++    if (!s_initialized) return GEM_UNINITIALIZED;
++    const u32 address = (u32)(uintptr_t)attribute;
++    if (!address || vm_read32(address) != 2) return GEM_BAD_PARAMETER;
++    const u32 output_format = vm_read32(address + 4);
++    if (!output_format || (output_format != 1 && !vm_read32(address + 32)))
++        return GEM_BAD_PARAMETER;
++    return GEM_NO_VIDEO;
++}
++
++s32 cellGemSetRumble(u32 gemNum, u8 rumble)
++{
++    const s32 status = gem_controller_check(gemNum);
++    if (status) return status;
++    printf("[cellGem] SetRumble(%u, %u): controller disconnected\n", gemNum, (unsigned)rumble);
++    return GEM_DISCONNECTED;
++}
++
++s32 cellGemForceRGB(u32 gemNum, float red, float green, float blue)
++{
++    const s32 status = gem_controller_check(gemNum);
++    if (status) return status;
++    if (!isfinite(red) || !isfinite(green) || !isfinite(blue)) return GEM_BAD_PARAMETER;
++    return GEM_DISCONNECTED;
++}
++
++s32 cellGemInvalidateCalibration(s32 gemNum)
++{
++    const s32 status = gem_controller_check((u32)gemNum);
++    return status ? status : GEM_DISCONNECTED;
++}
+diff --git a/libs/hardware/cellGem.h b/libs/hardware/cellGem.h
+index 76c5505..bc6e55a 100644
+--- a/libs/hardware/cellGem.h
++++ b/libs/hardware/cellGem.h
+@@ -106,6 +106,13 @@ s32 cellGemUpdateFinish(void);
+ s32 cellGemReset(u32 gemNum);
+ s32 cellGemEnableMagnetometer(u32 gemNum, s32 enable);
+ s32 cellGemEnableCameraPitchAngleCorrection(s32 enable);
++s32 cellGemGetTrackerHue(u32 gemNum, u32* hue);
++s32 cellGemConvertVideoFinish(void);
++s32 cellGemConvertVideoStart(const void* frame);
++s32 cellGemPrepareVideoConvert(const void* attribute);
++s32 cellGemSetRumble(u32 gemNum, u8 rumble);
++s32 cellGemForceRGB(u32 gemNum, float red, float green, float blue);
++s32 cellGemInvalidateCalibration(s32 gemNum);
+ 
+ #ifdef __cplusplus
+ }
 diff --git a/libs/network/cellHttp.c b/libs/network/cellHttp.c
-index 3e30a72..957cac9 100644
+index 3e30a72..5dd5f64 100644
 --- a/libs/network/cellHttp.c
 +++ b/libs/network/cellHttp.c
 @@ -10,6 +10,8 @@
@@ -616,7 +1032,7 @@ index 3e30a72..957cac9 100644
  #include <netinet/in.h>
  #include <netdb.h>
  #include <unistd.h>
-@@ -56,8 +59,17 @@ typedef struct {
+@@ -56,8 +59,20 @@ typedef struct {
      u32                  connect_timeout;
      u32                  send_timeout;
      u32                  recv_timeout;
@@ -630,11 +1046,25 @@ index 3e30a72..957cac9 100644
 +#define HTTP_CLIENT_INVALID_VALUE   ((s32)0x80710027)
 +#define HTTP_CLIENT_NO_SSL          ((s32)0x80710a08)
 +#define HTTP_CONNECT_NET_DOWN       ((s32)0x80710532)
++#define HTTP_ALREADY_INITIALIZED    ((s32)0x80710001)
++#define HTTP_BAD_TRANSACTION        ((s32)0x80710011)
++#define HTTP_INVALID_HEADER         ((s32)0x80710008)
 +
  /* Custom header key/value pair */
  typedef struct {
      char name[128];
-@@ -130,6 +142,119 @@ static void http_apply_timeout(http_socket_t sock, int send, u32 usec)
+@@ -103,6 +118,10 @@ typedef struct {
+ 
+ static HttpClientSlot s_clients[CELL_HTTP_MAX_CLIENTS];
+ static HttpTransSlot  s_transactions[CELL_HTTP_MAX_TRANSACTIONS];
++static struct {
++    u32 address;
++    u32 size;
++} s_cookie_pool;
+ 
+ /* ---------------------------------------------------------------------------
+  * Helpers
+@@ -130,6 +149,119 @@ static void http_apply_timeout(http_socket_t sock, int send, u32 usec)
  #endif
  }
  
@@ -754,7 +1184,7 @@ index 3e30a72..957cac9 100644
  /* Close the socket in a transaction slot if open, reset state. */
  static void http_close_slot_socket(HttpTransSlot* t)
  {
-@@ -198,6 +323,16 @@ static const char* http_strcasestr(const char* haystack, const char* needle)
+@@ -198,6 +330,16 @@ static const char* http_strcasestr(const char* haystack, const char* needle)
      return NULL;
  }
  
@@ -771,15 +1201,28 @@ index 3e30a72..957cac9 100644
  /* Parse the response headers that have been accumulated in hdr_buf.
   * Extracts status code, Content-Length, Connection: close.
   * Returns 0 on success, -1 on parse failure. */
-@@ -350,6 +485,7 @@ s32 cellHttpCreateClient(CellHttpClientId* clientId)
+@@ -339,10 +481,6 @@ s32 cellHttpCreateClient(CellHttpClientId* clientId)
+     if (!clientId)
+         return CELL_HTTP_ERROR_INVALID_PARAMETER;
+ 
+-    /* clientId is a raw GUEST effective address (the generic HLE adapter passes
+-     * r3 verbatim); translate it before writing or we fault on a host pointer. */
+-    CellHttpClientId* clientId_h = GUEST_PTR(clientId, CellHttpClientId*);
+-
+     for (u32 i = 0; i < CELL_HTTP_MAX_CLIENTS; i++) {
+         if (!s_clients[i].in_use) {
+             s_clients[i].in_use = 1;
+@@ -350,7 +488,8 @@ s32 cellHttpCreateClient(CellHttpClientId* clientId)
              s_clients[i].connect_timeout = 30000000;
              s_clients[i].send_timeout    = 120000000;
              s_clients[i].recv_timeout    = 120000000;
+-            *clientId_h = i;
 +            s_clients[i].user_agent[0] = '\0';
-             *clientId_h = i;
++            vm_write32((u32)(uintptr_t)clientId, i);
              printf("[cellHttp] CreateClient(id=%u)\n", i);
              return CELL_OK;
-@@ -479,6 +615,12 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
+         }
+@@ -479,6 +618,12 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
          printf("[cellHttp] SendRequest(trans=%u) - transaction aborted\n", transId);
          return CELL_HTTP_ERROR_ABORTED;
      }
@@ -792,7 +1235,7 @@ index 3e30a72..957cac9 100644
  
      printf("[cellHttp] SendRequest(trans=%u, %s %s, bodySize=%u)\n",
             transId, t->method, t->url, size);
-@@ -520,7 +662,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
+@@ -520,7 +665,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
      http_apply_timeout(sock, 1, c->send_timeout);
      http_apply_timeout(sock, 0, c->recv_timeout);
  
@@ -801,7 +1244,7 @@ index 3e30a72..957cac9 100644
          printf("[cellHttp]   connect() failed to %s:%u\n", t->hostname, t->port);
          http_closesocket(sock);
          freeaddrinfo(result);
-@@ -538,27 +680,36 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
+@@ -538,27 +683,36 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
                             "Host: %s\r\n",
                             t->method, t->path, t->hostname);
  
@@ -849,8 +1292,85 @@ index 3e30a72..957cac9 100644
  
      /* ---- Send header ---- */
      if (http_send_all(sock, req_buf, (u32)req_len) != 0) {
+@@ -979,8 +1133,7 @@ s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
+     h->value[sizeof(h->value) - 1] = '\0';
+     t->custom_header_count++;
+ 
+-    printf("[cellHttp] AddRequestHeader(trans=%u, '%s: %s')\n",
+-           transId, name, value);
++    printf("[cellHttp] AddRequestHeader(trans=%u, name='%s')\n", transId, h->name);
+     return CELL_OK;
+ }
+ 
+@@ -998,3 +1151,66 @@ s32 cellHttpAbortTransaction(CellHttpTransId transId)
+     printf("[cellHttp] AbortTransaction(trans=%u)\n", transId);
+     return CELL_OK;
+ }
++
++s32 cellHttpInitCookie(const void* pool, u32 poolSize)
++{
++    const u32 address = (u32)(uintptr_t)pool;
++    if (!address || !poolSize || (u64)address + poolSize > UINT64_C(0x100000000))
++        return HTTP_CLIENT_NO_BUFFER;
++    if (s_cookie_pool.address) return HTTP_ALREADY_INITIALIZED;
++    s_cookie_pool.address = address;
++    s_cookie_pool.size = poolSize;
++    printf("[cellHttp] InitCookie(poolSize=%u)\n", s_cookie_pool.size);
++    return CELL_OK;
++}
++
++s32 cellHttpEndCookie(void)
++{
++    if (!s_cookie_pool.address) return HTTP_CLIENT_NOT_INITIALIZED;
++    memset(&s_cookie_pool, 0, sizeof(s_cookie_pool));
++    return CELL_OK;
++}
++
++static s32 check_ps3_transaction(CellHttpTransId transId)
++{
++    if (!s_http_initialized) return HTTP_CLIENT_NOT_INITIALIZED;
++    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
++        return HTTP_BAD_TRANSACTION;
++    return CELL_OK;
++}
++
++s32 cellHttpTransactionAbortConnection(CellHttpTransId transId)
++{
++    s32 status = check_ps3_transaction(transId);
++    return status ? status : cellHttpAbortTransaction(transId);
++}
++
++s32 cellHttpRequestSetContentLength(CellHttpTransId transId, u64 length)
++{
++    s32 status = check_ps3_transaction(transId);
++    return status ? status : cellHttpSetRequestContentLength(transId, length);
++}
++
++s32 cellHttpRequestAddHeader(CellHttpTransId transId, const void* header)
++{
++    const s32 status = check_ps3_transaction(transId);
++    if (status) return status;
++    const u32 address = (u32)(uintptr_t)header;
++    if (!address) return HTTP_CLIENT_NO_BUFFER;
++    const u32 name_ea = vm_read32(address);
++    const u32 value_ea = vm_read32(address + 4);
++    if (!name_ea || !value_ea) return HTTP_INVALID_HEADER;
++    const char* name = (const char*)vm_ptr8(name_ea);
++    const char* value = (const char*)vm_ptr8(value_ea);
++    size_t name_length = strnlen(name, sizeof(((HttpCustomHeader*)0)->name));
++    size_t value_length = strnlen(value, sizeof(((HttpCustomHeader*)0)->value));
++    if (!name_length || name_length >= sizeof(((HttpCustomHeader*)0)->name) ||
++        value_length >= sizeof(((HttpCustomHeader*)0)->value) ||
++        memchr(name, ':', name_length) || memchr(name, '\r', name_length) ||
++        memchr(name, '\n', name_length) || memchr(value, '\r', value_length) ||
++        memchr(value, '\n', value_length))
++        return HTTP_INVALID_HEADER;
++    const s32 added = cellHttpAddRequestHeader(transId, (const char*)(uintptr_t)name_ea,
++                                               (const char*)(uintptr_t)value_ea);
++    return added == (s32)CELL_HTTP_ERROR_NO_BUFFER ? HTTP_CLIENT_NO_BUFFER : added;
++}
 diff --git a/libs/network/cellHttp.h b/libs/network/cellHttp.h
-index cfcf9c9..b53a8fe 100644
+index cfcf9c9..b47d2f2 100644
 --- a/libs/network/cellHttp.h
 +++ b/libs/network/cellHttp.h
 @@ -95,6 +95,11 @@ s32 cellHttpEnd(void);
@@ -865,14 +1385,89 @@ index cfcf9c9..b53a8fe 100644
  
  s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientId,
                                const char* method, const CellHttpUri* uri);
+@@ -122,6 +127,11 @@ s32 cellHttpSetRequestContentLength(CellHttpTransId transId, u64 length);
+ s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
+                              const char* value);
+ s32 cellHttpAbortTransaction(CellHttpTransId transId);
++s32 cellHttpInitCookie(const void* pool, u32 poolSize);
++s32 cellHttpEndCookie(void);
++s32 cellHttpTransactionAbortConnection(CellHttpTransId transId);
++s32 cellHttpRequestSetContentLength(CellHttpTransId transId, u64 length);
++s32 cellHttpRequestAddHeader(CellHttpTransId transId, const void* header);
+ 
+ #ifdef __cplusplus
+ }
 diff --git a/libs/network/sceNp.c b/libs/network/sceNp.c
-index 79890a1..d1816a4 100644
+index 79890a1..ef2291f 100644
 --- a/libs/network/sceNp.c
 +++ b/libs/network/sceNp.c
-@@ -73,6 +73,29 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
+@@ -73,6 +73,92 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
  /* Whether sceNpInit has run; sceNpBasic follows it (see sceNpBasic.c). */
  int np_is_initialized(void) { return s_np_initialized; }
  
++#define NP_BASIC_NOT_INITIALIZED ((s32)0x8002a662)
++#define NP_BASIC_INVALID_ARG     ((s32)0x8002a665)
++#define NP_BASIC_EXCEEDS_MAX     ((s32)0x8002a66b)
++#define NP_BASIC_NOT_CONNECTED   ((s32)0x8002a678)
++#define NP_FRIEND_NOT_INITIALIZED ((s32)0x8002ab21)
++#define NP_FRIEND_STATUS          ((s32)0x8002ab26)
++#define NP_FRIEND_INVALID_ARG     ((s32)0x8002ab28)
++#define NP_PROFILE_NOT_INITIALIZED ((s32)0x8002ab41)
++#define NP_PROFILE_STATUS          ((s32)0x8002ab46)
++#define NP_PROFILE_INVALID_ARG     ((s32)0x8002ab48)
++
++s32 sceNpBasicAddPlayersHistory(const SceNpId* player, const char* description)
++{
++    if (!s_np_initialized) return NP_BASIC_NOT_INITIALIZED;
++    const SceNpId* id = GUEST_PTR(player, const SceNpId*);
++    if (!id || !id->handle.data[0]) return NP_BASIC_INVALID_ARG;
++    const char* text = GUEST_PTR(description, const char*);
++    if (text && strnlen(text, 342) > 341) return NP_BASIC_EXCEEDS_MAX;
++    return NP_BASIC_NOT_CONNECTED;
++}
++
++s32 sceNpBasicGetBlockListEntry(u32 index, SceNpId* player)
++{
++    if (!s_np_initialized) return NP_BASIC_NOT_INITIALIZED;
++    if (!player) return NP_BASIC_INVALID_ARG;
++    fprintf(stderr, "[sceNp] GetBlockListEntry(%u): no online block list\n", index);
++    return (s32)SCE_NP_ERROR_ID_NOT_FOUND;
++}
++
++s32 sceNpFriendlist(u32 handler, u32 userArg, u32 container)
++{
++    if (!s_np_initialized) return NP_FRIEND_NOT_INITIALIZED;
++    if (!handler) return NP_FRIEND_INVALID_ARG;
++    fprintf(stderr, "[sceNp] Friendlist(arg=0x%08X, container=%u): offline\n", userArg, container);
++    return (s32)SCE_NP_ERROR_OFFLINE;
++}
++
++s32 sceNpFriendlistAbortGui(void)
++{
++    return s_np_initialized ? NP_FRIEND_STATUS : NP_FRIEND_NOT_INITIALIZED;
++}
++
++s32 sceNpProfileCallGui(const SceNpId* player, u32 handler, u32 userArg, u64 options)
++{
++    if (!s_np_initialized) return NP_PROFILE_NOT_INITIALIZED;
++    if (!player || !handler) return NP_PROFILE_INVALID_ARG;
++    fprintf(stderr, "[sceNp] ProfileCallGui(arg=0x%08X, options=0x%llX): offline\n",
++            userArg, (unsigned long long)options);
++    return (s32)SCE_NP_ERROR_OFFLINE;
++}
++
++s32 sceNpProfileAbortGui(void)
++{
++    return s_np_initialized ? NP_PROFILE_STATUS : NP_FRIEND_NOT_INITIALIZED;
++}
++
++s32 sceNpManagerGetEntitlementById(const char* entitlementId, void* entitlement)
++{
++    if (!s_np_initialized) return (s32)SCE_NP_ERROR_NOT_INITIALIZED;
++    if (!entitlementId || !entitlement) return (s32)SCE_NP_ERROR_INVALID_ARGUMENT;
++    return (s32)SCE_NP_ERROR_ID_NOT_FOUND;
++}
++
 +#define NP_MENU_NOT_INITIALIZED ((s32)0x80023b02)
 +#define NP_MENU_NOT_SUPPORTED   ((s32)0x80023b04)
 +#define NP_MENU_INVALID_ARG     ((s32)0x80023b09)
@@ -899,6 +1494,101 @@ index 79890a1..d1816a4 100644
  s32 sceNpTerm(void)
  {
      printf("[sceNp] Term()\n");
+@@ -399,6 +485,11 @@ s32 sceNpScoreTerm(void)
+     return CELL_OK;
+ }
+ 
++int np_score_is_initialized(void)
++{
++    return s_np_initialized && s_score_initialized;
++}
++
+ /* ---------------------------------------------------------------------------
+  * NPDRM
+  *
+diff --git a/libs/network/sceNp.h b/libs/network/sceNp.h
+index a0b8be0..e91d255 100644
+--- a/libs/network/sceNp.h
++++ b/libs/network/sceNp.h
+@@ -107,6 +107,16 @@ s32 sceNpTerm(void);
+ #define SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED     0x8002a102
+ s32 sceNpScoreInit(void);
+ s32 sceNpScoreTerm(void);
++int np_score_is_initialized(void);
++s32 sceNpScoreGetBoardInfo(s32 transId, u32 boardId, void* boardInfo, const void* option);
++
++s32 sceNpBasicAddPlayersHistory(const SceNpId* player, const char* description);
++s32 sceNpBasicGetBlockListEntry(u32 index, SceNpId* player);
++s32 sceNpFriendlist(u32 handler, u32 userArg, u32 container);
++s32 sceNpFriendlistAbortGui(void);
++s32 sceNpProfileCallGui(const SceNpId* player, u32 handler, u32 userArg, u64 options);
++s32 sceNpProfileAbortGui(void);
++s32 sceNpManagerGetEntitlementById(const char* entitlementId, void* entitlement);
+ 
+ s32 sceNpGetNpId(s32 userId, SceNpId* npId);
+ s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId);
+diff --git a/libs/network/sceNpScore.c b/libs/network/sceNpScore.c
+index f9c3c50..0d0db17 100644
+--- a/libs/network/sceNpScore.c
++++ b/libs/network/sceNpScore.c
+@@ -45,6 +45,12 @@ static void sleep_10ms(void) { struct timespec ts = { 0, 10000000L }; nanosleep(
+ #define SCORE_ERROR_NO_SERVER      0x8002A1A1u   /* community server error: unavailable */
+ #define SCORE_ERROR_INVALID_ID     0x8002A106u
+ #define SCORE_ERROR_ABORTED        0x8002A10Au
++#define SCORE_INVALID_ARGUMENT    ((s32)0x8002A104)
++#define SCORE_INSUFFICIENT_ARG    ((s32)0x8002A1A1)
++#define SCORE_BAD_TRANSACTION     ((s32)0x8002A1A3)
++#define SCORE_INVALID_ONLINE_ID   ((s32)0x8002A1A4)
++#define SCORE_TOO_MANY_NPIDS      ((s32)0x8002A1AD)
++#define SCORE_SERVICE_UNAVAILABLE ((s32)0x8002A409)
+ 
+ #define TITLE_MAX 8
+ #define TRANS_MAX 32
+@@ -283,6 +289,37 @@ static u64 stack_arg(ppu_context* ctx, int n)   /* n >= 9 */
+     return vm_read64((u32)ctx->gpr[1] + 112u + 8u * (u32)(n - 9));
+ }
+ 
++s32 sceNpScoreGetBoardInfo(s32 transId, u32 boardId, void* boardInfo, const void* option)
++{
++    if (!np_score_is_initialized()) return (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
++    if (!boardInfo) return SCORE_INSUFFICIENT_ARG;
++    if (option) return SCORE_INVALID_ARGUMENT;
++    if (!np_psnr_connected()) return SCORE_INVALID_ONLINE_ID;
++    if (!trans_get(transId)) return SCORE_BAD_TRANSACTION;
++    fprintf(stderr, "[sceNpScore] GetBoardInfo(%u): board metadata unavailable\n", boardId);
++    return SCORE_SERVICE_UNAVAILABLE;
++}
++
++static s32 ranking_by_npid_pcid(ppu_context* ctx)
++{
++    if (!np_score_is_initialized()) return (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
++    if (!(u32)ctx->gpr[5]) return SCORE_INSUFFICIENT_ARG;
++    const u32 count = (u32)stack_arg(ctx, 11);
++    if (!count) return SCORE_INVALID_ARGUMENT;
++    if (count > 101) return SCORE_TOO_MANY_NPIDS;
++    if (!trans_get((s32)ctx->gpr[3])) return SCORE_BAD_TRANSACTION;
++    if (!np_psnr_connected()) return SCORE_INVALID_ONLINE_ID;
++
++    /* The configured score transport has no character-ID ranking request. */
++    fprintf(stderr, "[sceNpScore] GetRankingByNpIdPcId(%u): service unavailable\n", (u32)ctx->gpr[4]);
++    return SCORE_SERVICE_UNAVAILABLE;
++}
++
++static void hle_ranking_by_npid_pcid(ppu_context* ctx)
++{
++    ctx->gpr[3] = (u64)(s64)ranking_by_npid_pcid(ctx);
++}
++
+ /* GetRankingByRange[Async](transId, boardId, startSerialRank, rankArray*, rankArraySize,
+  *   commentArray*, commentArraySize, infoArray*, infoArraySize, arrayNum,
+  *   lastSortDate*, totalRecord*, [prio,] option) */
+@@ -365,4 +402,6 @@ void np_score_register_ctx(void)
+                          "sceNpScoreGetRankingByNpIdAsync", hle_ranking_by_npid_async);
+     ps3_hle_register_ctx(ps3_compute_nid("sceNpScoreGetRankingByNpId"),
+                          "sceNpScoreGetRankingByNpId", hle_ranking_by_npid);
++    ps3_hle_register_ctx(ps3_compute_nid("sceNpScoreGetRankingByNpIdPcId"),
++                         "sceNpScoreGetRankingByNpIdPcId", hle_ranking_by_npid_pcid);
+ }
 diff --git a/libs/system/sys_crashdump.c b/libs/system/sys_crashdump.c
 new file mode 100644
 --- /dev/null

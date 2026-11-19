@@ -1,0 +1,47 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -352,6 +389,34 @@ static void cellFsOpen(ppu_context* ctx)
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
++static FILE* open_sdata_scratch()
++{
++#ifdef _WIN32
++    const char* root = ps3_env_once("PS3_HDD1_ROOT");
++    if (root && *root) {
++        static std::atomic<unsigned> next_file{0};
++        for (unsigned attempt = 0; attempt < 64; ++attempt) {
++            char path[1100];
++            const int length = snprintf(path, sizeof path, "%s/.sdata-%lu-%u.tmp",
++                                        root, (unsigned long)GetCurrentProcessId(),
++                                        next_file.fetch_add(1, std::memory_order_relaxed));
++            if (length < 0 || (size_t)length >= sizeof path) return nullptr;
++            const int fd = _open(path, _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY | _O_TEMPORARY,
++                                 _S_IREAD | _S_IWRITE);
++            if (fd < 0) {
++                if (errno == EEXIST) continue;
++                return nullptr;
++            }
++            FILE* stream = _fdopen(fd, "w+b");
++            if (!stream) _close(fd);
++            return stream;
++        }
++        return nullptr;
++    }
++#endif
++    return tmpfile();
++}
++
+ /* cellFsSdataOpen(path, flags, fd*, arg*, size): opens a PS3 SDATA/EDAT
+  * encrypted-data file and returns an fd whose reads yield the DECRYPTED
+  * plaintext. LBP 1.30 stores its SPU job code modules inside patch.sdat (an
+@@ -414,7 +479,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
+         }
+         char dmagic[4] = {0};
+         if (dec_sz >= 4) memcpy(dmagic, dec, 4);
+-        FILE* tf = tmpfile();
++        FILE* tf = open_sdata_scratch();
+         if (!tf || fwrite(dec, 1, dec_sz, tf) != dec_sz) {
+             if (tf) fclose(tf); free(dec);
+             ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;

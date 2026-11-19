@@ -16,9 +16,9 @@
       "completed_at": "2026-11-17T23:45:42.191580+00:00"
     },
     "build": {
-      "fingerprint": "d6605295fce79564da73b07a411c40762fdb9e4a6ebe9e792d768783d75053d4",
-      "outputs": "897289170ab009981a8421662d8cf82df848e1f3f700843c059a660e891f8b9c",
-      "completed_at": "2026-11-18T00:49:46.888931+00:00"
+      "fingerprint": "62b0b66eba811e48855e742c26f91180c68da1f1e3d4d0290e23b1d3d1d4653b",
+      "outputs": "cd2f9e65ef9bb31adc39ba0d2a559a245fc886546e950b9b2317cf8af7d6252c",
+      "completed_at": "2026-11-19T01:07:54.197793+00:00"
     }
   }
 }

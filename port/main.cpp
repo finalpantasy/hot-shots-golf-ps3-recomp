@@ -40,6 +40,7 @@
 #include "cli_options.h"
 
 #include <filesystem>
+#include <memory>
 #include <string>
 
 #include <stdint.h>
@@ -50,6 +51,7 @@
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
+#include <unistd.h>
 #endif
 
 #if defined(__APPLE__)
@@ -64,6 +66,9 @@
  * there is nothing to shim: the 15.6 ms default timer granularity this works
  * around is a Windows problem. */
 #include <timeapi.h>
+#include <bcrypt.h>
+#include <io.h>
+#include <share.h>
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -87,6 +92,7 @@ void     ps3_register_peripheral_imports(void);
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 int      cellGame_init_from_paramsfo(const char* sfo_path);   /* cellGame.c: 0 ok, -1 failed */
 const char* cellGame_get_title(void);
+const char* cellGame_get_title_id(void);
 void     ps3_host_quit(const char* why);      /* cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
 
 /* sys_ppu_thread.c: the main thread's stack, as sys_ppu_thread_get_stack_information
@@ -118,6 +124,7 @@ void     cellGcmTickVBlank(void);
 void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
+void     cellGcm_fifo_kick_wait(unsigned ms);
 unsigned cellGcm_flip_request_count(void);
 }
 
@@ -220,11 +227,13 @@ static DWORD WINAPI frame_clock(LPVOID)
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             rsx_ok ? (g_window_hidden ? "OK -- window hidden" : "OK -- window open") : "FAILED");
 
+    bool window_open = rsx_ok;
     unsigned  last_flip = 0;
     ULONGLONG next_tick = GetTickCount64();
 
     for (;;) {
-        Sleep(4);
+        /* Wake when a guest thread needs the FIFO walker. */
+        cellGcm_fifo_kick_wait(4);
         ULONGLONG now = GetTickCount64();
 
         int fired = 0;
@@ -237,7 +246,7 @@ static DWORD WINAPI frame_clock(LPVOID)
              * after the drain races the guest's next-frame writes and shows a
              * mixed one. */
             if (rsx_ok && cellGcm_take_flip_pending()) {
-                present_guest_frame();
+                if (window_open) present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
             }
             /* Drain the FIFO every tick. This is what writes the RSX sync-fence
@@ -255,15 +264,16 @@ static DWORD WINAPI frame_clock(LPVOID)
          * The real RSX writes them in microseconds. */
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
-                present_guest_frame();
+                if (window_open) present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
             }
             cellGcm_rsx_process_fifo();
 
+            if (!window_open) continue;
             if (rsx_backend_pump() != 0) {
-                rsx_ok = 0;              /* window closed */
-                /* ...so quit, as the console's Quit Game does, instead of
-                 * leaving the game running with no window. */
+                window_open = false;
+                /* Keep retiring FIFO fences while the guest handles its
+                 * exit callbacks. The backend still owns the GPU resources. */
                 ps3_host_quit("window closed");
                 continue;
             }
@@ -287,11 +297,93 @@ static DWORD WINAPI frame_clock(LPVOID)
  * -----------------------------------------------------------------------*/
 static bool file_exists(const std::string& p)
 {
-    FILE* f = fopen(p.c_str(), "rb");
-    if (!f) return false;
-    fclose(f);
-    return true;
+    std::error_code error;
+    return std::filesystem::is_regular_file(p, error);
 }
+
+static std::string find_game_files(const CliOptions& options, ResolvedPaths& paths)
+{
+    const std::string sfo = paths.vfs_root + "/PARAM.SFO";
+    if (file_exists(sfo) && file_exists(paths.elf)) return sfo;
+
+    const std::string disc = paths.vfs_root + "/PS3_GAME";
+    const std::string disc_sfo = disc + "/PARAM.SFO";
+    const std::string disc_elf = options.elf.empty() ? disc + "/USRDIR/EBOOT.elf" : paths.elf;
+    if (file_exists(disc_sfo) && file_exists(disc_elf)) {
+        paths.elf = disc_elf;
+        return disc_sfo;
+    }
+
+    const char* vfs_environment = getenv("PS3_VFS_ROOT");
+    if (options.elf.empty() && options.game_dir.empty() && (!vfs_environment || !*vfs_environment)) {
+        const std::string flat_sfo = paths.build_dir + "/PARAM.SFO";
+        const std::string flat_elf = paths.build_dir + "/USRDIR/EBOOT.elf";
+        if (file_exists(flat_sfo) && file_exists(flat_elf)) {
+            paths.vfs_root = paths.build_dir;
+            paths.elf = flat_elf;
+            return flat_sfo;
+        }
+    }
+    return {};
+}
+
+static void keep_explorer_message_open(int argc)
+{
+#ifdef _WIN32
+    DWORD console_processes[2];
+    if (argc == 1 && _isatty(_fileno(stdin)) && GetConsoleProcessList(console_processes, 2) == 1) {
+        fputs("Press Enter to close.\n", stderr);
+        getchar();
+    }
+#else
+    (void)argc;
+#endif
+}
+
+#ifdef _WIN32
+static bool matches_fixed_elf(FILE* file)
+{
+    // SHA-256 of profiles.fix-1.02.decrypted_elf_sha256 in config/target.json.
+    static const uint8_t expected[] = {
+        0x42, 0xbd, 0xdd, 0xc5, 0xe4, 0x19, 0xf7, 0xe1,
+        0x8b, 0xcb, 0xec, 0xdf, 0x02, 0xeb, 0x24, 0x74,
+        0x8d, 0xd1, 0xda, 0x91, 0x1e, 0xa7, 0x25, 0x7d,
+        0x86, 0xd8, 0x47, 0x7e, 0x24, 0x77, 0x7a, 0x8b,
+    };
+    // Reject incomplete or oversized inputs before the hash reads their data.
+    constexpr int64_t expected_size = 14340360;
+    if (!file || _fseeki64(file, 0, SEEK_END) != 0 ||
+        _ftelli64(file) != expected_size || _fseeki64(file, 0, SEEK_SET) != 0)
+        return false;
+
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+        return false;
+
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    bool matches = false;
+    if (BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) == 0) {
+        uint8_t buffer[64 * 1024];
+        size_t total = 0;
+        bool read_ok = true;
+        while (size_t count = fread(buffer, 1, sizeof buffer, file)) {
+            total += count;
+            if (total > expected_size ||
+                BCryptHashData(hash, buffer, static_cast<ULONG>(count), 0) != 0) {
+                read_ok = false;
+                break;
+            }
+        }
+        uint8_t digest[sizeof expected];
+        matches = read_ok && !ferror(file) && total == expected_size &&
+            BCryptFinishHash(hash, digest, sizeof digest, 0) == 0 &&
+            memcmp(digest, expected, sizeof expected) == 0;
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    return matches;
+}
+#endif
 
 static void make_one_dir(const std::string& p)
 {
@@ -316,6 +408,51 @@ static void make_dirs(const std::string& path)
     make_one_dir(t);
 }
 
+#ifdef _WIN32
+static bool configure_windows_profile(const std::string& build_dir)
+{
+    const auto profile = std::filesystem::path(build_dir) / "cache" / "profile";
+    const auto local = profile / "AppData" / "Local";
+    const auto local_low = profile / "AppData" / "LocalLow";
+    const auto roaming = profile / "AppData" / "Roaming";
+    const auto temporary = profile / "Temp";
+    for (const auto& directory : {local, local_low, roaming, temporary}) {
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        if (error) {
+            fprintf(stderr, "error: cannot create the Windows cache folder under %s (%s)\n",
+                    build_dir.c_str(), error.message().c_str());
+            return false;
+        }
+    }
+
+    // Direct3D and the display driver resolve cache folders against this process's profile.
+    if (_wputenv_s(L"USERPROFILE", profile.c_str()) ||
+        _wputenv_s(L"LOCALAPPDATA", local.c_str()) ||
+        _wputenv_s(L"APPDATA", roaming.c_str()) ||
+        _wputenv_s(L"TEMP", temporary.c_str()) ||
+        _wputenv_s(L"TMP", temporary.c_str())) {
+        fprintf(stderr, "error: cannot configure the Windows cache paths under %s\n", build_dir.c_str());
+        return false;
+    }
+    return true;
+}
+#endif
+
+static bool redirect_log(const std::string& path)
+{
+    size_t cut = path.rfind('/');
+    if (cut != std::string::npos) make_dirs(path.substr(0, cut));
+    if (!freopen(path.c_str(), "w", stdout)) return false;
+
+    // Share the file position so one stream cannot overwrite the other.
+#ifdef _WIN32
+    return _dup2(_fileno(stdout), _fileno(stderr)) == 0;
+#else
+    return dup2(fileno(stdout), fileno(stderr)) >= 0;
+#endif
+}
+
 static bool make_absolute(std::string& path)
 {
     if (path.empty()) return true;
@@ -329,11 +466,12 @@ static bool make_absolute(std::string& path)
     return true;
 }
 
-static bool resolve_firmware(std::string& roots, const std::string& exe_dir)
+static bool resolve_firmware(std::string& roots, const CliOptions& options,
+                             const std::string& build_dir)
 {
-    const char* configured = getenv("PS3_DEV_FLASH");
+    const char* configured = options.dev_flash.empty() ? getenv("PS3_DEV_FLASH") : options.dev_flash.c_str();
     if (!configured || !*configured) {
-        roots = exe_dir + "/dev_flash";
+        roots = build_dir + "/dev_flash";
         return true;
     }
 #ifdef _WIN32
@@ -490,47 +628,109 @@ int main(int argc, char** argv)
         fputs("error: --fullscreen and --hidden require the Windows backend.\n", stderr);
         return 2;
     }
+    if (cli_has_d3d12_options(opt)) {
+        fputs("error: RSX renderer options require the D3D12 backend.\n", stderr);
+        return 2;
+    }
 #endif
 
     std::string exe_dir = cli_exe_dir(argv[0]);
     if (!make_absolute(exe_dir)) return 1;
     ResolvedPaths rp;
     cli_resolve(opt, exe_dir, rp);
-    for (auto* path : {&rp.elf, &rp.vfs_root, &rp.hdd0, &rp.hdd1, &rp.savedata, &rp.log_file})
+    for (auto* path : {&rp.build_dir, &rp.elf, &rp.vfs_root, &rp.hdd0, &rp.hdd1,
+                       &rp.savedata, &rp.log_dir, &rp.log_file, &rp.audio_wav})
         if (!make_absolute(*path)) return 1;
+#ifdef _WIN32
+    if (rp.rsx_shader_cache != "0" && !make_absolute(rp.rsx_shader_cache)) return 1;
+#endif
     std::string firmware;
-    if (!resolve_firmware(firmware, exe_dir)) return 1;
+    if (!resolve_firmware(firmware, opt, rp.build_dir)) return 1;
 
-    /* Log file first, so everything after it is captured. A bare --log name
-     * lands in <exe dir>/logs. */
-    if (!rp.log_file.empty()) {
-        size_t cut = rp.log_file.rfind('/');
-        if (cut != std::string::npos) make_dirs(rp.log_file.substr(0, cut));
-        if (!freopen(rp.log_file.c_str(), "w", stdout) || !freopen(rp.log_file.c_str(), "a", stderr)) {
-            fprintf(stderr, "error: cannot open log file %s\n", rp.log_file.c_str());
+    /* Log file first so it also captures setup errors. */
+    if (!rp.log_file.empty() && !redirect_log(rp.log_file)) {
+        fprintf(stderr, "error: cannot redirect output to %s\n", rp.log_file.c_str());
+        return 1;
+    }
+
+    const std::string sfo = find_game_files(opt, rp);
+    if (sfo.empty()) {
+        fprintf(stderr,
+                "Game files not found.\n"
+                "Put PARAM.SFO and USRDIR/EBOOT.elf for the fixed 1.02 build in:\n"
+                "  %s\n"
+                "Use --game-dir or --elf to select another location.\n"
+                "ELF path checked: %s\n",
+                rp.vfs_root.c_str(), rp.elf.c_str());
+        keep_explorer_message_open(argc);
+        return 1;
+    }
+
+#ifdef _WIN32
+    // Keep this read handle open through ppu_load_elf so the checked file
+    // cannot be modified or replaced between the two reads.
+    std::unique_ptr<FILE, decltype(&fclose)> pinned_elf(
+        _fsopen(rp.elf.c_str(), "rb", _SH_DENYWR), fclose);
+    if (!matches_fixed_elf(pinned_elf.get())) {
+        fprintf(stderr, "Unsupported or unreadable EBOOT.elf at %s. Use the decrypted fixed 1.02 ELF for this build.\n",
+                rp.elf.c_str());
+        keep_explorer_message_open(argc);
+        return 1;
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
+    if (cellGame_init_from_paramsfo(sfo.c_str()) != 0) {
+        fprintf(stderr, "Game files are incomplete: could not read TITLE_ID from %s.\n", sfo.c_str());
+        keep_explorer_message_open(argc);
+        return 1;
+    }
+    if (strcmp(cellGame_get_title_id(), "NPUA80864") != 0) {
+        fprintf(stderr, "Unsupported title ID in %s. Use the US NPUA80864 game files.\n", sfo.c_str());
+        keep_explorer_message_open(argc);
+        return 1;
+    }
+    g_window_title = rp.title.empty() ? cellGame_get_title() : rp.title;
+
+    // Keep relative paths used internally by the runtime and graphics driver in the port folder.
+    std::error_code cwd_error;
+    std::filesystem::current_path(rp.build_dir, cwd_error);
+    if (cwd_error) {
+        fprintf(stderr, "error: cannot use the build folder %s (%s)\n",
+                rp.build_dir.c_str(), cwd_error.message().c_str());
+        return 1;
+    }
+
+    if (!rp.audio_wav.empty()) {
+        const std::filesystem::path output(rp.audio_wav);
+        std::error_code error;
+        if (output.filename().empty() || std::filesystem::is_directory(output, error)) {
+            fprintf(stderr, "error: audio WAV destination must name a file: %s\n", rp.audio_wav.c_str());
+            return 1;
+        }
+        std::filesystem::create_directories(output.parent_path(), error);
+        if (error) {
+            fprintf(stderr, "error: cannot create the audio WAV directory for %s (%s)\n",
+                    rp.audio_wav.c_str(), error.message().c_str());
             return 1;
         }
     }
 
-    /* The game must be there before anything else is touched. */
-    if (!file_exists(rp.elf)) {
-        fprintf(stderr,
-                "Game files not found.\n"
-                "Expected the game's PPU ELF at:\n  %s\n"
-                "Put the game files in the folder:\n  %s\n"
-                "(it should contain PARAM.SFO and USRDIR/EBOOT.elf), or pass --game-dir / --elf.\n",
-                rp.elf.c_str(), rp.vfs_root.c_str());
+#ifdef _WIN32
+    if (rp.rsx_shader_cache.size() >= MAX_PATH) {
+        fprintf(stderr, "error: D3D12 shader cache path must be shorter than %d bytes.\n", MAX_PATH);
         return 1;
     }
-
-    // Keep relative paths used internally by the runtime and graphics driver in the port folder.
-    std::error_code cwd_error;
-    std::filesystem::current_path(exe_dir, cwd_error);
-    if (cwd_error) {
-        fprintf(stderr, "error: cannot use the executable folder %s (%s)\n",
-                exe_dir.c_str(), cwd_error.message().c_str());
-        return 1;
+    if (!opt.rsx_shader_cache.empty() && rp.rsx_shader_cache != "0") {
+        std::error_code error;
+        std::filesystem::create_directories(rp.rsx_shader_cache, error);
+        if (error) {
+            fprintf(stderr, "error: cannot create D3D12 shader cache directory %s (%s)\n",
+                    rp.rsx_shader_cache.c_str(), error.message().c_str());
+            return 1;
+        }
     }
+    if (!configure_windows_profile(rp.build_dir)) return 1;
+#endif
 
     /* The runtime reads its roots from the environment, so the resolved values
      * (flag, env, or default next to the exe) are exported before it starts. */
@@ -545,6 +745,7 @@ int main(int argc, char** argv)
     cli_setenv("PS3_CAMERA", "0");
     cli_setenv("PS3_HTTP_OFFLINE", "1");
     cli_setenv("PS3_VERBOSE", std::to_string(rp.verbose).c_str());
+    cli_apply_tuning(opt, rp);
     if (rp.verbose > 0)
         fprintf(stderr, "[boot] Verbose runtime logging enabled (PS3_VERBOSE=%d)\n", rp.verbose);
     if (opt.width)  g_window_w = (uint32_t)opt.width;
@@ -558,7 +759,6 @@ int main(int argc, char** argv)
      * inflates every shorter wait the title makes and throttles the whole
      * thing. POSIX timers are already fine-grained. */
     timeBeginPeriod(1);
-    setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: do not lose prints on a kill */
 #endif
 
     printf("=== ps3recomp game runner ===\n");
@@ -569,8 +769,12 @@ int main(int argc, char** argv)
     }
 
     uint32_t entry = ppu_load_elf(rp.elf.c_str());
+#ifdef _WIN32
+    pinned_elf.reset();
+#endif
     if (!entry) {
         fprintf(stderr, "ERROR: could not load %s\n", rp.elf.c_str());
+        keep_explorer_message_open(argc);
         return 1;
     }
 
@@ -578,20 +782,6 @@ int main(int argc, char** argv)
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
     printf("[boot] hdd0: %s\n[boot] hdd1: %s\n[boot] savedata: %s\n",
            rp.hdd0.c_str(), rp.hdd1.c_str(), rp.savedata.c_str());
-
-    /* Title ID and name come from the game's real PARAM.SFO. No fallback id:
-     * if it cannot be read, say so and stop rather than run as BLES00000. */
-    {
-        std::string sfo = rp.vfs_root + "/PARAM.SFO";
-        if (!file_exists(sfo)) sfo = rp.vfs_root + "/PS3_GAME/PARAM.SFO";
-        if (cellGame_init_from_paramsfo(sfo.c_str()) != 0) {
-            fprintf(stderr, "ERROR: could not read the title ID from PARAM.SFO.\n"
-                            "Expected %s/PARAM.SFO (or %s/PS3_GAME/PARAM.SFO).\n",
-                    rp.vfs_root.c_str(), rp.vfs_root.c_str());
-            return 1;
-        }
-        g_window_title = !rp.title.empty() ? rp.title : std::string(cellGame_get_title());
-    }
 
     ppu_recomp_register();   /* lifted function table -> address map */
     ps3_load_prx_modules();  /* this game's lifted system PRX, if it has any */
