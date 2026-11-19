@@ -317,3 +317,13 @@ A title, menu and course run saved about 500 textures (169 MB). Four grass textu
 
 Measurements for the 4K and 120 FPS work are in `docs/MODERN-PC-ROADMAP.md`. The course runs at about 39 FPS, resolution does not change FPS, and 4K stops drawing at x=2047 because the shared depth buffer is 2048x2048.
 
+## 2026-11-19 update 35: full 1440p and 4K output (patch 0048)
+
+At 2560x1440 and 3840x2160 the image stopped at x=2047, leaving the right side of the screen black. D3D12 draws only inside the smallest attached target, and the shared depth buffer was fixed at 2048x2048. Patch `0048` sizes it to the larger of 2048 and the window, and grows it if an offscreen target is bigger. It also stretches loading-screen flips to the whole window and gives display passes pixel positions in the game's 1600x1080 space (`RSX_WPOS_SCALE=0` turns that off).
+
+For 4K, run with `--width 3840 --height 2160`. Resolution is free. Course FPS is the same at every size, about 32 to 34, and GPU memory rises from about 200 MB at 720p to 385 MB at 4K. The D3D12 debug layer showed no errors over 9,000 frames at 4K. A 1080p frame and a downscaled 4K frame of the same tee match apart from sharpness. Nothing regressed at 720p: a New Game round still reached hole 3.
+
+New debug switches: `RSX_SHOT=<dir>` with `RSX_SHOT_SECS` saves full-size frames, and `D3D12_IQ=2` prints only debug-layer errors.
+
+Found along the way and older than this patch: during the swing, some frames show the background and HUD without the golfer. Effect passes still run at the game's own size, so bloom and similar effects are not sharper at 4K yet.
+

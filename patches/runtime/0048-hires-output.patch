@@ -1,0 +1,402 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -435,6 +435,7 @@
+     /* Depth/stencil */
+     ID3D12DescriptorHeap* dsv_heap;
+     ID3D12Resource*       depth_buffer;
++    u32                   depth_w, depth_h;       /* its size (depth_ensure) */
+ 
+     /* Dynamic vertex buffer (upload heap) */
+     ID3D12Resource*       vertex_buffer;
+@@ -1246,9 +1247,14 @@
+          * D3D12 clips rasterization to the smallest bound attachment, and
+          * this DSV is shared by every pass -- with a window-sized depth
+          * buffer, draws into larger offscreen RTs (wave's 1920x1080 input
+-         * image) were silently cropped to the window rect. */
+-        depth_desc.Width              = 2048;
+-        depth_desc.Height             = 2048;
++         * image) were silently cropped to the window rect. At least
++         * 2048x2048 (every guest surface this backend allocates fits) and at
++         * least the backbuffer: a fixed 2048 cut a 2560- or 3840-wide window
++         * off at x=2047. A larger offscreen pass grows it (depth_ensure). */
++        s_d3d.depth_w = width  > 2048 ? width  : 2048;
++        s_d3d.depth_h = height > 2048 ? height : 2048;
++        depth_desc.Width              = s_d3d.depth_w;
++        depth_desc.Height             = s_d3d.depth_h;
+         depth_desc.DepthOrArraySize   = 1;
+         depth_desc.MipLevels          = 1;
+         /* Typeless, so the display depth can also be read (dispz_convert:
+@@ -1281,7 +1287,8 @@
+         s_d3d.device->lpVtbl->CreateDepthStencilView(
+             s_d3d.device, s_d3d.depth_buffer, &dsv_desc, dsv_handle);
+ 
+-        printf("[D3D12] Depth buffer created (%ux%u D24S8)\n", width, height);
++        printf("[D3D12] Depth buffer created (%ux%u D24S8, backbuffer %ux%u)\n",
++               s_d3d.depth_w, s_d3d.depth_h, width, height);
+     }
+ 
+     /* Create command allocators and command list */
+@@ -2218,6 +2225,71 @@
+     if (v < 0) { const char* e = getenv("RSX_KEEP_DISPLAY"); v = (e && e[0] == '0') ? 0 : 1; }
+     return v;
+ }
++/* This process's local (dedicated) video memory in use, in MB; 0 if unknown. */
++static double vram_used_mb(void)
++{
++    if (!s_d3d.device) return 0.0;
++    LUID luid;
++    s_d3d.device->lpVtbl->GetAdapterLuid(s_d3d.device, &luid);
++    IDXGIFactory4* f = NULL;
++    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&f)) || !f) return 0.0;
++    IDXGIAdapter3* a = NULL;
++    double mb = 0.0;
++    if (SUCCEEDED(f->lpVtbl->EnumAdapterByLuid(f, luid, &IID_IDXGIAdapter3, (void**)&a)) && a) {
++        DXGI_QUERY_VIDEO_MEMORY_INFO mi;
++        if (SUCCEEDED(a->lpVtbl->QueryVideoMemoryInfo(a, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)))
++            mb = (double)mi.CurrentUsage / 1048576.0;
++        a->lpVtbl->Release(a);
++    }
++    f->lpVtbl->Release(f);
++    return mb;
++}
++
++/* RSX_SHOT=<dir> with RSX_SHOT_SECS=<s>[,<s>...]: write the presented
++ * backbuffer at its full size to <dir>/shot_<s>.bmp, from the first presented
++ * frame with draws once the process has run s seconds. A window capture on a
++ * hidden desktop is cut to that desktop's size, so a 4K frame cannot be judged
++ * from one. Each shot also logs the process's video memory use. Called after
++ * the frame is submitted and before Present (backbuffer in PRESENT). */
++static void rsx_shot(u32 fi)
++{
++    static int on = -1, n = 0, done = 0;
++    static double at[32];
++    static const char* dir = NULL;
++    if (on < 0) {
++        dir = getenv("RSX_SHOT");
++        const char* e = getenv("RSX_SHOT_SECS");
++        on = 0;
++        if (dir && *dir && e) {
++            while (*e && n < 32) {
++                char* end = NULL;
++                const double v = strtod(e, &end);
++                if (end == e) break;
++                at[n++] = v;
++                e = (*end == ',') ? end + 1 : end;
++            }
++            on = n > 0;
++            if (on) CreateDirectoryA(dir, NULL);
++        }
++    }
++    if (!on || done >= n) return;
++    FILETIME c, x, k, u, now;
++    GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u);
++    GetSystemTimeAsFileTime(&now);
++    const double up = (double)((((u64)now.dwHighDateTime << 32) | now.dwLowDateTime) -
++                               (((u64)c.dwHighDateTime << 32) | c.dwLowDateTime)) / 1e7;
++    if (up < at[done]) return;
++    char path[512];
++    snprintf(path, sizeof path, "%s/shot_%g.bmp", dir, at[done]);
++    while (done < n && up >= at[done]) done++;   /* one frame per due time; skip ones already passed */
++    cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
++                       DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, path);
++    printf("[SHOT] %s %ux%u t=%.1fs frame=%llu draws=%u depth=%ux%u vram=%.0fMB\n", path,
++           s_d3d.width, s_d3d.height, up, (unsigned long long)s_d3d.frame_count,
++           s_dbg_last_draws, s_d3d.depth_w, s_d3d.depth_h, vram_used_mb());
++    fflush(stdout);
++}
++
+ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+ {
+     char dir[300]; const char* base = getenv("RSX_CAP_DIR");
+@@ -3341,6 +3413,64 @@
+     return v;
+ }
+ static u32 fp_tag(void) { return ((s_fp_evictions * 2654435761u) ^ (u32)s_d3d.vp_gen) | 1u; }
++/* RSX_WPOS_DBG=1: fragment programs that read WPOS, and the first display
++ * draws that run one. This backend leaves WPOS in host pixels; on a backbuffer
++ * scaled from the guest's surface (RSX_VP_SCALE) a program that turns WPOS
++ * into a texture coordinate with the guest's size would read the wrong texel. */
++static int wpos_dbg_on(void)
++{
++    static int v = -1;
++    if (v < 0) v = getenv("RSX_WPOS_DBG") ? 1 : 0;
++    return v;
++}
++static u32 s_wpos_fp[64];
++static int s_wpos_n = 0;
++static int fp_reads_wpos(u32 fp_addr)
++{
++    for (int i = 0; i < s_wpos_n; i++) if (s_wpos_fp[i] == fp_addr) return 1;
++    return 0;
++}
++
++static int wpos_scale_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_WPOS_SCALE"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++/* Route every WPOS read through _rsx_wpos_s, which scales the host position
++ * by rsx_texscale[0].w / [1].w when they are set. Needs the cbuffer that
++ * fp_rebind_b1 declares; the helper goes right after it. */
++static int fp_apply_wpos_scale(char* hlsl, size_t cap)
++{
++    static const char from[] = "_rsx_wpos(input.position)";
++    static const char to[]   = "_rsx_wpos(_rsx_wpos_s(input.position))";
++    static const char anchor[] = "static const float4 fp_alpha = float4(0, 0, 0, 0);\n";
++    static const char helper[] =
++        "float4 _rsx_wpos_s(float4 p) {\n"
++        "    return rsx_texscale[0].w != 0.0\n"
++        "        ? float4(p.x * rsx_texscale[0].w, p.y * rsx_texscale[1].w, p.z, p.w) : p;\n"
++        "}\n";
++    if (strstr(hlsl, "_rsx_wpos_s(")) return -1;
++    char* at = strstr(hlsl, anchor);
++    if (!at) return -1;
++    size_t len = strlen(hlsl), n = 0;
++    for (const char* q = strstr(hlsl, from); q; q = strstr(q + 1, from)) n++;
++    const size_t grow = n * (sizeof to - sizeof from) + (sizeof helper - 1);
++    if (len + grow + 1 > cap) return -1;
++    /* helper after the anchor */
++    at += sizeof anchor - 1;
++    memmove(at + sizeof helper - 1, at, len - (size_t)(at - hlsl) + 1);
++    memcpy(at, helper, sizeof helper - 1);
++    len += sizeof helper - 1;
++    /* each read, back to front so earlier offsets stay valid */
++    for (char* q = strstr(at, from); q; q = strstr(q + (sizeof to - 1), from)) {
++        memmove(q + (sizeof to - 1), q + (sizeof from - 1), len - (size_t)(q - hlsl) - (sizeof from - 1) + 1);
++        memcpy(q, to, sizeof to - 1);
++        len += sizeof to - sizeof from;
++    }
++    return 1;
++}
++
+ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
+                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
+                                           u32 cube_mask, u32 unnorm_mask, const u32 unnorm_dim[16][3], u64 zs,
+@@ -3522,6 +3652,27 @@
+     if (unnorm_mask) {
+         rsx_fp_apply_unnorm_scale(hlsl, sizeof(hlsl), unnorm_mask, (const u32 (*)[3])unnorm_dim, cube_mask, 0);
+     }
++    /* WPOS in guest pixels. The backbuffer stands in for a display surface of
++     * the guest's size (RSX_VP_SCALE), so SV_Position runs over the window
++     * while the program divides WPOS by the guest's size to address a
++     * screen-sized texture: at 1280x720 such a pass read the top-left 80% of
++     * its source, at 4K 2.4x past its edge. vp_record_cb puts the guest/host
++     * ratio in rsx_texscale[0].w and [1].w for a scaled display draw (0
++     * elsewhere: host position, as before). RSX_WPOS_SCALE=0 turns it off. */
++    if (wpos_scale_on() && strstr(hlsl, "float4 rsx_texscale[4];") &&
++        strstr(hlsl, "_rsx_wpos(input.position)"))
++        if (fp_apply_wpos_scale(hlsl, sizeof(hlsl)) < 0) {
++            static int _ew = 0;
++            if (PS3_LOG_FIRST(_ew, 8))
++                printf("[FP] WPOS scale not applied (fp=0x%08X)\n", fp_addr);
++        }
++    if (wpos_dbg_on() && (strstr(hlsl, "_rsx_wpos(input.position)") || strstr(hlsl, "_rsx_wpos_s(input.position)")) &&
++        !fp_reads_wpos(fp_addr) &&
++        s_wpos_n < 64) {
++        s_wpos_fp[s_wpos_n++] = fp_addr;
++        fprintf(stderr, "[WPOS] fp=0x%08X reads WPOS%c", fp_addr, 10);
++        if (getenv("RSX_WPOS_DBG")[0] == '2') fprintf(stderr, "%s%c", hlsl, 10);
++    }
+     /* FP_LIST=1: every program the title actually compiles, with its size. A
+      * fragment program that hangs the GPU shows up here as an implausible
+      * instruction count long before it shows up as a TDR. */
+@@ -4835,6 +4986,18 @@
+                               (dr->tex[_u].ctrl0 & 0x80000004u) == 0x80000004u;
+             ts[_u*4+0] = sx; ts[_u*4+1] = sy; ts[_u*4+2] = akill ? 1.0f : 0.0f; ts[_u*4+3] = 0.0f;
+         }
++        /* WPOS guest/host ratio (see fp_apply_wpos_scale): a display draw the
++         * draw loop scales from the guest surface to the backbuffer. */
++        if (dr && !dr->rt_off && !dr->no_color && wpos_scale_on() &&
++            dr->surf_w >= 16 && dr->surf_h >= 16 && dr->surf_w <= 4096 && dr->surf_h <= 4096 &&
++            (dr->surf_w != s_d3d.width || dr->surf_h != s_d3d.height)) {
++            static int vsc = -1;
++            if (vsc < 0) { const char* e = getenv("RSX_VP_SCALE"); vsc = (e && e[0] == '0') ? 0 : 1; }
++            if (vsc) {
++                ts[3] = (float)dr->surf_w / (float)s_d3d.width;
++                ts[7] = (float)dr->surf_h / (float)s_d3d.height;
++            }
++        }
+         /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
+          * has no fixed alpha test; guest FPs discard on it dynamically
+          * (wave's colour wheel is a disc via alpha test -- without it the
+@@ -5693,6 +5856,7 @@
+     s_dispz_nconv = s_dispz_nmake = s_dispz_nbind = 0; t0 = now;
+ }
+ 
++static void dispz_srvs(void);
+ static int dispz_init(void)
+ {
+     if (s_dispz_pso[0]) return 1;
+@@ -5778,7 +5942,14 @@
+         s_dispz_pso[0]->lpVtbl->Release(s_dispz_pso[0]); s_dispz_pso[0] = NULL;
+         return 0;
+     }
+-    /* Depth and stencil views of the shared buffer. */
++    dispz_srvs();
++    failed = 0;
++    return 1;
++}
++
++/* Depth and stencil views of the shared buffer (again after depth_ensure). */
++static void dispz_srvs(void)
++{
+     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
+     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+@@ -5792,8 +5963,51 @@
+     sv.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+     sv.Texture2D.PlaneSlice = 1;
+     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.depth_buffer, &sv, sh);
+-    failed = 0;
+-    return 1;
++}
++
++/* Grow the shared depth buffer to cover a w x h target. It is bound with the
++ * backbuffer and with every offscreen pass that has no depth surface of its
++ * own, and D3D12 clips rasterisation to the smallest attachment. Only called
++ * from render_frame's pre-pass: the GPU is idle (wait_for_gpu at its top) and
++ * nothing recorded so far this frame references the buffer. Never shrinks;
++ * the new buffer starts cleared. */
++static void depth_ensure(u32 w, u32 h)
++{
++    if (!s_d3d.depth_buffer || !s_d3d.device) return;
++    if (w <= s_d3d.depth_w && h <= s_d3d.depth_h) return;
++    if (w > 16384 || h > 16384) return;
++    const u32 nw = w > s_d3d.depth_w ? w : s_d3d.depth_w;
++    const u32 nh = h > s_d3d.depth_h ? h : s_d3d.depth_h;
++    D3D12_RESOURCE_DESC dd = {0};
++    s_d3d.depth_buffer->lpVtbl->GetDesc(s_d3d.depth_buffer, &dd);
++    dd.Width = nw; dd.Height = nh;
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_CLEAR_VALUE cv = {0};
++    cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
++    cv.DepthStencil.Depth = 1.0f;
++    ID3D12Resource* nd = NULL;
++    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
++            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &dd,
++            D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, &IID_ID3D12Resource, (void**)&nd)) || !nd) {
++        static int _n = 0; if (PS3_LOG_FIRST(_n, 2))
++            printf("[D3D12] depth buffer grow to %ux%u failed\n", nw, nh);
++        return;
++    }
++    wait_for_gpu();
++    s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
++    s_d3d.depth_buffer = nd;
++    s_d3d.depth_w = nw; s_d3d.depth_h = nh;
++    D3D12_DEPTH_STENCIL_VIEW_DESC dv = {0};
++    dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
++    dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
++    D3D12_CPU_DESCRIPTOR_HANDLE dh;
++    s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dh);
++    s_d3d.device->lpVtbl->CreateDepthStencilView(s_d3d.device, nd, &dv, dh);
++    if (s_dispz_pso[0]) dispz_srvs();
++    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dh,
++        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
++    s_dispz_gen++;
++    printf("[D3D12] depth buffer grown to %ux%u for a %ux%u target\n", nw, nh, w, h);
+ }
+ 
+ /* The copy of kind `k` at w x h (made, or remade when its size changes and no
+@@ -6369,9 +6583,14 @@
+      * display buffers against a 1280x720 backbuffer and shows a few flips with
+      * no draws while loading, so its first one did exactly that. Shrink a
+      * buffer that does not fit (nearest sample, as scanout scales to the video
+-     * mode); one that fits is copied unchanged, as before. */
+-    const u32 dw = gw > s_d3d.width  ? s_d3d.width  : gw;
+-    const u32 dh = gh > s_d3d.height ? s_d3d.height : gh;
++     * mode); one that fits is copied unchanged, as before. With
++     * RSX_VP_SCALE (the default) a smaller one is stretched to the whole
++     * backbuffer too, as the draws are: at 1920x1080 or 4K a 1600x1080
++     * buffer copied 1:1 left the loading flips black on the right. */
++    static int vsc = -1;
++    if (vsc < 0) { const char* e = getenv("RSX_VP_SCALE"); vsc = (e && e[0] == '0') ? 0 : 1; }
++    const u32 dw = (vsc || gw > s_d3d.width)  ? s_d3d.width  : gw;
++    const u32 dh = (vsc || gh > s_d3d.height) ? s_d3d.height : gh;
+     if (!dw || !dh) return;
+     const u32 up_pitch = (dw * 4u + 255u) & ~255u;   /* 256-byte rows */
+     static ID3D12Resource* up = NULL;
+@@ -6854,8 +7073,10 @@
+     for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
+     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+         D3D12DrawRecord* dr = &s_d3d.draws[_d];
+-        if (dr->is_vp && dr->rt_off)
+-            off_rt_get(dr->rt_off, dr->rt_w, dr->rt_h, dr->rt_fmt);
++        if (dr->is_vp && dr->rt_off) {
++            const int _s = off_rt_get(dr->rt_off, dr->rt_w, dr->rt_h, dr->rt_fmt);
++            if (_s >= 0) depth_ensure(s_d3d.off_rt[_s].w, s_d3d.off_rt[_s].h);
++        }
+         for (int _m = 0; _m < 3; _m++)
+             if (dr->is_vp && dr->rt_mrt[_m])
+                 off_rt_get(dr->rt_mrt[_m], dr->rt_w, dr->rt_h, dr->rt_fmt);
+@@ -7651,6 +7872,19 @@
+                                       (LONG)(dvp.TopLeftY + dvp.Height)};
+                     dvp_x = dvp.TopLeftX; dvp_y = dvp.TopLeftY;
+                     dvp_w = dvp.Width;    dvp_h = dvp.Height;
++                    if (wpos_dbg_on() && dr->fp_addr && fp_reads_wpos(dr->fp_addr)) {
++                        static u32 seen[128]; static int ns = 0;
++                        const u32 key = dr->fp_addr ^ (cur_rt < 0 ? 0x80000000u : 0u);
++                        int k = 0; while (k < ns && seen[k] != key) k++;
++                        if (k == ns && ns < 128) {
++                            seen[ns++] = key;
++                            fprintf(stderr, "[WPOS] draw fp=0x%08X rt=%d target %.0fx%.0f guest surf %ux%u"
++                                            " vp %u,%u %ux%u frame %llu t8=0x%08X %ux%u%c", dr->fp_addr, cur_rt, tw, th,
++                                    dr->surf_w, dr->surf_h, dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h,
++                                    (unsigned long long)s_d3d.frame_count, dr->tex[8].set ? dr->tex[8].raw : 0u,
++                                    dr->tex[8].w, dr->tex[8].h, 10);
++                        }
++                    }
+                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &dvp);
+                     s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &dsc);
+                 }
+@@ -8038,24 +8272,36 @@
+      * verified correct -- so the only remaining explanation is a validation
+      * error the debug layer is swallowing. Off unless the env var is set. */
+     { static int _iq = -1;
+-      if (_iq < 0) { const char* e = getenv("D3D12_IQ"); _iq = e ? 1 : 0; }
++      /* D3D12_IQ=2: print only corruption/error messages (the 80-line cap
++       * otherwise fills with warnings) and log a per-severity tally every
++       * 1800 frames. */
++      if (_iq < 0) { const char* e = getenv("D3D12_IQ"); _iq = e ? (e[0] == '2' ? 2 : 1) : 0; }
+       if (_iq && s_d3d.device) {
+         ID3D12InfoQueue* iq = NULL;
+         if (SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(
+                 s_d3d.device, &IID_ID3D12InfoQueue, (void**)&iq)) && iq) {
+             UINT64 n = iq->lpVtbl->GetNumStoredMessages(iq);
+             static int _printed = 0;
+-            for (UINT64 mi = 0; mi < n && _printed < 80; mi++) {
++            static u64 _tally[5];
++            for (UINT64 mi = 0; mi < n && (_iq == 2 || _printed < 80); mi++) {
+                 SIZE_T len = 0;
+                 iq->lpVtbl->GetMessage(iq, mi, NULL, &len);
+                 D3D12_MESSAGE* m = (D3D12_MESSAGE*)malloc(len);
+                 if (m && SUCCEEDED(iq->lpVtbl->GetMessage(iq, mi, m, &len))) {
+-                    fprintf(stderr, "[D3D12-IQ][sev=%d id=%d] %s\n",
+-                            (int)m->Severity, (int)m->ID, m->pDescription);
+-                    _printed++;
++                    if ((unsigned)m->Severity < 5) _tally[m->Severity]++;
++                    if (_printed < 80 && (_iq == 1 || m->Severity <= D3D12_MESSAGE_SEVERITY_ERROR)) {
++                        fprintf(stderr, "[D3D12-IQ][sev=%d id=%d] %s\n",
++                                (int)m->Severity, (int)m->ID, m->pDescription);
++                        _printed++;
++                    }
+                 }
+                 free(m);
+             }
++            if (_iq == 2 && s_d3d.frame_count % 1800 == 0)
++                fprintf(stderr, "[D3D12-IQ] frame %llu: corruption %llu error %llu warning %llu info %llu\n",
++                        (unsigned long long)s_d3d.frame_count, (unsigned long long)_tally[0],
++                        (unsigned long long)_tally[1], (unsigned long long)_tally[2],
++                        (unsigned long long)_tally[3]);
+             if (n) iq->lpVtbl->ClearStoredMessages(iq);
+             iq->lpVtbl->Release(iq);
+             fflush(stderr);
+@@ -8248,6 +8494,8 @@
+         }
+       } }
+ 
++    if (s_present_this_frame && s_dbg_last_draws > 0) rsx_shot(fi);
++
+     /* Present, on the vblank unless D3D12_VSYNC=0: that one is for measuring a
+      * title past the display's rate. Skipped for an offscreen-only batch. */
+     if (_pf0) _pf4 = perf_now();   /* debug dumps above are not "submit" */
