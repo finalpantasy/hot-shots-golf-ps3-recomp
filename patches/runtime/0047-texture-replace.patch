@@ -1,0 +1,989 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -328,6 +328,11 @@
+     int used;           /* referenced this frame */
+     u32 last_frame;     /* frame_count when last referenced: the slot least
+                          * recently used is the one given to a new texture */
++    /* TEX_REPLACE: when rep_w is non-zero the resource is an HD replacement of
++     * rep_w x rep_h with rep_mips levels in rep_dxgi, not the guest's w x h. */
++    u32 rep_w, rep_h, rep_mips;
++    int rep_dxgi;
++    u64 rep_bytes;
+ } VPTexSlot;
+ /* Distinct textures uploadable per frame. */
+ #define VP_TEX_SLOTS 256
+@@ -3996,6 +4001,128 @@
+     }
+ }
+ 
++/* ---- TEX_DUMP / TEX_REPLACE (see rsx_texrep.inc) --------------------------- */
++#include "rsx_texrep.inc"
++
++/* A resource the GPU may still be reading (a replaced texture's old image, an
++ * upload buffer) is released a few frames later, not at once. */
++typedef struct { ID3D12Resource* r; u64 frame; } TexDefer;
++static TexDefer s_texdefer[1024];
++static int s_texdefer_n;
++static void texrep_defer(ID3D12Resource* r)
++{
++    if (!r) return;
++    if (s_texdefer_n >= 1024) {   /* cannot happen at the per-frame rates here; stay bounded anyway */
++        s_texdefer[0].r->lpVtbl->Release(s_texdefer[0].r);
++        memmove(&s_texdefer[0], &s_texdefer[1], sizeof(TexDefer) * 1023); s_texdefer_n--;
++    }
++    s_texdefer[s_texdefer_n].r = r; s_texdefer[s_texdefer_n].frame = (u64)s_d3d.frame_count; s_texdefer_n++;
++}
++static void texrep_defer_tick(void)
++{
++    int o = 0;
++    for (int i = 0; i < s_texdefer_n; i++) {
++        if ((u64)s_d3d.frame_count >= s_texdefer[i].frame + FRAME_COUNT + 4) s_texdefer[i].r->lpVtbl->Release(s_texdefer[i].r);
++        else s_texdefer[o++] = s_texdefer[i];
++    }
++    s_texdefer_n = o;
++}
++
++/* Upload the replacement for entry `e` into slot `t` (guest size w x h). Returns
++ * 1 when the slot now holds it; 0 leaves the guest path to upload as usual. The
++ * decoded file lives only inside this call; its upload buffer is released a few
++ * frames later. */
++static int texrep_apply(VPTexSlot* t, TrpEntry* e, u32 w, u32 h)
++{
++    TrpImage im; memset(&im, 0, sizeof im);
++    if (!(e->dds ? trp_dds_load(e->path, &im) : trp_png_load(e->path, &im))) {
++        e->failed = 1; trp_repl_fail++;
++        fprintf(stderr, "[texrep] cannot load %s (unsupported or corrupt), keeping the original\n", e->path);
++        return 0;
++    }
++    if ((u64)im.w * h != (u64)im.h * w) {
++        e->failed = 1; trp_repl_fail++;
++        fprintf(stderr, "[texrep] %s is %ux%u but the texture is %ux%u (aspect must match), keeping the original\n", e->path, im.w, im.h, w, h);
++        trp_img_free(&im); return 0;
++    }
++    u64 held = 0;
++    for (int i = 0; i < VP_TEX_SLOTS; i++) if (&s_d3d.vp_tex[i] != t && s_d3d.vp_tex[i].res) held += s_d3d.vp_tex[i].rep_bytes;
++    if (held + im.bytes > trp_cap_bytes) {
++        e->failed = 1; trp_over_cap++;
++        fprintf(stderr, "[texrep] cache cap reached (%llu MB held), %s not loaded\n", (unsigned long long)(held >> 20), e->path);
++        trp_img_free(&im); return 0;
++    }
++    ID3D12Device* dev = s_d3d.device;
++    int fresh = 0, ok = 0;
++    ID3D12Resource* up = NULL;
++    if (t->res && !(t->rep_w == im.w && t->rep_h == im.h && t->rep_mips == im.nlv && t->rep_dxgi == (int)im.dxgi)) {
++        texrep_defer(t->res); t->res = NULL;
++        t->rep_w = t->rep_h = t->rep_mips = 0; t->rep_dxgi = 0; t->rep_bytes = 0;
++    }
++    D3D12_RESOURCE_DESC td = {0};
++    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    td.Width = im.w; td.Height = im.h; td.DepthOrArraySize = 1; td.MipLevels = (UINT16)im.nlv;
++    td.Format = (DXGI_FORMAT)im.dxgi; td.SampleDesc.Count = 1; td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    D3D12_PLACED_SUBRESOURCE_FOOTPRINT lay[TRP_MAXLV]; UINT nrows[TRP_MAXLV]; UINT64 rsz[TRP_MAXLV], total = 0;
++    dev->lpVtbl->GetCopyableFootprints(dev, &td, 0, im.nlv, 0, lay, nrows, rsz, &total);
++    D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1;
++    bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hu, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&up))) goto out;
++    if (!t->res) {
++        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++        if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &td,
++                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&t->res))) { t->res = NULL; goto out; }
++        fresh = 1;
++    }
++    {
++        u8* mp = NULL; D3D12_RANGE nr = {0, 0};
++        if (FAILED(up->lpVtbl->Map(up, 0, &nr, (void**)&mp)) || !mp) goto out;
++        for (u32 l = 0; l < im.nlv; l++) {
++            const u32 rb = im.lrow[l] < (u32)rsz[l] ? im.lrow[l] : (u32)rsz[l];
++            for (u32 r = 0; r < nrows[l] && r < im.lrows[l]; r++)
++                memcpy(mp + lay[l].Offset + (u64)r * lay[l].Footprint.RowPitch, im.lv[l] + (size_t)r * im.lrow[l], rb);
++        }
++        up->lpVtbl->Unmap(up, 0, NULL);
++    }
++    if (!fresh) {
++        D3D12_RESOURCE_BARRIER b = {0};
++        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = t->res;
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
++    }
++    for (u32 l = 0; l < im.nlv; l++) {
++        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
++        dst.pResource = t->res; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = l;
++        src.pResource = up; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = lay[l];
++        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
++    }
++    {
++        D3D12_RESOURCE_BARRIER b = {0};
++        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = t->res;
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
++    }
++    t->rep_w = im.w; t->rep_h = im.h; t->rep_mips = im.nlv; t->rep_dxgi = (int)im.dxgi; t->rep_bytes = im.bytes;
++    ok = 1;
++    trp_replaced++;
++    if (trp_replaced <= 12 || !(trp_replaced % 50))
++        fprintf(stderr, "[texrep] indexed %u, replaced %u (%ux%u -> %ux%u, %u mips, %s)\n", trp_nidx, trp_replaced, w, h, im.w, im.h, im.nlv, e->path);
++out:
++    if (up) texrep_defer(up);
++    if (!ok && fresh && t->res) { t->res->lpVtbl->Release(t->res); t->res = NULL; }
++    if (!t->res) { t->rep_w = t->rep_h = t->rep_mips = 0; t->rep_dxgi = 0; t->rep_bytes = 0; }
++    if (!ok) { e->failed = 1; trp_repl_fail++; fprintf(stderr, "[texrep] D3D upload of %s failed, keeping the original\n", e->path); }
++    trp_img_free(&im);
++    return ok;
++}
++
+ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips, u32 pitch_arg)
+ {
+     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
+@@ -4202,6 +4329,30 @@
+     VPTexSlot* t = &s_d3d.vp_tex[slot];
+     t->last_frame = s_d3d.frame_count;
+     t->pitch = pitch_arg;
++    /* TEX_DUMP / TEX_REPLACE: identify the texture by its guest bytes (only
++     * here, on a (re)upload -- a cached bind returned above) and either note it
++     * for dumping or bind an HD replacement instead of uploading the guest data. */
++    if (!cube && trp_active()) {
++        const double trp_t0 = perf_now();
++        if (tl.fmt == RSX_TEXFMT_R8G8B8A8 || tl.fmt == RSX_TEXFMT_BC1 ||
++            tl.fmt == RSX_TEXFMT_BC2 || tl.fmt == RSX_TEXFMT_BC3) {
++            const u8* gsrc = vm_base + off;
++            const u64 hh = trp_hash(gsrc, tl.face_bytes, ((u64)(fmt & 0xFF) << 56) ^ ((u64)w << 28) ^ (u64)h);
++            trp_observe(key_off, w, h, fmt, hh, &tl, gsrc, (u64)s_d3d.frame_count);
++            if (trp_repl_on && !(fmt & 0x40)) {   /* 0x40: unnormalized coordinates, never replaced */
++                TrpEntry* te = trp_find(hh);
++                if (te && !te->failed && texrep_apply(t, te, w, h)) {
++                    t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
++                    t->cube = cube; t->used = 1;
++                    { u32 nb2 = dxt ? (blkrow * blkrows) : (w * h * bpp);
++                      t->csum = TEX_CSUM(vm_base + off, nb2); }
++                    trp_ms += (perf_now() - trp_t0) * 1000.0;
++                    return slot;
++                }
++            }
++        } else trp_skip_fmt++;
++        trp_ms += (perf_now() - trp_t0) * 1000.0;
++    }
+     /* The upload buffer's rows hold the DECODED image, so they are sized from
+      * dst_row_bytes -- w * bpp is the source row, which is narrower for any
+      * format rsx_texture_decode unpacks. */
+@@ -4212,6 +4363,10 @@
+      * the same dimensions would otherwise be reused with 1 array slice while the
+      * cube path copies 6 subresources and writes a 6x upload buffer -- which
+      * crashes. */
++    if (t->res && t->rep_w) {   /* the slot holds an HD replacement: never reuse it for guest data */
++        texrep_defer(t->res); t->res = NULL;
++        t->rep_w = t->rep_h = t->rep_mips = 0; t->rep_dxgi = 0; t->rep_bytes = 0;
++    }
+     if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->pitch != pitch_arg)) {
+         t->res->lpVtbl->Release(t->res); t->res = NULL;
+         if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
+@@ -5143,12 +5298,12 @@
+  * calls a frame on a 3500-draw course view. Resources a window names stay
+  * alive for the frame (a texture slot used this frame is never evicted), so
+  * the earlier window still describes exactly what this draw would write. */
+-typedef struct { ID3D12Resource* res; UINT mapping; int fmt, cube, set; } SrvStage;
++typedef struct { ID3D12Resource* res; UINT mapping; int fmt, cube, set, mips; } SrvStage;
+ static SrvStage s_srv_cur[DRAW_SRV_STRIDE], s_srv_prev[DRAW_SRV_STRIDE];
+ static int  s_srv_staging = 0;
+ static u32  s_srv_stage_base = 0, s_srv_prev_win = ~0u;
+ static void srv_write_now(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
+-                          UINT mapping, int cube);
++                          UINT mapping, int cube, int mips);
+ static int srv_dedup_on(void)
+ {
+     static int v = -1;
+@@ -5174,30 +5329,37 @@
+     for (int u = 0; u < DRAW_SRV_STRIDE; u++)
+         if (s_srv_cur[u].set)
+             srv_write_now(s_srv_stage_base + (u32)u, s_srv_cur[u].res, (DXGI_FORMAT)s_srv_cur[u].fmt,
+-                          s_srv_cur[u].mapping, s_srv_cur[u].cube);
++                          s_srv_cur[u].mapping, s_srv_cur[u].cube, s_srv_cur[u].mips);
+     if (all) { memcpy(s_srv_prev, s_srv_cur, sizeof s_srv_cur); s_srv_prev_win = s_srv_stage_base; }
+     else s_srv_prev_win = ~0u;
+     return s_srv_stage_base;
+ }
+-static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
+-                         UINT mapping, int cube)
++/* mips: 0 = a single-level texture (every guest upload), else the level count
++ * of a TEX_REPLACE replacement. */
++static void srv_write_ex2(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
++                          UINT mapping, int cube, int mips)
+ {
+     if (s_srv_staging && heap_slot - s_srv_stage_base < DRAW_SRV_STRIDE) {
+         SrvStage* g = &s_srv_cur[heap_slot - s_srv_stage_base];
+         memset(g, 0, sizeof *g);
+-        g->res = res; g->mapping = mapping; g->fmt = (int)fmt; g->cube = cube ? 1 : 0; g->set = 1;
++        g->res = res; g->mapping = mapping; g->fmt = (int)fmt; g->cube = cube ? 1 : 0; g->set = 1; g->mips = mips;
+         return;
+     }
+-    srv_write_now(heap_slot, res, fmt, mapping, cube);
++    srv_write_now(heap_slot, res, fmt, mapping, cube, mips);
++}
++static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
++                         UINT mapping, int cube)
++{
++    srv_write_ex2(heap_slot, res, fmt, mapping, cube, 0);
+ }
+ static void srv_write_now(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
+-                          UINT mapping, int cube)
++                          UINT mapping, int cube, int mips)
+ {
+     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
+     sv.Format = fmt;
+     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+     sv.Shader4ComponentMapping = mapping;
+-    sv.Texture2D.MipLevels = 1;
++    sv.Texture2D.MipLevels = mips > 1 ? (UINT)mips : 1;
+     if (cube) {   /* must match the TextureCube declaration in the HLSL */
+         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+         sv.TextureCube.MipLevels = 1;
+@@ -6723,6 +6885,8 @@
+      * (tex_slot 1000+idx) -- no guest-memory upload. */
+     double _pre0 = pf2_on() ? perf_now() : 0.0;
+     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
++    texrep_defer_tick();
++    trp_tick((u64)s_d3d.frame_count);
+     srv_stage_reset();
+     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+         D3D12DrawRecord* dr = &s_d3d.draws[_d];
+@@ -6940,10 +7104,15 @@
+                         /* The upload's own format: an X16 font atlas bound
+                          * as R8 over an R16 resource sampled nothing. */
+                         DXGI_FORMAT sf = vp_tex_dxgi(dr->tex[_u].fmt);
+-                        srv_write_ex(wslot, s_d3d.vp_tex[ts].res, sf,
++                        int _rmips = 0;
++                        if (s_d3d.vp_tex[ts].rep_w) {   /* TEX_REPLACE: the HD texture's own format and mips */
++                            sf = (DXGI_FORMAT)s_d3d.vp_tex[ts].rep_dxgi;
++                            _rmips = (int)s_d3d.vp_tex[ts].rep_mips;
++                        }
++                        srv_write_ex2(wslot, s_d3d.vp_tex[ts].res, sf,
+                                   (_bf == 0x81) ? 0x1000
+                                                 : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
+-                                  _cube);
++                                  _cube, _rmips);
+                         continue;
+                     }
+                 }
+--- /dev/null
++++ b/libs/video/rsx_texrep.inc
+@@ -0,0 +1,714 @@
++/*
++ * rsx_texrep.inc - texture dump and replacement (HD texture packs) for the
++ * D3D12 RSX backend. Included once by rsx_d3d12_backend.c, just above
++ * vp_upload_tex_slot; everything here is static and independent of the D3D12
++ * objects except the DXGI format constants the loader reports.
++ *
++ *   TEX_DUMP=<dir>      write each distinct guest texture (level 0, decoded to
++ *                       RGBA8) once as <hash16>_<w>x<h>_f<fmt>.png. Encoding
++ *                       and file I/O run on a worker thread.
++ *   TEX_REPLACE=<dir>   index <dir> (recursively) for files whose name starts
++ *                       with a 16-digit hex identity (.png gray/RGB/RGBA/palette,
++ *                       .dds BC1/BC3/BC7/RGBA8/BGRA8) and bind them in place of
++ *                       the guest data when that texture is uploaded.
++ *   TEX_REPLACE_MB=<n>  cap on GPU memory held by replacements (default 768).
++ *   TEX_DUMP_LOG=1      log one line per queued dump with its frame number.
++ *   TEX_DUMP_DELAY=<n>  frames a new texture must stay unchanged before it is
++ *                       dumped (default 30); a texture that changes four times
++ *                       in a row, each within 120 frames of the last, is dynamic
++ *                       (glyph atlas, video, read-back) and is never dumped.
++ *
++ * Identity: XXH64 of the full guest bytes of level 0 as the guest stores them,
++ * seeded with fmt/w/h. Computed only when a texture is (re)uploaded.
++ */
++
++/* ---- hashing --------------------------------------------------------- */
++#define TRP_P1 11400714785074694791ull
++#define TRP_P2 14029467366897019727ull
++#define TRP_P3 1609587929392839161ull
++#define TRP_P4 9650029242287828579ull
++#define TRP_P5 2870177450012600261ull
++static u64 trp_rotl(u64 x, int r) { return (x << r) | (x >> (64 - r)); }
++static u64 trp_rd64(const u8* p) { u64 v; memcpy(&v, p, 8); return v; }
++static u32 trp_rd32(const u8* p) { u32 v; memcpy(&v, p, 4); return v; }
++static u64 trp_xround(u64 acc, u64 in) { acc += in * TRP_P2; acc = trp_rotl(acc, 31); return acc * TRP_P1; }
++static u64 trp_xmerge(u64 acc, u64 v) { acc ^= trp_xround(0, v); return acc * TRP_P1 + TRP_P4; }
++static u64 trp_hash(const u8* p, size_t len, u64 seed)
++{
++    const u8* e = p + len;
++    u64 h;
++    if (len >= 32) {
++        u64 v1 = seed + TRP_P1 + TRP_P2, v2 = seed + TRP_P2, v3 = seed, v4 = seed - TRP_P1;
++        const u8* lim = e - 32;
++        do {
++            v1 = trp_xround(v1, trp_rd64(p)); v2 = trp_xround(v2, trp_rd64(p + 8));
++            v3 = trp_xround(v3, trp_rd64(p + 16)); v4 = trp_xround(v4, trp_rd64(p + 24));
++            p += 32;
++        } while (p <= lim);
++        h = trp_rotl(v1, 1) + trp_rotl(v2, 7) + trp_rotl(v3, 12) + trp_rotl(v4, 18);
++        h = trp_xmerge(h, v1); h = trp_xmerge(h, v2); h = trp_xmerge(h, v3); h = trp_xmerge(h, v4);
++    } else h = seed + TRP_P5;
++    h += (u64)len;
++    while (p + 8 <= e) { h ^= trp_xround(0, trp_rd64(p)); h = trp_rotl(h, 27) * TRP_P1 + TRP_P4; p += 8; }
++    if (p + 4 <= e) { h ^= (u64)trp_rd32(p) * TRP_P1; h = trp_rotl(h, 23) * TRP_P2 + TRP_P3; p += 4; }
++    while (p < e) { h ^= (u64)(*p++) * TRP_P5; h = trp_rotl(h, 11) * TRP_P1; }
++    h ^= h >> 33; h *= TRP_P2; h ^= h >> 29; h *= TRP_P3; h ^= h >> 32;
++    return h;
++}
++
++/* ---- crc32 / adler32 -------------------------------------------------- */
++static u32 trp_crc_tab[256];
++static void trp_crc_init(void)
++{
++    if (trp_crc_tab[1]) return;
++    for (u32 n = 0; n < 256; n++) { u32 c = n; for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1; trp_crc_tab[n] = c; }
++}
++static u32 trp_crc(u32 c, const u8* p, size_t n)
++{
++    c = ~c; while (n--) c = trp_crc_tab[(c ^ *p++) & 255] ^ (c >> 8); return ~c;
++}
++static u32 trp_adler(const u8* p, size_t n)
++{
++    u32 a = 1, b = 0;
++    while (n) { size_t k = n > 5552 ? 5552 : n; n -= k; while (k--) { a += *p++; b += a; } a %= 65521u; b %= 65521u; }
++    return (b << 16) | a;
++}
++
++/* ---- deflate (fixed Huffman, greedy LZ77) ------------------------------ */
++typedef struct { u8* buf; size_t len, cap; u32 acc; int nacc; int oom; } TrpBW;
++static void trp_bw_byte(TrpBW* b, u8 v)
++{
++    if (b->len == b->cap) {
++        size_t nc = b->cap ? b->cap * 2 : 65536; u8* nb = (u8*)realloc(b->buf, nc);
++        if (!nb) { b->oom = 1; return; } b->buf = nb; b->cap = nc;
++    }
++    b->buf[b->len++] = v;
++}
++static void trp_bw_put(TrpBW* b, u32 v, int n)    /* LSB first */
++{
++    b->acc |= v << b->nacc; b->nacc += n;
++    while (b->nacc >= 8) { trp_bw_byte(b, (u8)b->acc); b->acc >>= 8; b->nacc -= 8; }
++}
++static void trp_bw_huff(TrpBW* b, u32 code, int n)  /* Huffman codes go MSB first */
++{
++    u32 r = 0; for (int i = 0; i < n; i++) r |= ((code >> i) & 1u) << (n - 1 - i);
++    trp_bw_put(b, r, n);
++}
++static void trp_bw_sym(TrpBW* b, u32 s)
++{
++    if (s < 144) trp_bw_huff(b, 0x30 + s, 8);
++    else if (s < 256) trp_bw_huff(b, 0x190 + (s - 144), 9);
++    else if (s < 280) trp_bw_huff(b, s - 256, 7);
++    else trp_bw_huff(b, 0xC0 + (s - 280), 8);
++}
++static const u16 trp_lbase[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
++static const u8  trp_lext[29]  = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
++static const u16 trp_dbase[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
++static const u8  trp_dext[30]  = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
++static void trp_bw_match(TrpBW* b, u32 len, u32 dist)
++{
++    int li = 28; while (trp_lbase[li] > len) li--;
++    trp_bw_sym(b, 257 + li); if (trp_lext[li]) trp_bw_put(b, len - trp_lbase[li], trp_lext[li]);
++    int di = 29; while (trp_dbase[di] > dist) di--;
++    trp_bw_huff(b, (u32)di, 5); if (trp_dext[di]) trp_bw_put(b, dist - trp_dbase[di], trp_dext[di]);
++}
++/* zlib stream: header, one fixed-Huffman block, adler32. */
++static int trp_zlib(const u8* in, size_t n, TrpBW* b)
++{
++    int* head = (int*)malloc(sizeof(int) * 32768); int* prev = (int*)malloc(sizeof(int) * 32768);
++    if (!head || !prev) { free(head); free(prev); return 0; }
++    for (int i = 0; i < 32768; i++) head[i] = -1;
++    trp_bw_byte(b, 0x78); trp_bw_byte(b, 0x01);
++    trp_bw_put(b, 1, 1); trp_bw_put(b, 1, 2);
++    size_t i = 0;
++    #define TRP_HASH3(p) ((((u32)(p)[0] << 10) ^ ((u32)(p)[1] << 5) ^ (u32)(p)[2]) & 0x7FFF)
++    while (i < n) {
++        u32 best = 0, bestd = 0;
++        if (i + 3 <= n) {
++            u32 hs = TRP_HASH3(in + i); int cand = head[hs]; int chain = 24;
++            const u32 maxl = (n - i) > 258 ? 258 : (u32)(n - i);
++            while (cand >= 0 && (size_t)cand < i && i - (size_t)cand <= 32768 && chain--) {
++                u32 l = 0; while (l < maxl && in[cand + l] == in[i + l]) l++;
++                if (l > best) { best = l; bestd = (u32)(i - (size_t)cand); if (l >= maxl) break; }
++                int nx = prev[cand & 32767]; if (nx >= cand) break; cand = nx;
++            }
++        }
++        size_t adv = 1;
++        if (best >= 3) { trp_bw_match(b, best, bestd); adv = best; }
++        else trp_bw_sym(b, in[i]);
++        for (size_t k = 0; k < adv; k++, i++)
++            if (i + 3 <= n) { u32 hs = TRP_HASH3(in + i); prev[i & 32767] = head[hs]; head[hs] = (int)i; }
++    }
++    #undef TRP_HASH3
++    trp_bw_sym(b, 256);
++    if (b->nacc) trp_bw_put(b, 0, 8 - b->nacc);
++    u32 ad = trp_adler(in, n);
++    trp_bw_byte(b, (u8)(ad >> 24)); trp_bw_byte(b, (u8)(ad >> 16)); trp_bw_byte(b, (u8)(ad >> 8)); trp_bw_byte(b, (u8)ad);
++    free(head); free(prev);
++    return !b->oom;
++}
++
++/* ---- PNG write -------------------------------------------------------- */
++static void trp_be32(u8* p, u32 v) { p[0] = (u8)(v >> 24); p[1] = (u8)(v >> 16); p[2] = (u8)(v >> 8); p[3] = (u8)v; }
++static void trp_chunk(FILE* f, const char* type, const u8* d, size_t n)
++{
++    u8 hd[8]; trp_be32(hd, (u32)n); memcpy(hd + 4, type, 4); fwrite(hd, 1, 8, f);
++    u32 c = trp_crc(0, (const u8*)type, 4);
++    if (n) { fwrite(d, 1, n, f); c = trp_crc(c, d, n); }
++    u8 t[4]; trp_be32(t, c); fwrite(t, 1, 4, f);
++}
++/* rgba: w*h*4 tightly packed. Returns 1 on success. */
++static int trp_png_write(const char* path, const u8* rgba, u32 w, u32 h)
++{
++    trp_crc_init();
++    const size_t rb = (size_t)w * 4;
++    u8* raw = (u8*)malloc((rb + 1) * h);
++    if (!raw) return 0;
++    for (u32 y = 0; y < h; y++) {          /* per row: none / sub / up, smallest sum of |v| wins */
++        const u8* cur = rgba + y * rb; const u8* up = y ? cur - rb : NULL;
++        u8* o = raw + (size_t)y * (rb + 1) + 1;
++        u32 s0 = 0, s1 = 0, s2 = 0;
++        for (size_t x = 0; x < rb; x++) {
++            int a = x >= 4 ? cur[x - 4] : 0, b = up ? up[x] : 0;
++            int d1 = (u8)(cur[x] - a), d2 = (u8)(cur[x] - b);
++            s0 += cur[x] < 128 ? cur[x] : 256 - cur[x];
++            s1 += d1 < 128 ? d1 : 256 - d1; s2 += d2 < 128 ? d2 : 256 - d2;
++        }
++        int ft = 0; u32 bs = s0; if (s1 < bs) { ft = 1; bs = s1; } if (up && s2 < bs) { ft = 2; }
++        raw[(size_t)y * (rb + 1)] = (u8)ft;
++        for (size_t x = 0; x < rb; x++) {
++            int a = x >= 4 ? cur[x - 4] : 0, b = up ? up[x] : 0;
++            o[x] = ft == 0 ? cur[x] : ft == 1 ? (u8)(cur[x] - a) : (u8)(cur[x] - b);
++        }
++    }
++    TrpBW bw; memset(&bw, 0, sizeof bw);
++    int ok = trp_zlib(raw, (rb + 1) * h, &bw);
++    free(raw);
++    if (!ok) { free(bw.buf); return 0; }
++    FILE* f = fopen(path, "wb");
++    if (!f) { free(bw.buf); return 0; }
++    static const u8 sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
++    fwrite(sig, 1, 8, f);
++    u8 ih[13]; trp_be32(ih, w); trp_be32(ih + 4, h); ih[8] = 8; ih[9] = 6; ih[10] = ih[11] = ih[12] = 0;
++    trp_chunk(f, "IHDR", ih, 13); trp_chunk(f, "IDAT", bw.buf, bw.len); trp_chunk(f, "IEND", NULL, 0);
++    ok = (fclose(f) == 0);
++    free(bw.buf);
++    return ok;
++}
++
++/* ---- inflate (after zlib's puff) ---------------------------------------- */
++typedef struct { const u8* in; size_t inlen, incnt; u32 bitbuf; int bitcnt; u8* out; size_t outlen, outcnt; } TrpInf;
++typedef struct { short count[16]; short symbol[288]; } TrpHuff;
++static int trp_ibits(TrpInf* s, int need)
++{
++    u32 val = s->bitbuf;
++    while (s->bitcnt < need) {
++        if (s->incnt >= s->inlen) return -1;
++        val |= (u32)s->in[s->incnt++] << s->bitcnt; s->bitcnt += 8;
++    }
++    s->bitbuf = val >> need; s->bitcnt -= need;
++    return (int)(val & ((1u << need) - 1));
++}
++static int trp_idecode(TrpInf* s, const TrpHuff* h)
++{
++    int code = 0, first = 0, index = 0;
++    for (int len = 1; len <= 15; len++) {
++        int b = trp_ibits(s, 1); if (b < 0) return -1;
++        code |= b; int count = h->count[len];
++        if (code - count < first) return h->symbol[index + (code - first)];
++        index += count; first += count; first <<= 1; code <<= 1;
++    }
++    return -1;
++}
++static int trp_hconstruct(TrpHuff* h, const short* length, int n)
++{
++    short offs[16]; int left = 1;
++    for (int l = 0; l <= 15; l++) h->count[l] = 0;
++    for (int i = 0; i < n; i++) h->count[length[i]]++;
++    if (h->count[0] == n) return 0;
++    for (int l = 1; l <= 15; l++) { left <<= 1; left -= h->count[l]; if (left < 0) return left; }
++    offs[1] = 0; for (int l = 1; l < 15; l++) offs[l + 1] = offs[l] + h->count[l];
++    for (int i = 0; i < n; i++) if (length[i]) h->symbol[offs[length[i]]++] = (short)i;
++    return left;
++}
++static int trp_icodes(TrpInf* s, const TrpHuff* lc, const TrpHuff* dc)
++{
++    for (;;) {
++        int sym = trp_idecode(s, lc); if (sym < 0) return -1;
++        if (sym < 256) { if (s->outcnt >= s->outlen) return -1; s->out[s->outcnt++] = (u8)sym; }
++        else if (sym == 256) return 0;
++        else {
++            sym -= 257; if (sym >= 29) return -1;
++            int eb = trp_ibits(s, trp_lext[sym]); if (eb < 0) return -1;
++            u32 len = trp_lbase[sym] + (u32)eb;
++            int ds = trp_idecode(s, dc); if (ds < 0 || ds >= 30) return -1;
++            eb = trp_ibits(s, trp_dext[ds]); if (eb < 0) return -1;
++            u32 dist = trp_dbase[ds] + (u32)eb;
++            if (dist > s->outcnt || s->outcnt + len > s->outlen) return -1;
++            while (len--) { s->out[s->outcnt] = s->out[s->outcnt - dist]; s->outcnt++; }
++        }
++    }
++}
++/* Inflate a zlib stream into out[outlen]; returns bytes written or -1. */
++static long trp_inflate(const u8* in, size_t inlen, u8* out, size_t outlen)
++{
++    if (inlen < 2) return -1;
++    TrpInf s; memset(&s, 0, sizeof s); s.in = in + 2; s.inlen = inlen - 2; s.out = out; s.outlen = outlen;
++    static const short order[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
++    int last;
++    do {
++        last = trp_ibits(&s, 1); int type = trp_ibits(&s, 2);
++        if (last < 0 || type < 0) return -1;
++        if (type == 0) {
++            s.bitbuf = 0; s.bitcnt = 0;
++            if (s.incnt + 4 > s.inlen) return -1;
++            u32 len = s.in[s.incnt] | (s.in[s.incnt + 1] << 8); s.incnt += 4;
++            if (s.incnt + len > s.inlen || s.outcnt + len > s.outlen) return -1;
++            memcpy(s.out + s.outcnt, s.in + s.incnt, len); s.incnt += len; s.outcnt += len;
++        } else if (type == 1) {
++            TrpHuff lc, dc; short l[288];
++            int i = 0; for (; i < 144; i++) l[i] = 8; for (; i < 256; i++) l[i] = 9;
++            for (; i < 280; i++) l[i] = 7; for (; i < 288; i++) l[i] = 8;
++            trp_hconstruct(&lc, l, 288);
++            for (i = 0; i < 30; i++) l[i] = 5;
++            trp_hconstruct(&dc, l, 30);
++            if (trp_icodes(&s, &lc, &dc)) return -1;
++        } else if (type == 2) {
++            TrpHuff lc, dc; short lens[320];
++            int nlen = trp_ibits(&s, 5) + 257, ndist = trp_ibits(&s, 5) + 1, ncode = trp_ibits(&s, 4) + 4;
++            if (nlen < 257 || ndist < 1 || ncode < 4 || nlen > 286 || ndist > 30) return -1;
++            int i = 0;
++            for (; i < ncode; i++) { int v = trp_ibits(&s, 3); if (v < 0) return -1; lens[order[i]] = (short)v; }
++            for (; i < 19; i++) lens[order[i]] = 0;
++            if (trp_hconstruct(&lc, lens, 19) != 0) return -1;
++            i = 0;
++            while (i < nlen + ndist) {
++                int sym = trp_idecode(&s, &lc); if (sym < 0) return -1;
++                if (sym < 16) lens[i++] = (short)sym;
++                else {
++                    int pl = 0, rep, eb;
++                    if (sym == 16) { if (i == 0) return -1; pl = lens[i - 1]; eb = trp_ibits(&s, 2); rep = 3 + eb; }
++                    else if (sym == 17) { eb = trp_ibits(&s, 3); rep = 3 + eb; }
++                    else { eb = trp_ibits(&s, 7); rep = 11 + eb; }
++                    if (eb < 0 || i + rep > nlen + ndist) return -1;
++                    while (rep--) lens[i++] = (short)pl;
++                }
++            }
++            if (lens[256] == 0) return -1;
++            if (trp_hconstruct(&lc, lens, nlen) < 0) return -1;
++            if (trp_hconstruct(&dc, lens + nlen, ndist) < 0) return -1;
++            if (trp_icodes(&s, &lc, &dc)) return -1;
++        } else return -1;
++    } while (!last);
++    return (long)s.outcnt;
++}
++
++/* ---- images -------------------------------------------------------------- */
++#define TRP_MAXLV 15
++typedef struct {
++    u32 w, h, nlv, dxgi, blk;          /* blk: 0 = RGBA8 texels, else bytes per 4x4 block */
++    u8* lv[TRP_MAXLV]; u32 lw[TRP_MAXLV], lh[TRP_MAXLV], lrow[TRP_MAXLV], lrows[TRP_MAXLV];
++    u64 bytes;
++} TrpImage;
++static void trp_img_free(TrpImage* im) { for (u32 i = 0; i < TRP_MAXLV; i++) { free(im->lv[i]); im->lv[i] = NULL; } }
++static u32 trp_u32le(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
++static u32 trp_u32be(const u8* p) { return ((u32)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
++
++/* Box-filter mips for an RGBA8 base level already in lv[0]. */
++static int trp_mips_rgba(TrpImage* im)
++{
++    u32 n = 1, w = im->w, h = im->h;
++    while ((w > 1 || h > 1) && n < TRP_MAXLV) {
++        u32 nw = w > 1 ? w >> 1 : 1, nh = h > 1 ? h >> 1 : 1;
++        u8* d = (u8*)malloc((size_t)nw * nh * 4); if (!d) return 0;
++        const u8* s = im->lv[n - 1];
++        for (u32 y = 0; y < nh; y++) for (u32 x = 0; x < nw; x++) {
++            u32 x0 = x * 2, x1 = x * 2 + 1 < w ? x * 2 + 1 : w - 1, y0 = y * 2, y1 = y * 2 + 1 < h ? y * 2 + 1 : h - 1;
++            const u8* a = s + ((size_t)y0 * w + x0) * 4; const u8* b = s + ((size_t)y0 * w + x1) * 4;
++            const u8* c = s + ((size_t)y1 * w + x0) * 4; const u8* e = s + ((size_t)y1 * w + x1) * 4;
++            for (int k = 0; k < 4; k++) d[((size_t)y * nw + x) * 4 + k] = (u8)((a[k] + b[k] + c[k] + e[k] + 2) >> 2);
++        }
++        im->lv[n] = d; im->lw[n] = nw; im->lh[n] = nh; im->lrow[n] = nw * 4; im->lrows[n] = nh;
++        im->bytes += (u64)nw * nh * 4; w = nw; h = nh; n++;
++    }
++    im->nlv = n; return 1;
++}
++
++static u8* trp_readfile(const char* path, size_t* n)
++{
++    FILE* f = fopen(path, "rb"); if (!f) return NULL;
++    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
++    if (sz <= 0 || sz > (512l << 20)) { fclose(f); return NULL; }
++    u8* b = (u8*)malloc((size_t)sz); if (!b) { fclose(f); return NULL; }
++    if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return NULL; }
++    fclose(f); *n = (size_t)sz; return b;
++}
++
++static int trp_png_load(const char* path, TrpImage* im)
++{
++    size_t fn; u8* f = trp_readfile(path, &fn); if (!f) return 0;
++    static const u8 sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
++    int ok = 0; u8* z = NULL; size_t zn = 0, zc = 0; u8* raw = NULL; u8* rgba = NULL;
++    u32 w = 0, h = 0, depth = 0, ct = 0, il = 0; u8 pal[256][4];
++    for (int i = 0; i < 256; i++) { pal[i][0] = pal[i][1] = pal[i][2] = 0; pal[i][3] = 255; }
++    if (fn < 33 || memcmp(f, sig, 8)) goto done;
++    for (size_t p = 8; p + 12 <= fn;) {
++        u32 len = trp_u32be(f + p); const u8* ty = f + p + 4; const u8* d = f + p + 8;
++        if ((size_t)len + 12 > fn - p) goto done;
++        if (!memcmp(ty, "IHDR", 4) && len >= 13) { w = trp_u32be(d); h = trp_u32be(d + 4); depth = d[8]; ct = d[9]; il = d[12]; }
++        else if (!memcmp(ty, "PLTE", 4)) { int np = (int)(len / 3 > 256 ? 256 : len / 3); for (int i = 0; i < np; i++) { pal[i][0] = d[i*3]; pal[i][1] = d[i*3+1]; pal[i][2] = d[i*3+2]; } }
++        else if (!memcmp(ty, "tRNS", 4) && ct == 3) { for (u32 i = 0; i < len && i < 256; i++) pal[i][3] = d[i]; }
++        else if (!memcmp(ty, "IDAT", 4)) {
++            if (zn + len > zc) { zc = (zn + len) * 2; u8* nz = (u8*)realloc(z, zc); if (!nz) goto done; z = nz; }
++            memcpy(z + zn, d, len); zn += len;
++        } else if (!memcmp(ty, "IEND", 4)) break;
++        p += 12 + (size_t)len;
++    }
++    if (!w || !h || w > 16384 || h > 16384 || il || !z) goto done;
++    { u32 ch = ct == 0 ? 1 : ct == 2 ? 3 : ct == 3 ? 1 : ct == 4 ? 2 : ct == 6 ? 4 : 0;
++      if (!ch || (depth != 8 && !(depth == 16 && ct != 3))) goto done;
++      u32 bpp = ch * (depth / 8); size_t rb = (size_t)w * bpp;
++      raw = (u8*)malloc((rb + 1) * h); if (!raw) goto done;
++      long got = trp_inflate(z, zn, raw, (rb + 1) * h); if (got < (long)((rb + 1) * h)) goto done;
++      for (u32 y = 0; y < h; y++) {                       /* unfilter in place */
++          u8* row = raw + (size_t)y * (rb + 1); int ft = row[0]; u8* cur = row + 1; const u8* up = y ? row - rb : NULL;
++          for (size_t x = 0; x < rb; x++) {
++              int a = x >= bpp ? cur[x - bpp] : 0, b = up ? up[x] : 0, c = (up && x >= bpp) ? up[x - bpp] : 0, v = cur[x];
++              switch (ft) { case 1: v += a; break; case 2: v += b; break; case 3: v += (a + b) >> 1; break;
++                  case 4: { int pp = a + b - c, pa = abs(pp - a), pb = abs(pp - b), pc = abs(pp - c);
++                            v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c); break; }
++                  default: break; }
++              cur[x] = (u8)v;
++          }
++      }
++      rgba = (u8*)malloc((size_t)w * h * 4); if (!rgba) goto done;
++      for (u32 y = 0; y < h; y++) for (u32 x = 0; x < w; x++) {
++          const u8* s = raw + (size_t)y * (rb + 1) + 1 + (size_t)x * bpp; u8* o = rgba + ((size_t)y * w + x) * 4; u32 st = depth / 8;
++          switch (ct) {
++              case 0: o[0] = o[1] = o[2] = s[0]; o[3] = 255; break;
++              case 2: o[0] = s[0]; o[1] = s[st]; o[2] = s[2*st]; o[3] = 255; break;
++              case 3: { int i = s[0]; o[0] = pal[i][0]; o[1] = pal[i][1]; o[2] = pal[i][2]; o[3] = pal[i][3]; break; }
++              case 4: o[0] = o[1] = o[2] = s[0]; o[3] = s[st]; break;
++              default: o[0] = s[0]; o[1] = s[st]; o[2] = s[2*st]; o[3] = s[3*st]; break;
++          }
++      }
++    }
++    memset(im, 0, sizeof *im);
++    im->w = w; im->h = h; im->dxgi = DXGI_FORMAT_R8G8B8A8_UNORM; im->blk = 0;
++    im->lv[0] = rgba; rgba = NULL; im->lw[0] = w; im->lh[0] = h; im->lrow[0] = w * 4; im->lrows[0] = h; im->nlv = 1; im->bytes = (u64)w * h * 4;
++    if (!trp_mips_rgba(im)) { trp_img_free(im); goto done; }
++    ok = 1;
++done:
++    free(f); free(z); free(raw); free(rgba);
++    return ok;
++}
++
++static int trp_dds_load(const char* path, TrpImage* im)
++{
++    size_t fn; u8* f = trp_readfile(path, &fn); if (!f) return 0;
++    int ok = 0;
++    u32 h, w, mc, pff, bits, rm, bm, am; size_t dp = 128; u32 dx = 0, blk = 0, swap = 0, noalpha = 0;
++    if (fn < 128 || memcmp(f, "DDS ", 4) || trp_u32le(f + 4) != 124) goto done;
++    h = trp_u32le(f + 12); w = trp_u32le(f + 16); mc = trp_u32le(f + 28);
++    pff = trp_u32le(f + 80); bits = trp_u32le(f + 88);
++    rm = trp_u32le(f + 92); bm = trp_u32le(f + 100); am = trp_u32le(f + 104);
++    if (!w || !h || w > 16384 || h > 16384) goto done;
++    if (!memcmp(f + 84, "DX10", 4)) {
++        if (fn < 148) goto done;
++        { u32 df = trp_u32le(f + 128); dp = 148;
++          if (df == 71) { dx = DXGI_FORMAT_BC1_UNORM; blk = 8; }
++          else if (df == 77) { dx = DXGI_FORMAT_BC3_UNORM; blk = 16; }
++          else if (df == 98) { dx = DXGI_FORMAT_BC7_UNORM; blk = 16; }
++          else if (df == 28) { dx = DXGI_FORMAT_R8G8B8A8_UNORM; }
++          else if (df == 87) { dx = DXGI_FORMAT_R8G8B8A8_UNORM; swap = 1; }
++          else goto done; }
++    } else if (pff & 4) {
++        if (!memcmp(f + 84, "DXT1", 4)) { dx = DXGI_FORMAT_BC1_UNORM; blk = 8; }
++        else if (!memcmp(f + 84, "DXT5", 4)) { dx = DXGI_FORMAT_BC3_UNORM; blk = 16; }
++        else goto done;
++    } else if ((pff & 0x40) && bits == 32) {
++        dx = DXGI_FORMAT_R8G8B8A8_UNORM; noalpha = !(pff & 1) || !am;
++        if (rm == 0x000000FFu && bm == 0x00FF0000u) swap = 0;
++        else if (rm == 0x00FF0000u && bm == 0x000000FFu) swap = 1;
++        else goto done;
++    } else goto done;
++    if (blk && ((w & 3) || (h & 3))) goto done;
++    memset(im, 0, sizeof *im); im->w = w; im->h = h; im->dxgi = dx; im->blk = blk;
++    { u32 maxlv = 1; u32 a = w > h ? w : h; while (a > 1) { a >>= 1; maxlv++; }
++      if (!mc) mc = 1; if (mc > maxlv) mc = maxlv; if (mc > TRP_MAXLV) mc = TRP_MAXLV; }
++    { u32 lw = w, lh = h; size_t pos = dp; u32 n = 0;
++      for (; n < mc; n++) {
++          u32 bw2 = (lw + 3) / 4, bh2 = (lh + 3) / 4;
++          size_t row = blk ? (size_t)bw2 * blk : (size_t)lw * 4, rows = blk ? bh2 : lh, sz = row * rows;
++          if (pos + sz > fn) break;
++          u8* d = (u8*)malloc(sz); if (!d) break;
++          memcpy(d, f + pos, sz); pos += sz;
++          if (!blk && (swap || noalpha)) for (size_t i = 0; i < sz; i += 4) {
++              if (swap) { u8 t = d[i]; d[i] = d[i + 2]; d[i + 2] = t; }
++              if (noalpha) d[i + 3] = 255;
++          }
++          im->lv[n] = d; im->lw[n] = lw; im->lh[n] = lh; im->lrow[n] = (u32)row; im->lrows[n] = (u32)rows; im->bytes += sz;
++          if (lw > 1) lw >>= 1;
++          if (lh > 1) lh >>= 1;
++      }
++      im->nlv = n;
++      if (!n) { trp_img_free(im); goto done; }
++      if (!blk && n == 1 && !trp_mips_rgba(im)) { trp_img_free(im); goto done; } }
++    ok = 1;
++done:
++    free(f);
++    return ok;
++}
++
++/* ---- BC1/2/3 to RGBA8 (for dumping) ---------------------------------------- */
++static void trp_bc_color(const u8* b, u8 out[16][4], int force4)
++{
++    u32 c0 = b[0] | (b[1] << 8), c1 = b[2] | (b[3] << 8); u8 p[4][4];
++    for (int k = 0; k < 2; k++) {
++        u32 c = k ? c1 : c0;
++        p[k][0] = (u8)(((c >> 11) & 31) * 255 / 31); p[k][1] = (u8)(((c >> 5) & 63) * 255 / 63); p[k][2] = (u8)((c & 31) * 255 / 31); p[k][3] = 255;
++    }
++    if (c0 > c1 || force4) {
++        for (int k = 0; k < 3; k++) { p[2][k] = (u8)((2 * p[0][k] + p[1][k]) / 3); p[3][k] = (u8)((p[0][k] + 2 * p[1][k]) / 3); }
++        p[2][3] = p[3][3] = 255;
++    } else {
++        for (int k = 0; k < 3; k++) p[2][k] = (u8)((p[0][k] + p[1][k]) / 2);
++        p[2][3] = 255; p[3][0] = p[3][1] = p[3][2] = 0; p[3][3] = 0;
++    }
++    u32 idx = trp_u32le(b + 4);
++    for (int i = 0; i < 16; i++) memcpy(out[i], p[(idx >> (2 * i)) & 3], 4);
++}
++static void trp_bc_decode(u8* rgba, const u8* src, u32 w, u32 h, int kind /* 1,2,3 */)
++{
++    const u32 bw = (w + 3) / 4, bh = (h + 3) / 4, bsz = kind == 1 ? 8 : 16;
++    for (u32 by = 0; by < bh; by++) for (u32 bx = 0; bx < bw; bx++) {
++        const u8* b = src + ((size_t)by * bw + bx) * bsz; u8 px[16][4]; u8 al[16];
++        trp_bc_color(kind == 1 ? b : b + 8, px, kind != 1);
++        if (kind == 2) for (int i = 0; i < 16; i++) { u8 v = (b[i >> 1] >> ((i & 1) * 4)) & 15; al[i] = (u8)(v * 17); }
++        else if (kind == 3) {
++            u8 a[8]; a[0] = b[0]; a[1] = b[1];
++            if (a[0] > a[1]) for (int k = 1; k < 7; k++) a[k + 1] = (u8)(((7 - k) * a[0] + k * a[1]) / 7);
++            else { for (int k = 1; k < 5; k++) a[k + 1] = (u8)(((5 - k) * a[0] + k * a[1]) / 5); a[6] = 0; a[7] = 255; }
++            u64 bits = 0; for (int i = 0; i < 6; i++) bits |= (u64)b[2 + i] << (8 * i);
++            for (int i = 0; i < 16; i++) al[i] = a[(bits >> (3 * i)) & 7];
++        }
++        for (u32 y = 0; y < 4 && by * 4 + y < h; y++) for (u32 x = 0; x < 4 && bx * 4 + x < w; x++) {
++            u8* o = rgba + ((size_t)(by * 4 + y) * w + bx * 4 + x) * 4; memcpy(o, px[y * 4 + x], 4);
++            if (kind != 1) o[3] = al[y * 4 + x];
++        }
++    }
++}
++
++/* ---- state ---------------------------------------------------------------------- */
++typedef struct { u64 hash; char* path; int dds; int failed; } TrpEntry;
++typedef struct TrpJob { struct TrpJob* next; u8* data; int kind; u32 w, h, fmt; u64 hash; } TrpJob;
++typedef struct { u32 off, w, h, fmt; u64 hash; u64 frame; int streak, pend, used; } TrpKey;
++typedef struct { u64 hash; u32 w, h, fmt; int kind; u8* data; u64 frame; int key, used; } TrpPend;
++#define TRP_KEYS 16384
++#define TRP_PENDS 2048
++#define TRP_SET 65536
++static int trp_state = -1;                   /* -1 not initialised, 0 off, 1 on */
++static int trp_dump_on, trp_repl_on, trp_delay = 30;
++static char trp_dump_dir[MAX_PATH], trp_repl_dir[MAX_PATH];
++static TrpEntry* trp_idx; static u32 trp_nidx;
++static u64 trp_cap_bytes = 768ull << 20;
++static u64* trp_set;                         /* hashes already queued for dumping */
++static TrpKey* trp_keys; static TrpPend* trp_pends; static u32 trp_npend; static u64 trp_pend_bytes;
++static CRITICAL_SECTION trp_cs; static HANDLE trp_ev; static TrpJob *trp_qh, *trp_qt; static u64 trp_qbytes;
++static volatile LONG trp_written, trp_exists, trp_failed;
++static u32 trp_dropped, trp_dyn_keys, trp_skip_fmt, trp_replaced, trp_repl_fail, trp_over_cap, trp_seen;
++static u32 trp_last_w, trp_last_r; static u64 trp_last_stat, trp_frame; static int trp_verbose; static double trp_ms;   /* total time spent hashing/observing/replacing on the render thread */
++
++static u64 trp_job_bytes(int kind, u32 w, u32 h) { return kind == 0 ? (u64)w * h * 4 : (u64)((w + 3) / 4) * ((h + 3) / 4) * (kind == 1 ? 8 : 16); }
++static int trp_set_has(u64 h) { if (!h) h = 1; for (u32 i = (u32)h & (TRP_SET - 1);; i = (i + 1) & (TRP_SET - 1)) { if (!trp_set[i]) return 0; if (trp_set[i] == h) return 1; } }
++static int trp_set_add(u64 h)
++{
++    static u32 n; if (!h) h = 1; if (n > TRP_SET * 3 / 4) return 0;
++    for (u32 i = (u32)h & (TRP_SET - 1);; i = (i + 1) & (TRP_SET - 1)) { if (!trp_set[i]) { trp_set[i] = h; n++; return 1; } if (trp_set[i] == h) return 1; }
++}
++static void trp_mkdirs(const char* path)
++{
++    char t[MAX_PATH]; strncpy(t, path, MAX_PATH - 1); t[MAX_PATH - 1] = 0;
++    for (char* p = t + 1; *p; p++) if (*p == '\\' || *p == '/') { char c = *p; *p = 0; CreateDirectoryA(t, NULL); *p = c; }
++    CreateDirectoryA(t, NULL);
++}
++
++/* worker: convert to RGBA, encode PNG, write <dir>\<name>.png via a temp name */
++static DWORD WINAPI trp_worker(LPVOID arg)
++{
++    (void)arg;
++    for (;;) {
++        WaitForSingleObject(trp_ev, INFINITE);
++        for (;;) {
++            EnterCriticalSection(&trp_cs);
++            TrpJob* j = trp_qh; if (j) { trp_qh = j->next; if (!trp_qh) trp_qt = NULL; }
++            LeaveCriticalSection(&trp_cs);
++            if (!j) break;
++            char name[MAX_PATH], tmp[MAX_PATH];
++            snprintf(name, sizeof name, "%s\\%016llx_%ux%u_f%02x.png", trp_dump_dir, (unsigned long long)j->hash, j->w, j->h, j->fmt & 0xFF);
++            snprintf(tmp, sizeof tmp, "%s.tmp", name);
++            if (GetFileAttributesA(name) != INVALID_FILE_ATTRIBUTES) InterlockedIncrement(&trp_exists);
++            else {
++                u8* rgba = NULL; int ok = 0;
++                if (j->kind == 0) { rgba = j->data; j->data = NULL; }
++                else { rgba = (u8*)malloc((size_t)j->w * j->h * 4); if (rgba) trp_bc_decode(rgba, j->data, j->w, j->h, j->kind); }
++                if (rgba) ok = trp_png_write(tmp, rgba, j->w, j->h) && MoveFileExA(tmp, name, MOVEFILE_REPLACE_EXISTING);
++                free(rgba);
++                if (ok) InterlockedIncrement(&trp_written); else { DeleteFileA(tmp); InterlockedIncrement(&trp_failed); }
++            }
++            free(j->data);
++            { const u64 jb = trp_job_bytes(j->kind, j->w, j->h);
++              EnterCriticalSection(&trp_cs); trp_qbytes = trp_qbytes > jb ? trp_qbytes - jb : 0; LeaveCriticalSection(&trp_cs); }
++            free(j);
++        }
++    }
++    return 0;
++}
++
++static int trp_idx_cmp(const void* a, const void* b)
++{
++    const TrpEntry* x = (const TrpEntry*)a; const TrpEntry* y = (const TrpEntry*)b;
++    if (x->hash != y->hash) return x->hash < y->hash ? -1 : 1;
++    return y->dds - x->dds;                  /* DDS first when both exist */
++}
++static void trp_scan(const char* dir, int depth)
++{
++    char pat[MAX_PATH]; snprintf(pat, sizeof pat, "%s\\*", dir);
++    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd); if (h == INVALID_HANDLE_VALUE) return;
++    do {
++        if (fd.cFileName[0] == '.') continue;
++        char full[MAX_PATH]; snprintf(full, sizeof full, "%s\\%s", dir, fd.cFileName);
++        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { if (depth < 4) trp_scan(full, depth + 1); continue; }
++        size_t n = strlen(fd.cFileName); if (n < 20) continue;
++        const char* ext = fd.cFileName + n - 4; int dds = !_stricmp(ext, ".dds");
++        if (!dds && _stricmp(ext, ".png")) continue;
++        u64 hv = 0; int okh = 1;
++        for (int i = 0; i < 16; i++) { char c = fd.cFileName[i]; int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1; if (d < 0) { okh = 0; break; } hv = (hv << 4) | (u64)d; }
++        if (!okh || trp_nidx >= 65536) continue;
++        if (!(trp_nidx & 255)) { TrpEntry* ni = (TrpEntry*)realloc(trp_idx, sizeof(TrpEntry) * (trp_nidx + 256)); if (!ni) continue; trp_idx = ni; }
++        trp_idx[trp_nidx].hash = hv; trp_idx[trp_nidx].path = _strdup(full); trp_idx[trp_nidx].dds = dds; trp_idx[trp_nidx].failed = 0; trp_nidx++;
++    } while (FindNextFileA(h, &fd));
++    FindClose(h);
++}
++static TrpEntry* trp_find(u64 hash)
++{
++    u32 lo = 0, hi = trp_nidx;
++    while (lo < hi) { u32 m = (lo + hi) / 2; if (trp_idx[m].hash < hash) lo = m + 1; else hi = m; }
++    return (lo < trp_nidx && trp_idx[lo].hash == hash) ? &trp_idx[lo] : NULL;
++}
++static void trp_report(const char* why)
++{
++    if (trp_dump_on) fprintf(stderr, "[texdump] %s (frame %llu): seen %u, written %ld, existed %ld, failed %ld, dropped %u, dynamic-skipped %u, unsupported-fmt %u, pending %u, render-thread cost %.1f ms\n",
++        why, (unsigned long long)trp_frame, trp_seen, (long)trp_written, (long)trp_exists, (long)trp_failed, trp_dropped, trp_dyn_keys, trp_skip_fmt, trp_npend, trp_ms);
++    if (trp_repl_on) fprintf(stderr, "[texrep] %s: indexed %u, replaced %u (load failures %u, over cap %u, render-thread cost %.1f ms)\n", why, trp_nidx, trp_replaced, trp_repl_fail, trp_over_cap, trp_ms);
++    fflush(stderr);
++}
++static void trp_atexit(void) { trp_report("exit"); }
++
++static int trp_active(void)
++{
++    if (trp_state >= 0) return trp_state;
++    trp_state = 0;
++    const char* d = getenv("TEX_DUMP"); const char* r = getenv("TEX_REPLACE");
++    if (d && d[0]) { strncpy(trp_dump_dir, d, MAX_PATH - 2); trp_dump_on = 1; }
++    if (r && r[0]) { strncpy(trp_repl_dir, r, MAX_PATH - 2); trp_repl_on = 1; }
++    if (!trp_dump_on && !trp_repl_on) return 0;
++    for (char* p = trp_dump_dir; *p; p++) if (*p == '/') *p = '\\';
++    for (char* p = trp_repl_dir; *p; p++) if (*p == '/') *p = '\\';
++    for (size_t n = strlen(trp_dump_dir); n > 3 && trp_dump_dir[n - 1] == '\\'; n--) trp_dump_dir[n - 1] = 0;
++    for (size_t n = strlen(trp_repl_dir); n > 3 && trp_repl_dir[n - 1] == '\\'; n--) trp_repl_dir[n - 1] = 0;
++    const char* e = getenv("TEX_REPLACE_MB"); if (e && atoi(e) > 0) trp_cap_bytes = (u64)atoi(e) << 20;
++    e = getenv("TEX_DUMP_LOG"); trp_verbose = e && atoi(e) > 0;
++    e = getenv("TEX_DUMP_DELAY"); if (e && atoi(e) >= 0) trp_delay = atoi(e);
++    trp_crc_init();
++    if (trp_dump_on) {
++        trp_mkdirs(trp_dump_dir);
++        trp_set = (u64*)calloc(TRP_SET, sizeof(u64));
++        trp_keys = (TrpKey*)calloc(TRP_KEYS, sizeof(TrpKey));
++        trp_pends = (TrpPend*)calloc(TRP_PENDS, sizeof(TrpPend));
++        InitializeCriticalSection(&trp_cs); trp_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
++        HANDLE th = CreateThread(NULL, 0, trp_worker, NULL, 0, NULL);
++        if (!trp_set || !trp_keys || !trp_pends || !th) { trp_dump_on = 0; fprintf(stderr, "[texdump] init failed, dumping off\n"); }
++        else { SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(th); fprintf(stderr, "[texdump] dumping to %s (delay %d frames)\n", trp_dump_dir, trp_delay); }
++    }
++    if (trp_repl_on) {
++        trp_scan(trp_repl_dir, 0);
++        qsort(trp_idx, trp_nidx, sizeof(TrpEntry), trp_idx_cmp);
++        u32 o = 0; for (u32 i = 0; i < trp_nidx; i++) { if (o && trp_idx[o - 1].hash == trp_idx[i].hash) { free(trp_idx[i].path); continue; } trp_idx[o++] = trp_idx[i]; }
++        trp_nidx = o;
++        fprintf(stderr, "[texrep] indexed %u, replaced 0 (dir %s, cap %llu MB)\n", trp_nidx, trp_repl_dir, (unsigned long long)(trp_cap_bytes >> 20));
++    }
++    trp_state = trp_dump_on || trp_repl_on;
++    if (trp_state) atexit(trp_atexit);
++    return trp_state;
++}
++
++static void trp_pend_free(int i)
++{
++    TrpPend* p = &trp_pends[i]; if (!p->used) return;
++    trp_pend_bytes -= trp_job_bytes(p->kind, p->w, p->h); free(p->data); p->data = NULL; p->used = 0; trp_npend--;
++}
++
++/* A texture was (re)uploaded: `hash` is its identity. Tracks whether it keeps
++ * changing, and queues a dump of it once it has stayed unchanged for the delay.
++ * tl->fmt must be RGBA8 or BC1/2/3 (the caller filters). */
++static void trp_observe(u32 off, u32 w, u32 h, u32 fmt, u64 hash, const rsx_tex_layout* tl, const u8* src, u64 frame)
++{
++    trp_seen++;
++    if (!trp_dump_on) return;
++    const u32 ki = ((off * 0x9E3779B1u) ^ (w * 0x85EBCA77u) ^ (h * 0xC2B2AE3Du) ^ (fmt * 0x27D4EB2Fu)) >> 18;
++    TrpKey* k = &trp_keys[ki];
++    if (k->used && (k->off != off || k->w != w || k->h != h || k->fmt != fmt)) {
++        if (k->pend >= 0) trp_pend_free(k->pend);
++        k->used = 0;
++    }
++    if (!k->used) { memset(k, 0, sizeof *k); k->used = 1; k->off = off; k->w = w; k->h = h; k->fmt = fmt; k->hash = hash; k->frame = frame; k->pend = -1; }
++    else if (k->hash != hash) {
++        k->streak = (frame - k->frame < 120) ? k->streak + 1 : 1;
++        k->frame = frame; k->hash = hash;
++        if (k->pend >= 0) { trp_pend_free(k->pend); k->pend = -1; }
++    } else return;
++    if (k->streak >= 4) { if (k->streak == 4) trp_dyn_keys++; return; }
++    if (trp_set_has(hash)) return;
++    const int kind = tl->fmt == RSX_TEXFMT_BC1 ? 1 : tl->fmt == RSX_TEXFMT_BC2 ? 2 : tl->fmt == RSX_TEXFMT_BC3 ? 3 : 0;
++    const u64 nb = trp_job_bytes(kind, w, h);
++    if (trp_pend_bytes + nb > (256ull << 20)) { trp_dropped++; return; }
++    int slot = -1; for (int i = 0; i < TRP_PENDS; i++) if (!trp_pends[i].used) { slot = i; break; }
++    if (slot < 0) { trp_dropped++; return; }
++    u8* d = (u8*)malloc((size_t)nb); if (!d) { trp_dropped++; return; }
++    rsx_texture_decode(d, kind ? tl->row_bytes : w * 4, src, w, h, tl, rsx_texture_argb_is_rgba());
++    TrpPend* p = &trp_pends[slot];
++    p->hash = hash; p->w = w; p->h = h; p->fmt = fmt; p->kind = kind; p->data = d; p->frame = frame; p->key = (int)ki; p->used = 1;
++    k->pend = slot; trp_npend++; trp_pend_bytes += nb;
++}
++
++/* Once per frame: hand finished pendings to the worker, and print stats. */
++static void trp_tick(u64 frame)
++{
++    if (!trp_state) return;
++    trp_frame = frame;
++    if (trp_dump_on && trp_npend) {
++        for (int i = 0; i < TRP_PENDS; i++) {
++            TrpPend* p = &trp_pends[i];
++            if (!p->used || frame < p->frame + (u64)trp_delay) continue;
++            if (trp_keys[p->key].pend == i) trp_keys[p->key].pend = -1;
++            const u64 jb = trp_job_bytes(p->kind, p->w, p->h);
++            int queue = !trp_set_has(p->hash);
++            if (queue) { EnterCriticalSection(&trp_cs); if (trp_qbytes + jb > (384ull << 20)) queue = 0; LeaveCriticalSection(&trp_cs); if (!queue) trp_dropped++; }
++            if (queue && trp_set_add(p->hash)) {
++                TrpJob* j = (TrpJob*)calloc(1, sizeof *j);
++                if (j) {
++                    j->data = p->data; p->data = NULL; j->kind = p->kind; j->w = p->w; j->h = p->h; j->fmt = p->fmt; j->hash = p->hash;
++                    if (trp_verbose) fprintf(stderr, "[texdump] f%llu %016llx_%ux%u_f%02x\n", (unsigned long long)frame, (unsigned long long)p->hash, j->w, j->h, j->fmt & 0xFF);
++                    EnterCriticalSection(&trp_cs); trp_qbytes += jb; if (trp_qt) trp_qt->next = j; else trp_qh = j; trp_qt = j; LeaveCriticalSection(&trp_cs);
++                    SetEvent(trp_ev);
++                }
++            }
++            trp_pend_free(i);
++        }
++    }
++    if (frame >= trp_last_stat + 900) {
++        trp_last_stat = frame;
++        if ((u32)trp_written != trp_last_w || trp_replaced != trp_last_r) { trp_last_w = (u32)trp_written; trp_last_r = trp_replaced; trp_report("progress"); }
++    }
++}

@@ -306,3 +306,14 @@ Some words still lost a letter, such as "ookie's Cup". The font code was fine. T
 
 The plan for 4K, 120 FPS, upscaling and HD textures is in `docs/MODERN-PC-ROADMAP.md`.
 
+## 2026-11-19 update 34: HD texture packs can load (patch 0047)
+
+Patch `0047` lets the game save its textures to disk and load higher-resolution replacements in their place, which is what an HD texture pack needs. Both are off by default.
+
+- `TEX_DUMP=<dir>` saves each texture as a PNG named `<hash>_<w>x<h>_f<fmt>.png` after it has stayed unchanged for 30 frames. The hash is XXH64 of the full texture data. Textures that keep changing are skipped.
+- `TEX_REPLACE=<dir>` loads a PNG or DDS (BC1, BC3, BC7, RGBA8) with a matching hash in place of the original. It can be any size with the same aspect ratio, and mipmaps are built if the file has none. GPU memory for replacements is capped at 768 MB (`TEX_REPLACE_MB`).
+
+A title, menu and course run saved about 500 textures (169 MB). Four grass textures, replaced with tinted 4x copies, showed on the first tee. With the switches unset, a New Game round reached the course as before. Cost is low. Saving took about 35 ms of renderer time over 5,400 frames, with no visible FPS change. Large PNGs stall the renderer the first time they load (1.6 s for four 4096x4096 files), so packs should ship as BC7 DDS. Real-ESRGAN is set up locally to upscale the saved textures, and the next step is a real 4x pack checked in game against the originals.
+
+Measurements for the 4K and 120 FPS work are in `docs/MODERN-PC-ROADMAP.md`. The course runs at about 39 FPS, resolution does not change FPS, and 4K stops drawing at x=2047 because the shared depth buffer is 2048x2048.
+

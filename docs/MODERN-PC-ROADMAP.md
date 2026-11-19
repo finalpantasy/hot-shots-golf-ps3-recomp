@@ -21,3 +21,17 @@ Target set on 2026-11-18: 120+ FPS, 4K output, HD textures, upscaling and frame 
 | 6 | FSR 1 / CAS upscale pass; 120 FPS through driver frame generation | S-M | Low | 1440p internal to 4K output; 120 FPS shown with AFMF or Smooth Motion |
 | 7 | Texture dump and replace by hash, DDS loader | M | Medium | A replaced course texture shows in game at higher resolution |
 | 8 | Ultrawide through a guest aspect patch and HUD anchoring | L | High | 21:9 capture with no stretching |
+
+## Milestone 1 results (2026-11-19)
+
+| Measure | Result |
+|---|---|
+| Course, steady, 1080p window | About 39 FPS |
+| Renderer thread per frame on the course | 4.3 ms reading commands, 7.4 ms recording (about 6 ms of it CPU vertex fetch for about 200,000 vertices), 9.1 ms draining, 0.1 ms present, 18.7 ms idle |
+| CPU by thread on the course (share of one core) | Renderer 48%, main PPU 37%, SPURS job chain 27%, four SPURS lanes about 12% each |
+| 1920x1080 | Runs, no clipping, same FPS as 720p |
+| 2560x1440 and 3840x2160 | Run, but drawing stops at x=2047 because the shared depth buffer is 2048x2048 |
+| Game logic tied to frame rate | Unclear. One unmatched comparison gave a different swing power at 58 FPS and 9.5 FPS |
+
+No thread is at 100%. The renderer waits about 60% of each frame for the game, and the game waits for the renderer, so their work runs one after the other. Overlapping them is the first speed target, CPU vertex fetch the second. Resolution does not change FPS, so 4K is blocked only by the depth buffer size.
+
