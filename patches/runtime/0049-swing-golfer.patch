@@ -1,0 +1,98 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2251,8 +2251,31 @@
+  * hidden desktop is cut to that desktop's size, so a 4K frame cannot be judged
+  * from one. Each shot also logs the process's video memory use. Called after
+  * the frame is submitted and before Present (backbuffer in PRESENT). */
++static int s_shot_kept = 0;   /* this frame: 1 = began from a kept display image, 0 = cleared */
++static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx);
+ static void rsx_shot(u32 fi)
+ {
++    /* RSX_SHOT_FLIPS=a:b: also write every presented frame while the guest
++     * flip count is in [a, b) (one swing at ~30 frames a second), as
++     * <dir>/burst_<flip>_<frame>.bmp; RSX_SHOT_MANIFEST=1 adds an RSX_CAP
++     * dump (draw manifest) of each. */
++    { static int bon = -1; static unsigned ba = 0, bb = 0; static u32 bn = 0;
++      if (bon < 0) { const char* e = getenv("RSX_SHOT_FLIPS"); const char* d = getenv("RSX_SHOT");
++          bon = (e && d && *d && sscanf(e, "%u:%u", &ba, &bb) == 2) ? 1 : 0;
++          if (bon) CreateDirectoryA(d, NULL); }
++      if (bon) { extern unsigned cellGcm_flip_request_count(void);
++          const unsigned fl = cellGcm_flip_request_count();
++          if (fl >= ba && fl < bb && bn < 4000) {
++              static int man = -1; if (man < 0) man = getenv("RSX_SHOT_MANIFEST") ? 1 : 0;
++              char bp[512];
++              snprintf(bp, sizeof bp, "%s/burst_%06u_%07llu.bmp", getenv("RSX_SHOT"), fl,
++                       (unsigned long long)s_d3d.frame_count);
++              cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
++                                 DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, bp);
++              if (man) rsx_capture_frame(fi, s_dbg_last_draws, bn);
++              printf("[SHOTB] %s flip=%u frame=%llu draws=%u kept=%d%c", bp, fl,
++                     (unsigned long long)s_d3d.frame_count, s_dbg_last_draws, s_shot_kept, 10);
++              fflush(stdout); bn++; } } }
+     static int on = -1, n = 0, done = 0;
+     static double at[32];
+     static const char* dir = NULL;
+@@ -5831,6 +5854,30 @@
+     if (v < 0) { const char* e = getenv("RSX_DISP_DEPTH_KEEP"); v = (e && e[0] == '0') ? 0 : 1; }
+     return v;
+ }
++/* A depth surface read through an A8R8G8B8 unit (its D24S8 bytes: the colour
++ * copies ds_convert and dispz_convert make) goes through the unit's component
++ * remap like any texture. Hot Shots Golf saves the display depth before a
++ * swing and restores it in every swing frame through crossbar 0xAA93, which
++ * puts the high depth byte (A) in .r, the middle byte in .g and the low byte
++ * in .b, and the program rebuilds depth as r/256 + g/65536 + b/2^24. Read
++ * without the remap it took the middle byte as the high one: the saved depth
++ * was the low two bytes of the real one, near 0, every golfer draw in the
++ * swing failed its depth test, and pixels whose low byte was 0 stayed black
++ * under the restored background. Only the byte copy (R8G8B8A8) of an ARGB
++ * unit is remapped; a depth-format unit reads the R32F copy as before.
++ * RSX_DEPTH_REMAP=0 reads them unremapped, as before. */
++static UINT depth_bytes_mapping(u32 fmt, u32 ctrl1, u32 dxgi)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_DEPTH_REMAP"); v = (e && e[0] == '0') ? 0 : 1; }
++    if (!v || (fmt & 0x9Fu) != 0x85u || dxgi != (u32)DXGI_FORMAT_R8G8B8A8_UNORM)
++        return D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    { static u32 seen[8]; static int ns = 0; int k = 0;   /* each crossbar once */
++      for (; k < ns; k++) if (seen[k] == (ctrl1 & 0xFFFFu)) break;
++      if (k == ns && ns < 8) { seen[ns++] = ctrl1 & 0xFFFFu;
++          printf("[D3D12] depth bytes read through crossbar 0x%04X%c", ctrl1 & 0xFFFFu, 10); } }
++    return rsx_remap_to_d3d(ctrl1, 0x85u);
++}
+ static u32 s_dispz_off = 0;            /* the display's zeta offset (0 is valid) */
+ static int s_dispz_known = 0;
+ static u32 s_dispz_sw = 0, s_dispz_sh = 0;   /* guest display surface size */
+@@ -7236,7 +7283,8 @@
+                                  dr->fp_addr, _u, dr->tex[_u].fmt, dr->tex[_u].w, dr->tex[_u].h, dr->rt_off,
+                                  dr->zeta_off, (unsigned long long)dr->zs_key, dr->cmask, dr->vertex_count, 10); } }
+                     srv_write(wslot, s_dispz[_k].res, (DXGI_FORMAT)s_dispz[_k].dxgi,
+-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
++                              depth_bytes_mapping(dr->tex[_u].fmt, dr->tex[_u].ctrl1,
++                                                  s_dispz[_k].dxgi));
+                     continue;
+                 }
+             }
+@@ -7253,7 +7301,8 @@
+                     dr->tex_rt[_u] = crt;
+                     dr->tex_ds[_u] = ds;
+                     srv_write(wslot, s_d3d.off_rt[crt].res, (DXGI_FORMAT)s_d3d.off_rt[crt].dxgi,
+-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
++                              depth_bytes_mapping(dr->tex[_u].fmt, dr->tex[_u].ctrl1,
++                                                  s_d3d.off_rt[crt].dxgi));
+                     continue;
+                 }
+             }
+@@ -7411,10 +7460,12 @@
+                 D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+             s_dispz_gen++; s_shared_scratch = 0;
+         }
++        s_shot_kept = 1;
+         static int _kl = 0;
+         if (PS3_LOG_FIRST(_kl, 4))
+             printf("[D3D12] display 0x%08X kept across a frame with no colour clear%c", keep_first, 10);
+     } else {
++    s_shot_kept = 0;
+     s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
+         s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
+     s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(

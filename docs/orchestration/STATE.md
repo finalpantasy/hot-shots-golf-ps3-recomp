@@ -555,3 +555,5 @@ Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-f
 - 2026-11-19 03:00 run 44 (worker aef1995516fcec7da): HD pack v1, 541 textures 4x/2x via realesrgan-x4plus (tools/make_hd_pack.py), indexed 541 replaced 1150, 0 failures; needs TEX_REPLACE_MB=3072. At 720p grass is softer, not sharper; first-load stalls 23.9 s total over 300 s (PNG). Next: judge at 4K, DDS packs, detail-preserving terrain.
 
 - 2026-11-19 03:30 run 45 (worker a181e99eb786ab90a): 0048 depth sized to backbuffer, 1440p/4K full frame, FPS unchanged (~33), VRAM 385 MB at 4K, debug layer 0 errors. Pre-existing: golfer missing in some swing frames at all sizes.
+
+- 2026-11-19 04:40 run 46 (worker ac08404a25782b213): golfer missing mid-swing = depth restore read A8R8G8B8 bytes without remap 0xAA93; 0049 applies the remap (RSX_DEPTH_REMAP=0 reverts). Missing frames 132 to 0 at 720p and 4K, 0 of 287 over 3 swings, no black frames, New Game to hole 3. Open: check hole 2 depth-fade rectangle. Adds RSX_SHOT_FLIPS, RSX_SHOT_MANIFEST.

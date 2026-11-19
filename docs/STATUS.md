@@ -327,3 +327,11 @@ New debug switches: `RSX_SHOT=<dir>` with `RSX_SHOT_SECS` saves full-size frames
 
 Found along the way and older than this patch: during the swing, some frames show the background and HUD without the golfer. Effect passes still run at the game's own size, so bloom and similar effects are not sharper at 4K yet.
 
+
+## 2026-11-19 update 36: the golfer stays visible through the swing (patch 0049)
+
+During the swing the golfer vanished for about 130 frames, leaving only the course, the club tip against the sky and the HUD. The game saves depth into a color buffer and rebuilds it later as r/256 + g/65536 + b/2^24, reading the bytes through texture remap 0xAA93. The backend ignored that remap on these copies, so it read the middle byte as the high one, the rebuilt depth came out near zero, and every golfer draw after it failed the depth test. Only the club survived. Patch `0049` applies the remap on these depth-byte copies; real depth formats are unchanged. `RSX_DEPTH_REMAP=0` restores the old reads.
+
+Frames with the golfer missing went from 132 to 0 on the first swing at 720p and at 4K, and none were missing in 287 swing frames over three shots at 720p. The impact flash still looks the same, now with the golfer in it. None of the 2,100 saved frames were black, and a New Game round reached hole 3. The hole 2 frame was not captured, so the effects that use the same depth decode there have not been checked yet.
+
+New debug switches: `RSX_SHOT_FLIPS=a:b` saves every frame in a flip range, and `RSX_SHOT_MANIFEST=1` writes the draw list for each saved frame.
