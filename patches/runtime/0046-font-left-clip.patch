@@ -1,0 +1,43 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -3940,6 +3940,27 @@ static u32 tex_csum(const u8* base, u32 nbytes)
+     return h;
+ }
+ 
++/* Every byte of a texture, 8 at a time. tex_csum above samples about 1024 words
++ * of a large texture; that is fine for a surface that changes everywhere (an
++ * animated one) but blind to a small edit. A glyph cache is the small-edit
++ * case: the game rasterizes one new glyph into a 40x44 cell of an 8-bit atlas
++ * that is otherwise unchanged, and with a 1024-byte stride over 1024-byte rows
++ * the sampled words never land inside that cell. The atlas then keeps its old
++ * upload, the new glyph samples as empty, and the string that asked for it
++ * (and nothing else) draws with a hole where the glyph belongs, for as long as
++ * the screen stays up. */
++static u32 tex_csum_dense(const u8* base, u32 nbytes)
++{
++    u64 h = 14695981039346656037ull;
++    u32 i = 0;
++    for (; i + 8 <= nbytes; i += 8) {
++        u64 w64; memcpy(&w64, base + i, sizeof w64);
++        h ^= w64; h *= 1099511628211ull; h ^= h >> 29;
++    }
++    for (; i < nbytes; i++) { h ^= base[i]; h *= 1099511628211ull; }
++    return (u32)(h ^ (h >> 32));
++}
++
+ /* The DXGI format a guest texture is uploaded as -- the DECODED image's, which
+  * is not always the guest's: the packed 16-bit colour formats arrive unpacked
+  * to RGBA8, and DEPTH24_D8 as a float. rsx_texture_layout.h says which class
+@@ -4045,7 +4066,11 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+      * animated surface changing, cheap enough to run on every bind. */
+     /* (portable helper tex_csum() -- see above; a statement-expression macro
+      * here was a GCC/Clang extension MSVC rejects.) */
+-    #define TEX_CSUM(base, nbytes) tex_csum((base), (nbytes))
++    /* Single- and two-channel 8-bit textures up to 8 MB (the font atlas class)
++     * are hashed in full; everything else keeps the sparse sample. */
++    const int dense_csum = !dxt && (tl.fmt == RSX_TEXFMT_R8 || tl.fmt == RSX_TEXFMT_R8G8) &&
++                           (u64)w * h * bpp <= (8u << 20);
++    #define TEX_CSUM(base, nbytes) (dense_csum ? tex_csum_dense((base), (nbytes))                                                : tex_csum((base), (nbytes)))
+     int slot = -1, freeslot = -1;
+     for (int i = 0; i < VP_TEX_SLOTS; i++) {
+         VPTexSlot* c = &s_d3d.vp_tex[i];

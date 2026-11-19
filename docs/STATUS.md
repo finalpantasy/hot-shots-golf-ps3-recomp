@@ -297,3 +297,12 @@ After Select Character or the Changing Room, the course load stopped and the scr
 Patch `0045` frees a chain's slot when the game joins it after shutdown, once its walker thread has exited, and raises the table to 256 slots (`JC_RECLAIM=0` restores the old behavior). A full table now logs `registry full ... this chain will NOT run`. It also adds `HANG_WD=<seconds>`: when no frame has been shown for that long, it prints every guest thread's wait and every job-chain walker. It is off unless set.
 
 Two runs through Select Character loaded and played the round, with chains past number 32 running. A New Game round reached hole 3 and went on to load hole 4 without a stall. Nothing froze. Hang B (a second Cross during the Continue load) did not happen in two tries. It is still open. The likely cause is a timing race in the movie player when the press lands while the intro movie is closing, since in the one failing run the player closed the stream but never finished shutting down.
+
+## 2026-11-18 update 33: missing letters and blank menu text
+
+Blank text across the menus came from test runs that had no firmware font. With `PS3_DEV_FLASH` pointing at a dev_flash folder that holds the font, the description bars and labels render. The test launcher now sets it. The default firmware path is in `port/main.cpp`, so a fallback was proposed to Codex.
+
+Some words still lost a letter, such as "ookie's Cup". The font code was fine. The cause was a stale texture in the renderer. The game writes new glyphs into a 256x256 one-byte atlas texture. The backend decides whether a cached texture changed by sampling about 1,024 words, and that sample missed the new glyph cells, so the old upload stayed and the new letter drew as a gap. Patch `0046` hashes every byte of one- and two-channel 8-bit textures up to 8 MB. Other textures keep the sparse check. Challenge and Select Character now show "Rookie's Cup" and the full character descriptions, and a New Game round still reached the course. Not measured yet: what the full hash on this atlas costs in FPS, which should be small since the atlas is 64 KB but is hashed every time it is bound.
+
+The plan for 4K, 120 FPS, upscaling and HD textures is in `docs/MODERN-PC-ROADMAP.md`.
+
