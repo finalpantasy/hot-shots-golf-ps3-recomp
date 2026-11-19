@@ -1,0 +1,208 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2277,14 +2277,14 @@
+                      (unsigned long long)s_d3d.frame_count, s_dbg_last_draws, s_shot_kept, 10);
+               fflush(stdout); bn++; } } }
+     static int on = -1, n = 0, done = 0;
+-    static double at[32];
++    static double at[160];
+     static const char* dir = NULL;
+     if (on < 0) {
+         dir = getenv("RSX_SHOT");
+         const char* e = getenv("RSX_SHOT_SECS");
+         on = 0;
+         if (dir && *dir && e) {
+-            while (*e && n < 32) {
++            while (*e && n < 160) {
+                 char* end = NULL;
+                 const double v = strtod(e, &end);
+                 if (end == e) break;
+@@ -2295,6 +2295,24 @@
+             if (on) CreateDirectoryA(dir, NULL);
+         }
+     }
++    /* RSX_SHOT_PAIR=1: also save the frame after each timed shot, as
++     * shot_<s>_next.bmp (with RSX_RT_SUBRECT=2 the two differ in that switch
++     * only). */
++    { static char nextp[512]; static int pend = 0, pair = -1;
++      if (pair < 0) pair = getenv("RSX_SHOT_PAIR") ? 1 : 0;
++      if (pend) { pend = 0;
++          cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
++                             DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, nextp);
++          printf("[SHOT] %s frame=%llu draws=%u%c", nextp, (unsigned long long)s_d3d.frame_count,
++                 s_dbg_last_draws, 10);
++          fflush(stdout); return; }
++      if (pair && on && done < n) {
++          FILETIME c0, x0, k0, u0, now0;
++          GetProcessTimes(GetCurrentProcess(), &c0, &x0, &k0, &u0);
++          GetSystemTimeAsFileTime(&now0);
++          const double up0 = (double)((((u64)now0.dwHighDateTime << 32) | now0.dwLowDateTime) -
++                                      (((u64)c0.dwHighDateTime << 32) | c0.dwLowDateTime)) / 1e7;
++          if (up0 >= at[done]) { snprintf(nextp, sizeof nextp, "%s/shot_%g_next.bmp", dir, at[done]); pend = 1; } } }
+     if (!on || done >= n) return;
+     FILETIME c, x, k, u, now;
+     GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u);
+@@ -2307,6 +2325,9 @@
+     while (done < n && up >= at[done]) done++;   /* one frame per due time; skip ones already passed */
+     cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
+                        DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, path);
++    /* RSX_SHOT_SECS_MANIFEST=1: an RSX_CAP manifest of each timed shot too
++     * (cap dirs frame_<100+n>), for scenes whose flip number varies by run. */
++    if (getenv("RSX_SHOT_SECS_MANIFEST")) rsx_capture_frame(fi, s_dbg_last_draws, 100u + (u32)done);
+     printf("[SHOT] %s %ux%u t=%.1fs frame=%llu draws=%u depth=%ux%u vram=%.0fMB\n", path,
+            s_d3d.width, s_d3d.height, up, (unsigned long long)s_d3d.frame_count,
+            s_dbg_last_draws, s_d3d.depth_w, s_d3d.depth_h, vram_used_mb());
+@@ -3197,7 +3218,126 @@
+     return m;
+ }
+ 
+-/* Which of a draw's texture units use unnormalized coordinates, with dimensions. */
++/* A render target sampled through a texture smaller than the target.
++ *
++ * On the RSX a texture is a header over memory: width, height and pitch. A
++ * linear texture whose pitch is its surface's pitch but whose size is smaller
++ * reads only the top-left corner of that surface, and normalized coordinates
++ * 0..1 span that corner. Hot Shots Golf renders a reduced copy of the scene
++ * into a corner of the 1600x1080 surface 0x01900000 (viewport 400x270; its
++ * blur passes use 800x540) and its water program (fp 0x018CE701) samples it
++ * through a 400x270 header at 0x01900000 (close-ups show a half-screen
++ * rectangle, so an 800x540 one there), addressed by screen position, to
++ * draw the reflection. The backend bound the whole offscreen target, so 0..1
++ * spanned all 1600x1080: the reflection filled only the corner's share of the
++ * screen, a hard-edged upside-down rectangle in the lower left, and the rest
++ * of the water reflected the target's cleared texels (plain blue water).
++ *
++ * Units like that get their coordinate scaled by texture size / target size
++ * in the fragment program (bits 16..31 of the unnorm mask, the PSO key; dims
++ * hold texture w, h and target w << 16 | h). Only units the program samples,
++ * normalized 2D ones, and only when the texture pitch is the target's
++ * (padded) row size, or unknown. RSX_RT_SUBRECT=0 restores sampling the whole target;
++ * RSX_RT_SUBRECT=2 (a/b test) scales on even frames only, so neighbouring
++ * frames of one scene show both. */
++static int rt_subrect_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_RT_SUBRECT"); v = e ? atoi(e) : 1; }
++    if (v == 2) return (s_d3d.frame_count & 1u) == 0;
++    return v != 0;
++}
++static u32 fp_units_cached(u32 fp_addr);
++static u32 dr_subrect_units(const D3D12DrawRecord* dr, u32 dim[16][3])
++{
++    if (!rt_subrect_on() || dr->is_clear) return 0;
++    u32 mask = 0, used = 0xFFFFu; int used_known = 0;
++    for (int u = 0; u < 16; u++) {
++        const int rt = dr->tex_rt[u];
++        if (rt < 0 || rt >= MAX_OFF_RTS || !dr->tex[u].set || dr->tex[u].cube ||
++            (dr->tex[u].fmt & 0x40) || !s_d3d.off_rt[rt].res) continue;
++        const u32 tw = dr->tex[u].w, th = dr->tex[u].h;
++        const u32 rw = s_d3d.off_rt[rt].w, rh = s_d3d.off_rt[rt].h;
++        if (!tw || !th || !rw || !rh || tw > rw || th > rh || (tw == rw && th == rh)) continue;
++        if (rw > 0xFFFFu || rh > 0x7FFFu) continue;
++        { static int rdbg = -1, rn = 0;   /* RSX_RT_SUBRECT_DBG=-N: every candidate, before the checks */
++          if (rdbg == -1) { const char* e = getenv("RSX_RT_SUBRECT_DBG"); rdbg = (e && atoi(e) < 0) ? -atoi(e) : 0; }
++          static u32 seen[512]; int dup = 0;
++          const u32 key = dr->fp_addr ^ ((u32)u << 28) ^ (tw << 12) ^ th;
++          for (int i = 0; i < rn && i < 512; i++) if (seen[i] == key) dup = 1;
++          if (rdbg && !dup && rn < rdbg && rn < 512) { seen[rn++] = key;
++              fprintf(stderr, "[SUBRECT?] fp=0x%08X unit %d tex 0x%08X %ux%u pitch=%u fmt=0x%02X <- target %ux%u dxgi=%u used=0x%X%c",
++                      dr->fp_addr, u, dr->tex[u].raw, tw, th, dr->tex[u].pitch, dr->tex[u].fmt, rw, rh,
++                      s_d3d.off_rt[rt].dxgi, fp_units_cached(dr->fp_addr), 10); } }
++        /* The pitch must be the target's row: at least its width in bytes
++         * (bytes per texel from the target's format) and less than twice it,
++         * as the surface pitch is padded (1600 wide: 6656 bytes, not 6400).
++         * Any other pitch reinterprets the memory and is not a corner. */
++        if (dr->tex[u].pitch) {
++            const u32 bpp = (s_d3d.off_rt[rt].dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8u
++                          : (s_d3d.off_rt[rt].dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16u : 4u;
++            if (dr->tex[u].pitch < rw * bpp || dr->tex[u].pitch >= 2u * rw * bpp) continue;
++        }
++        if (!used_known) { used = fp_units_cached(dr->fp_addr); used_known = 1; }
++        if (!((used >> u) & 1u)) continue;
++        mask |= 1u << u;
++        dim[u][0] = tw; dim[u][1] = th; dim[u][2] = (rw << 16) | rh;
++        { static int dbg = -1, n = 0;
++          if (dbg < 0) { const char* e = getenv("RSX_RT_SUBRECT_DBG"); dbg = e ? atoi(e) : 0; }
++          if (dbg && n < dbg) { n++;
++              fprintf(stderr, "[SUBRECT] fp=0x%08X unit %d tex 0x%08X %ux%u pitch=%u <- target %ux%u (scale %.4f,%.4f)%c",
++                      dr->fp_addr, u, dr->tex[u].raw, tw, th, dr->tex[u].pitch, rw, rh,
++                      (double)tw / rw, (double)th / rh, 10); } }
++    }
++    return mask;
++}
++
++/* Insert " * float2(tw/rw, th/rh)" at the end of every 2D Sample() coordinate
++ * of the units in sub_mask (see dr_subrect_units). Returns call sites patched. */
++static int fp_apply_subrect_scale(char* hlsl, size_t cap, u32 sub_mask, const u32 dim[16][3])
++{
++    int patched = 0;
++    for (u32 u = 0; u < 16 && sub_mask; u++) {
++        if (!((sub_mask >> u) & 1u)) continue;
++        const u32 rw = dim[u][2] >> 16, rh = dim[u][2] & 0xFFFFu;
++        if (!rw || !rh) continue;
++        char scale[80];
++        snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
++                 (double)dim[u][0] / (double)rw, (double)dim[u][1] / (double)rh);
++        const size_t slen = strlen(scale);
++        char needles[2][40];
++        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].Sample(rsx_samp[%u],", u, u);
++        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.Sample(rsx_samp[%u],", u, u);
++        for (int k = 0; k < 2; k++) {
++            char* from = hlsl;
++            for (;;) {
++                char* at = strstr(from, needles[k]);
++                if (!at) break;
++                char* open = strchr(at, '(');
++                int depth = 0; char* p = open;
++                for (; p && *p; p++) {
++                    if (*p == '(') depth++;
++                    else if (*p == ')') { depth--; if (!depth) break; }
++                }
++                if (!p || *p != ')') break;
++                from = p;
++                /* A 3-component coordinate (cube / volume form): leave it. */
++                { const char save = *p; *p = 0; const int v3 = strstr(at, ".xyz") != NULL; *p = save;
++                  if (v3) continue; }
++                const size_t used = strlen(hlsl);
++                if (used + slen + 1 > cap) return patched;
++                memmove(p + slen, p, used - (size_t)(p - hlsl) + 1);
++                memcpy(p, scale, slen);
++                from = p + slen;
++                patched++;
++            }
++        }
++    }
++    return patched;
++}
++
++/* Which of a draw's texture units use unnormalized coordinates, with dimensions.
++ * Bits 16..31: units sampling a corner of a larger render target (above). */
+ static u32 dr_unnorm_units(const D3D12DrawRecord* dr, u32 dim[16][3])
+ {
+     u32 mask = 0;
+@@ -3210,7 +3350,7 @@
+         dim[u][1] = dr->tex[u].h;
+         dim[u][2] = 1;
+     }
+-    return mask;
++    return mask | (dr_subrect_units(dr, dim) << 16);
+ }
+ 
+ /* Depth-format textures (0x90..0x93) are recorded and sampled from the depth
+@@ -3672,8 +3812,14 @@
+             if (PS3_LOG_FIRST(_ek, 8))
+                 printf("[FP] texture alpha kill not applied (fp=0x%08X)\n", fp_addr);
+         }
+-    if (unnorm_mask) {
+-        rsx_fp_apply_unnorm_scale(hlsl, sizeof(hlsl), unnorm_mask, (const u32 (*)[3])unnorm_dim, cube_mask, 0);
++    if (unnorm_mask & 0xFFFFu) {
++        rsx_fp_apply_unnorm_scale(hlsl, sizeof(hlsl), unnorm_mask & 0xFFFFu, (const u32 (*)[3])unnorm_dim, cube_mask, 0);
++    }
++    if (unnorm_mask >> 16) {   /* render-target corners (dr_subrect_units) */
++        const int np = fp_apply_subrect_scale(hlsl, sizeof(hlsl), unnorm_mask >> 16, unnorm_dim);
++        { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
++            printf("[D3D12] fp=0x%08X samples a render-target corner: units 0x%X, %d sites scaled%c",
++                   fp_addr, unnorm_mask >> 16, np, 10); }
+     }
+     /* WPOS in guest pixels. The backbuffer stands in for a display surface of
+      * the guest's size (RSX_VP_SCALE), so SV_Position runs over the window

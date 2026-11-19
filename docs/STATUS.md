@@ -335,3 +335,11 @@ During the swing the golfer vanished for about 130 frames, leaving only the cour
 Frames with the golfer missing went from 132 to 0 on the first swing at 720p and at 4K, and none were missing in 287 swing frames over three shots at 720p. The impact flash still looks the same, now with the golfer in it. None of the 2,100 saved frames were black, and a New Game round reached hole 3. The hole 2 frame was not captured, so the effects that use the same depth decode there have not been checked yet.
 
 New debug switches: `RSX_SHOT_FLIPS=a:b` saves every frame in a flip range, and `RSX_SHOT_MANIFEST=1` writes the draw list for each saved frame.
+
+## 2026-11-19 update 37: water reflections fill the water (patch 0050)
+
+On hole 2 the water showed an upside-down copy of the scene as a hard-edged box in the lower-left of the screen, and the rest of the water was plain blue. The game renders a small reflection image into the top-left 400x270 corner of a 1600x1080 offscreen target, then reads it through a 400x270 texture header. On the PS3, coordinates 0 to 1 cover only that header. The backend bound the whole target, so the image landed in one quarter of the screen. Patch `0050` scales the coordinate by header size over target size when a texture reads part of a larger offscreen target. Only the water program does this so far. `RSX_RT_SUBRECT=0` turns it off.
+
+At 720p and 4K the box is gone and the reflection spreads across the water. A default 720p round had no black frames, kept the golfer in swing frames and reached hole 3. There is no hardware reference yet. The water now looks more opaque than before, and some logs that showed through it are harder to see. A sky-white wedge also appears near one bank. Both need a check against real PS3 footage.
+
+New debug switches: `RSX_RT_SUBRECT=2` applies the fix on even frames only for side-by-side tests, `RSX_RT_SUBRECT_DBG`, `RSX_SHOT_PAIR` and `RSX_SHOT_SECS_MANIFEST`.
