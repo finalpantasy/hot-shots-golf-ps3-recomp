@@ -17,6 +17,12 @@ Per texture:
          a wrap pad, otherwise the edge pixels are smeared; --pad px on each side.
   alpha  realesrgan-ncnn-vulkan keeps and resizes the alpha plane of RGBA PNGs
          (checked), so alpha is passed through; fully opaque textures are written RGB.
+  bleed  (needs numpy+Pillow) before upscaling, the RGB of transparent/mostly transparent texels
+         (alpha < 128) is filled from the nearest opaque texels. Otherwise their black RGB bleeds
+         into the visible edge and the upscaled leaf/fence textures come out 20-50 levels too dark.
+  match  (needs numpy+Pillow) after upscaling, each output is shifted per channel so its mean (and,
+         up to a 1.25x gain, its std) at source size equals the source's, weighted by the source
+         alpha. Real-ESRGAN darkens opaque textures by 2-20 levels. Alpha is never touched.
   scale  4x for long side <= 256, else 4x then lanczos down to 2x. The padded center
          is cropped back, so output is exactly (w*s, h*s): same aspect as the original.
 Resumable: files already in --out are skipped. Batches are bounded (--batch-mpx input
@@ -98,6 +104,64 @@ def ff(src, dst, graph):
         raise RuntimeError(r.stderr.decode(errors='replace')[:300])
 
 
+def _np():
+    try:
+        import numpy as np
+        from PIL import Image
+        return np, Image
+    except ImportError:
+        return None, None
+
+
+def bleed_rgb(path, thr=128, maxit=512):
+    """Fill RGB of texels with alpha < thr from the nearest texels with alpha >= thr (alpha unchanged)."""
+    np, Image = _np()
+    if np is None: return
+    im = np.array(Image.open(path).convert('RGBA'))
+    known = im[..., 3] >= thr
+    if known.all() or not known.any(): return
+    rgb = im[..., :3].astype(np.float32); k = known.copy()
+    for _ in range(maxit):
+        if k.all(): break
+        kf = k.astype(np.float32)[..., None]
+        acc = np.zeros_like(rgb); cnt = np.zeros(k.shape + (1,), np.float32)
+        pr = np.pad(rgb * kf, ((1, 1), (1, 1), (0, 0))); pk = np.pad(kf, ((1, 1), (1, 1), (0, 0)))
+        H, W = k.shape
+        for dy in (0, 1, 2):
+            for dx in (0, 1, 2):
+                if dy == 1 and dx == 1: continue
+                acc += pr[dy:dy + H, dx:dx + W]; cnt += pk[dy:dy + H, dx:dx + W]
+        new = (~k) & (cnt[..., 0] > 0)
+        if not new.any(): break
+        rgb[new] = acc[new] / cnt[new]; k |= new
+    im[..., :3] = np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+    Image.fromarray(im, 'RGBA').save(path)
+
+
+def match_color(src_png, out_png, max_gain=1.25):
+    """Shift/scale the output's RGB so its mean/std at source size match the source. Returns (dmean, gain) or None."""
+    np, Image = _np()
+    if np is None: return None
+    o = np.asarray(Image.open(src_png).convert('RGBA'), np.float32)
+    u_img = Image.open(out_png); has_a = u_img.mode == 'RGBA'
+    u = np.asarray(u_img.convert('RGBA'), np.float32)
+    H, W = o.shape[:2]; k = u.shape[0] // H
+    if k < 1 or u.shape[0] != H * k or u.shape[1] != W * k: return None
+    d = u.reshape(H, k, W, k, 4).mean((1, 3))
+    w = o[..., 3:] / 255.0 if has_a else np.ones((H, W, 1), np.float32)
+    sw = float(w.sum())
+    if sw < 0.02 * H * W: return None
+    def stats(a):
+        m = (a[..., :3] * w).sum((0, 1)) / sw
+        return m, np.sqrt((((a[..., :3] - m) ** 2) * w).sum((0, 1)) / sw)
+    mo, so = stats(o); md, sd = stats(d)
+    g = np.clip(so / np.maximum(sd, 1e-3), 1.0, max_gain)
+    out = np.clip((u[..., :3] - md) * g + mo, 0, 255)
+    res = np.concatenate([out, u[..., 3:]], 2) if has_a else out
+    Image.fromarray(np.clip(res + 0.5, 0, 255).astype(np.uint8), 'RGBA' if has_a else 'RGB').save(out_png)
+    return (mo - md).round(1).tolist(), g.round(2).tolist()
+
+
 def acquire(lock, owner, log):
     t0 = time.time()
     while True:
@@ -134,6 +198,9 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--wrap-k', type=float, default=2.2, help='wrap pad an axis when seam delta <= k*inner delta + 2')
     ap.add_argument('--prev-k', type=float, default=2.2, help='k used for outputs that have no manifest entry')
+    ap.add_argument('--only-alpha', action='store_true', help='process only textures that have an alpha channel')
+    ap.add_argument('--no-match', action='store_true', help='skip the post-upscale colour match')
+    ap.add_argument('--rematch', action='store_true', help='only colour-match the files already in --out (no upscaling)')
     ap.add_argument('--lock'); ap.add_argument('--owner', default='make_hd_pack')
     a = ap.parse_args()
     out = os.path.abspath(a.out); os.makedirs(out, exist_ok=True)
@@ -169,6 +236,8 @@ def main():
             wx = sx <= a.wrap_k * ix + 2; wy = sy <= a.wrap_k * iy + 2
         if why:
             skips[n] = why; log('SKIP %s: %s' % (n, why)); continue
+        if a.only_alpha and not has_alpha: continue
+        if a.rematch: continue
         if os.path.exists(os.path.join(out, n)):
             prev = manifest.get(n)
             if prev is None:
@@ -198,6 +267,7 @@ def main():
             shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
         for t in b:
             ff(t['path'], os.path.join(din, t['n']), t['g'])
+            if t['alpha']: bleed_rgb(os.path.join(din, t['n']))
         cmd = [exe, '-i', din, '-o', dout, '-n', a.model, '-f', 'png']
         if a.models: cmd += ['-m', a.models]
         t0 = time.time()
@@ -222,12 +292,20 @@ def main():
             g += ',format=%s[o]' % ('rgba' if t['alpha'] else 'rgb24')
             try:
                 ff(up, os.path.join(out, t['n']), g); okc += 1
+                if not a.no_match:
+                    r = match_color(t['path'], os.path.join(out, t['n']))
+                    if r: log('match %s dmean %s gain %s' % (t['n'], r[0], r[1]))
                 manifest[t['n']] = [t['wx'], t['wy']]; json.dump(manifest, open(mpath, 'w'))
             except RuntimeError as e:
                 log('FAIL %s %s' % (t['n'], e))
         log('batch %d/%d: %d files, %.1f Mpx in, %.0f s, ok %d' % (bi + 1, len(batches), len(b), sum((x['w'] + 2 * x['px']) * (x['h'] + 2 * x['py']) for x in b) / 1e6, time.time() - t0, okc))
     shutil.rmtree(os.path.join(work, 'in'), ignore_errors=True); shutil.rmtree(os.path.join(work, 'out'), ignore_errors=True)
 
+    if a.rematch:
+        for n, path in files.items():
+            if os.path.exists(os.path.join(out, n)):
+                r = match_color(path, os.path.join(out, n))
+                if r: log('rematch %s dmean %s gain %s' % (n, r[0], r[1]))
     # stats
     tot = 0; gpu = 0; n = 0
     for f in os.listdir(out):
