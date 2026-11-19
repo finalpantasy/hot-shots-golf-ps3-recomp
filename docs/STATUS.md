@@ -343,3 +343,11 @@ On hole 2 the water showed an upside-down copy of the scene as a hard-edged box 
 At 720p and 4K the box is gone and the reflection spreads across the water. A default 720p round had no black frames, kept the golfer in swing frames and reached hole 3. There is no hardware reference yet. The water now looks more opaque than before, and some logs that showed through it are harder to see. A sky-white wedge also appears near one bank. Both need a check against real PS3 footage.
 
 New debug switches: `RSX_RT_SUBRECT=2` applies the fix on even frames only for side-by-side tests, `RSX_RT_SUBRECT_DBG`, `RSX_SHOT_PAIR` and `RSX_SHOT_SECS_MANIFEST`.
+
+## 2026-11-19 update 38: textures keep their mip levels (patch 0051)
+
+The renderer uploaded only the top level of every game texture, though 75 of the 128 distinct textures seen on the first tee carry smaller mip levels. Distant fairway and slopes shimmered as a result. Patch `0051` uploads every level the texture header declares, for swizzled, linear and DXT textures, and the sampler now follows the header's LOD clamp. Textures from an HD pack get the game's levels plus extra ones for their larger size, averaged by alpha so transparent black texels no longer darken leaf edges. `RSX_GUEST_MIPS=0` reverts the game path, and `TEX_REPLACE_MIPS=0` gives pack textures one level only.
+
+Fine detail energy on the distant fairway dropped from 62 to 8, which is the shimmer going away. At 4K the tee grass, fairway and trees match within one or two levels across the old build, the new build and the new build with HD pack v2. The lighter grass seen in the first 4K test of HD pack v1 was a run-to-run state, not the pack: in some runs the bottom third of the frame is about 0.72x darker, with or without a pack. That state is not explained yet.
+
+GPU memory rises by the cost of the mip levels, from about 385 to 405 MB at 4K. FPS is unchanged within noise. The debug layer reported 0 errors over 9,000 frames, the golfer stays in swing frames, the hole 2 water is intact and a New Game round reached hole 3.
