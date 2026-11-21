@@ -1,0 +1,190 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -3288,6 +3288,100 @@
+     }
+ }
+ 
++/* RSX_SHADOW_SCALE=N (2..4; unset or 1 = off): depth-only passes render into
++ * a depth surface N times the guest's size on each axis, with their viewports
++ * scaled by N. Hot Shots Golf's shadow map is one such pass: a 3072x1024 atlas
++ * of three 1024 cascades side by side (ShadowMap_Create 0x8FAA78; the guest's
++ * 2048 cap overflows its atlas and VRAM pool). Its programs sample the map
++ * with normalized coordinates, and the compare helper takes its texel size
++ * from the bound texture (GetDimensions), so the lookups need no change: each
++ * cascade just has N*N times the texels. The guest's layout, memory and
++ * cascade math are untouched. RSX_SHADOW_LOG=1 logs the scaled surfaces and
++ * the first units that sample them. RSX_SHADOW_FROM_FLIP=F (a/b test) keeps
++ * the guest's size until guest flip F and scales from then on, so one run
++ * shows the same scene both ways. */
++static int shadow_scale_cfg(void)
++{
++    static int v = -1;
++    if (v < 0) {
++        const char* e = getenv("RSX_SHADOW_SCALE");
++        v = e ? atoi(e) : 1;
++        if (v < 1) v = 1;
++        if (v > 4) v = 4;
++        if (v > 1) fprintf(stderr, "[SHADOW] depth-only passes at %dx%c", v, 10);
++    }
++    return v;
++}
++static int s_shadow_k = 1;
++static unsigned long long s_shadow_k_frame = ~0ull;
++/* The scale in effect, fixed for each host frame (the RT pre-pass sizes the
++ * surface and the draws scale their viewports with the same value). */
++static int shadow_scale(void)
++{
++    const int k = shadow_scale_cfg();
++    if (k <= 1) return 1;
++    if (s_shadow_k_frame != (unsigned long long)s_d3d.frame_count) {
++        static long from = -2;
++        extern unsigned cellGcm_flip_request_count(void);
++        if (from == -2) { const char* e = getenv("RSX_SHADOW_FROM_FLIP"); from = e ? atol(e) : -1; }
++        s_shadow_k_frame = (unsigned long long)s_d3d.frame_count;
++        const int was = s_shadow_k;
++        s_shadow_k = (from < 0 || cellGcm_flip_request_count() >= (unsigned)from) ? k : 1;
++        if (s_shadow_k != was)
++            fprintf(stderr, "[SHADOW] scale %d from flip %u frame %llu%c", s_shadow_k,
++                    cellGcm_flip_request_count(), s_shadow_k_frame, 10);
++    }
++    return s_shadow_k;
++}
++static int shadow_log_on(void)
++{
++    static int v = -1;
++    if (v < 0) v = getenv("RSX_SHADOW_LOG") ? 1 : 0;
++    return v;
++}
++static u32 s_shadow_zeta[8];
++static int s_shadow_nzeta;
++/* Was this depth offset sized by shadow_ds_dim (so it is N times the guest)? */
++static int shadow_zeta_scaled(u32 off)
++{
++    if (!off || shadow_scale() <= 1) return 0;
++    for (int i = 0; i < s_shadow_nzeta; i++) if (s_shadow_zeta[i] == off) return 1;
++    return 0;
++}
++/* The depth surface size the RT pre-pass asks for: the guest's, times N for
++ * a depth-only pass. */
++static u32 shadow_ds_dim(const D3D12DrawRecord* dr, u32 v)
++{
++    const int k = shadow_scale();
++    if (k <= 1 || !dr->no_color || !dr->zeta_off || !v) return v;
++    if (!shadow_zeta_scaled(dr->zeta_off) && s_shadow_nzeta < 8) {
++        s_shadow_zeta[s_shadow_nzeta++] = dr->zeta_off;
++        if (shadow_log_on())
++            fprintf(stderr, "[SHADOW] depth 0x%08X guest %ux%u -> %ux%u%c", dr->zeta_off,
++                    dr->rt_w, dr->rt_h, dr->rt_w * (u32)k, dr->rt_h * (u32)k, 10);
++    }
++    return shadow_zeta_scaled(dr->zeta_off) ? v * (u32)k : v;
++}
++/* A draw into a scaled depth surface: its guest viewport, in guest pixels,
++ * mapped to the surface's pixels. */
++static void shadow_scale_vp(int cur_nc, int cur_z, float* x, float* y, float* w, float* h)
++{
++    const int k = shadow_scale();
++    if (k <= 1 || !cur_nc || cur_z < 0 || cur_z >= MAX_OFF_DS ||
++        !shadow_zeta_scaled(s_d3d.off_ds[cur_z].off)) return;
++    *x *= (float)k; *y *= (float)k; *w *= (float)k; *h *= (float)k;
++}
++/* RSX_SHADOW_LOG=1: the first units that sample a scaled depth surface. */
++static void shadow_log_sample(const D3D12DrawRecord* dr, int u)
++{
++    static int n = 0;
++    if (!shadow_log_on() || n >= 8 || !shadow_zeta_scaled(dr->tex[u].raw)) return;
++    n++;
++    fprintf(stderr, "[SHADOW] fp=0x%08X unit %d samples 0x%08X %ux%u fmt=0x%02X filter=0x%08X"
++                    " addr=0x%08X ctrl0=0x%08X%c", dr->fp_addr, u, dr->tex[u].raw, dr->tex[u].w,
++            dr->tex[u].h, dr->tex[u].fmt, dr->tex[u].filter, dr->tex[u].addr, dr->tex[u].ctrl0, 10);
++}
++
+ /* Which of a draw's texture units are cube textures, as a 4-bit mask. */
+ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
+ {
+@@ -3343,6 +3437,7 @@
+         const int rt = dr->tex_rt[u];
+         if (rt < 0 || rt >= MAX_OFF_RTS || !dr->tex[u].set || dr->tex[u].cube ||
+             (dr->tex[u].fmt & 0x40) || !s_d3d.off_rt[rt].res) continue;
++        if (shadow_zeta_scaled(dr->tex[u].raw)) continue;   /* larger by RSX_SHADOW_SCALE, not a corner */
+         const u32 tw = dr->tex[u].w, th = dr->tex[u].h;
+         const u32 rw = s_d3d.off_rt[rt].w, rh = s_d3d.off_rt[rt].h;
+         if (!tw || !th || !rw || !rh || tw > rw || th > rh || (tw == rw && th == rh)) continue;
+@@ -7657,7 +7752,7 @@
+             if (dr->is_vp && dr->rt_mrt[_m])
+                 off_rt_get(dr->rt_mrt[_m], dr->rt_w, dr->rt_h, dr->rt_fmt);
+         if (dr->is_vp && dr->zeta_off && (dr->rt_off || dr->no_color))
+-            off_ds_get(dr->zeta_off, dr->rt_w, dr->rt_h);
++            off_ds_get(dr->zeta_off, shadow_ds_dim(dr, dr->rt_w), shadow_ds_dim(dr, dr->rt_h));
+         for (int _u = 0; _u < 16; _u++) dr->tex_ds[_u] = -1;   /* set below for draws */
+     }
+     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+@@ -7828,6 +7923,7 @@
+                     fprintf(stderr, "[DSBIND] frame=%llu op %u unit %d ds %d crt %d%c",
+                             (unsigned long long)s_d3d.frame_count, _d, _u, ds, crt, 10);
+                 if (crt >= 0) {
++                    shadow_log_sample(dr, _u);
+                     dr->tex_rt[_u] = crt;
+                     dr->tex_ds[_u] = ds;
+                     srv_write(wslot, s_d3d.off_rt[crt].res, (DXGI_FORMAT)s_d3d.off_rt[crt].dxgi,
+@@ -8447,6 +8543,7 @@
+                           const float sx = tw / (float)dr->surf_w, sy = th / (float)dr->surf_h;
+                           gx = ox + gx * sx; gw *= sx; gy = oy + gy * sy; gh *= sy;
+                       } }
++                    shadow_scale_vp(cur_nc, cur_z, &gx, &gy, &gw, &gh);
+                     if (gw >= 1.0f && gh >= 1.0f &&
+                         gx + gw <= ox + tw + 0.5f &&
+                         gy + gh <= oy + th + 0.5f) {
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -512,6 +512,40 @@
+     return units;
+ }
+ 
++/* RSX_SHADOW_PCF=1 (default off): compared lookups filter over a 3x3-texel
++ * box, bilinearly weighted (16 taps; weights 1-f, 1, 1, f per axis, sum 9),
++ * instead of the RSX's 2x2 bilinear compare. Softens the stair-stepped
++ * shadow edges a 2x2 compare leaves at 4K; pairs with RSX_SHADOW_SCALE,
++ * whose larger map keeps the 3-texel footprint near the guest's own. */
++static int fp_shadow_pcf_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_SHADOW_PCF"); v = (e && atoi(e) > 0) ? 1 : 0; }
++    return v;
++}
++static void fp_shadow_pcf_taps(Out* p, const char* tex, u32 unit, int need_size)
++{
++    char text[512];
++    if (!need_size) {
++        snprintf(text, sizeof text, "    uint width, height; %s.GetDimensions(width, height);\n"
++            "    float2 size = float2(width, height);\n", tex);
++        out_puts(p, text);
++    }
++    out_puts(p, "    float2 position = uv * size - 0.5;\n"
++        "    float2 base = floor(position); float2 fraction = position - base;\n"
++        "    float wx[4] = { 1.0 - fraction.x, 1.0, 1.0, fraction.x };\n"
++        "    float wy[4] = { 1.0 - fraction.y, 1.0, 1.0, fraction.y };\n"
++        "    float sum = 0.0;\n"
++        "    [unroll] for (int j = 0; j < 4; j++) {\n"
++        "        [unroll] for (int i = 0; i < 4; i++) {\n");
++    snprintf(text, sizeof text,
++        "            float depth = %s.SampleLevel(rsx_samp[%u], (base + float2(i - 0.5, j - 0.5)) / size, 0.0).r;\n"
++        "            sum += wx[i] * wy[j] * _rsx_shadow_cmp%u(reference, depth);\n"
++        "        }\n    }\n"
++        "    return (float4)(sum / 9.0);\n}\n", tex, unit, unit);
++    out_puts(p, text);
++}
++
+ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
+                               const rsx_fp_shadow_desc* d)
+ {
+@@ -535,6 +569,10 @@
+     }
+     out_puts(p, d->unnormalized ? "    float2 uv = coordinate.xy / size;\n" :
+                                      "    float2 uv = coordinate.xy;\n");
++    if (fp_shadow_pcf_on() && !d->unnormalized) {
++        fp_shadow_pcf_taps(p, tex, unit, d->linear);
++        return;
++    }
+     if (!d->linear) {
+         snprintf(text, sizeof text,
+             "    float depth = %s.SampleLevel(rsx_samp[%u], uv, 0.0).r;\n"
