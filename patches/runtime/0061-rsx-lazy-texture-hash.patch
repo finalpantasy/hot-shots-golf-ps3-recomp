@@ -1,0 +1,116 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -4521,8 +4521,20 @@
+  * upload, the new glyph samples as empty, and the string that asked for it
+  * (and nothing else) draws with a hole where the glyph belongs, for as long as
+  * the screen stays up. */
++/* RSX_TEX_HASH_LAZY (default on; =0 off): the dense checksum runs four
++ * independent 64-bit lanes (rsx_hash64) instead of one multiply chain --
++ * every byte still hashed, about four times the throughput. The upload and
++ * the per-frame check both come through here, so the two always agree. */
++static int tex_lazy_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_TEX_HASH_LAZY"); v = e ? atoi(e) : 1; }
++    return v;
++}
++u64 rsx_hash64(const void* p, size_t n, u64 seed);
+ static u32 tex_csum_dense(const u8* base, u32 nbytes)
+ {
++    if (tex_lazy_on()) { const u64 h4 = rsx_hash64(base, nbytes, 0x7E7Cu); return (u32)(h4 ^ (h4 >> 32)); }
+     u64 h = 14695981039346656037ull;
+     u32 i = 0;
+     for (; i + 8 <= nbytes; i += 8) {
+@@ -5962,7 +5974,45 @@
+     if (v < 0) { const char* e = getenv("RSX_SRV_DEDUP"); v = (e && e[0] == '0') ? 0 : 1; }
+     return v;
+ }
+-static void srv_stage_reset(void) { s_srv_prev_win = ~0u; }
++/* RSX_SRV_MEMO (default on; =0 off): beyond the previous draw, any window
++ * this pre-pass already filled with the same sixteen descriptors is bound
++ * again instead of creating sixteen more. Windows are written only by the
++ * pre-pass and only at their own draw's index, so an earlier window still
++ * holds what it was given until the next pre-pass resets the memo. */
++#define SRV_MEMO_N 512
++static struct { u64 h; u32 win; SrvStage e[DRAW_SRV_STRIDE]; } *s_srv_memo;
++static u32 s_srv_memo_n;
++static int srv_memo_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_SRV_MEMO"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++static u64 srv_memo_hash(void)
++{
++    u64 h = 0x51EDull;
++    for (int u = 0; u < DRAW_SRV_STRIDE; u++) {
++        const SrvStage* g = &s_srv_cur[u];
++        h ^= (u64)(uintptr_t)g->res + ((u64)g->mapping << 7) + ((u64)(u32)g->fmt << 29) +
++             ((u64)g->cube << 41) + ((u64)(u32)g->mips << 43);
++        h *= 0x9E3779B97F4A7C15ull; h ^= h >> 31;
++    }
++    return h;
++}
++static u16 s_srv_memo_ix[1024];   /* hash -> entry + 1 (direct-mapped; a collision is a miss) */
++static int srv_memo_find(u64 h)
++{
++    const u32 i = (u32)s_srv_memo_ix[h >> 54] - 1u;
++    if (i < s_srv_memo_n && s_srv_memo[i].h == h && memcmp(s_srv_memo[i].e, s_srv_cur, sizeof s_srv_cur) == 0)
++        return (int)i;
++    return -1;
++}
++static void srv_stage_reset(void)
++{
++    s_srv_prev_win = ~0u;
++    if (s_srv_memo_n) memset(s_srv_memo_ix, 0, sizeof s_srv_memo_ix);
++    s_srv_memo_n = 0;
++}
+ static void srv_stage_begin(u32 base)
+ {
+     s_srv_staging = srv_dedup_on();
+@@ -5978,12 +6028,29 @@
+     if (all && s_srv_prev_win != ~0u &&
+         memcmp(s_srv_cur, s_srv_prev, sizeof s_srv_cur) == 0)
+         return s_srv_prev_win;
++    u64 mh = 0;
++    if (all && srv_memo_on()) {
++        mh = srv_memo_hash();
++        const int m = srv_memo_find(mh);
++        if (m >= 0) {
++            memcpy(s_srv_prev, s_srv_cur, sizeof s_srv_cur); s_srv_prev_win = s_srv_memo[m].win;
++            return s_srv_prev_win;
++        }
++    }
+     for (int u = 0; u < DRAW_SRV_STRIDE; u++)
+         if (s_srv_cur[u].set)
+             srv_write_now(s_srv_stage_base + (u32)u, s_srv_cur[u].res, (DXGI_FORMAT)s_srv_cur[u].fmt,
+                           s_srv_cur[u].mapping, s_srv_cur[u].cube, s_srv_cur[u].mips);
+     if (all) { memcpy(s_srv_prev, s_srv_cur, sizeof s_srv_cur); s_srv_prev_win = s_srv_stage_base; }
+     else s_srv_prev_win = ~0u;
++    if (mh) {
++        if (!s_srv_memo) s_srv_memo = malloc(sizeof(*s_srv_memo) * SRV_MEMO_N);
++        if (s_srv_memo && s_srv_memo_n < SRV_MEMO_N) {
++            s_srv_memo[s_srv_memo_n].h = mh; s_srv_memo[s_srv_memo_n].win = s_srv_stage_base;
++            memcpy(s_srv_memo[s_srv_memo_n].e, s_srv_cur, sizeof s_srv_cur);
++            s_srv_memo_ix[mh >> 54] = (u16)(++s_srv_memo_n);
++        }
++    }
+     return s_srv_stage_base;
+ }
+ /* mips: 0 or 1 = a single-level texture, else the level count of the
+@@ -9752,12 +9819,12 @@
+     if (mhz > 0.0) {
+         const double k = 1.0 / (mhz * 1e3) / f;   /* ticks -> ms per frame */
+         extern unsigned cellGcm_flip_request_count(void);
+-        fprintf(stderr, "[RSX_CACHE] flip %u vtx cache %s: hit %.0f store %.0f uncached %.0f /frame, blocks "
++        fprintf(stderr, "[RSX_CACHE] flip %u tex-lazy %d vtx cache %s: hit %.0f store %.0f uncached %.0f /frame, blocks "
+                         "found %.0f new %.0f skipped %.0f /frame, replay hit %.0f store %.0f miss %.0f stale %.0f /frame "
+                 "(checked %llu mismatched %llu), hash %.2f ms %.2f MB /frame, "
+                         "resident %.0f MB, checked %llu mismatched %llu | tex check: sparse %.0f "
+                         "%.2f ms, dense %.0f %.2f ms %.2f MB, changed %.0f, uploads %.1f (evict %.1f) %.2f ms /frame%c",
+-                cellGcm_flip_request_count(),
++                cellGcm_flip_request_count(), tex_lazy_on(),
+                 rsx_vcache_mode() ? (rsx_vcache_mode() == 2 ? "check" : "on") : "off",
+                 v[VCS_HIT] / f, v[VCS_STORE] / f, v[VCS_UNC] / f, v[VCS_BFOUND] / f,
+                 v[VCS_BNEW] / f, v[VCS_SKIP] / f, v[VCS_RHIT] / f, v[VCS_RSTORE] / f, v[VCS_RMISS] / f, v[VCS_RSTALE] / f,

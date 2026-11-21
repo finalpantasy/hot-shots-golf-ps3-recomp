@@ -1,0 +1,806 @@
+diff --git a/libs/video/rsx_vertex_fetch.h b/libs/video/rsx_vertex_fetch.h
+--- a/libs/video/rsx_vertex_fetch.h
++++ b/libs/video/rsx_vertex_fetch.h
+@@ -82,9 +82,57 @@
+     int n;
+     rsx_fetch_plan_attr a[16];
+     float tmpl[16][4];
++    signed char at[16];    /* attribute index -> entry in a[], -1 = constant register */
+ } rsx_fetch_plan;
+ void rsx_fetch_plan_build(const rsx_state* st, rsx_fetch_plan* pl);
+ void rsx_fetch_vertex16(const rsx_fetch_plan* pl, u32 vi, float out[16][4]);
++/* RSX_VTX_DIRECT: vertex vi converted straight into a packed vertex whose
++ * slot j holds attribute idx[j] -- the values rsx_fetch_vertex16 gives,
++ * without assembling all sixteen slots first. */
++void rsx_fetch_vertex_pk(const rsx_fetch_plan* pl, u32 vi, const u8* idx, u32 nslots, u8* dst);
++
++
++/* RSX_VTX_CACHE (default off: on this title validating a reuse costs about
++ * what converting costs, measured 11-21; =1 on, =2 on and also re-convert every hit and
++ * count mismatches): converted vertices kept across frames. A block holds the
++ * packed output of one draw's vertex range [lo, lo+n) and is keyed on a
++ * 64-bit signature of the fetch plan (formats, offsets, strides, constant
++ * registers), the packed layout, the range and a content hash of the guest
++ * bytes the range reads. There is no guest write tracking, so the content
++ * hash is what proves the bytes unchanged; it reads each source byte once,
++ * far cheaper than decoding every attribute of every vertex. */
++typedef struct rsx_vcache_blk {
++    u64 sig;
++    u32 lo, n, stride, mask;
++    u32 last;                  /* frame it was last used */
++    u8* data;                  /* n * stride packed bytes */
++    u8* valid;                 /* n flags: vertex converted */
++    size_t bytes;
++    struct rsx_vcache_blk* next;
++} rsx_vcache_blk;
++int rsx_vcache_mode(void);
++/* The content hash the cache uses: four 64-bit lanes, every byte. */
++u64 rsx_hash64(const void* p, size_t n, u64 seed);
++/* The draw's block (found or new), or NULL when the draw is not cacheable. */
++rsx_vcache_blk* rsx_vcache_begin(const rsx_fetch_plan* pl, u32 pk_mask, u32 pk_stride,
++                                 u32 lo, u32 hi, u32 frame);
++/* The two halves of rsx_vcache_begin: the content signature (0 = not
++ * cacheable) and the block for it. */
++u64 rsx_vcache_sig(const rsx_fetch_plan* pl, u32 pk_mask, u32 pk_stride, u32 lo, u32 hi);
++rsx_vcache_blk* rsx_vcache_block(u64 sig, u32 n, u32 pk_mask, u32 pk_stride, u32 lo, u32 frame);
++/* Decode parameters only (0 = not cacheable), and the content hash of
++ * exactly the elements vertices idx[0..n) read. */
++u64 rsx_vcache_plan_sig(const rsx_fetch_plan* pl, u32 pk_mask, u32 pk_stride);
++u64 rsx_vcache_gather(const rsx_fetch_plan* pl, const u32* idx, u32 n);
++/* Opaque byte strings under a 64-bit key, same table and budget. */
++u8* rsx_vcache_blob_find(u64 key, u32 frame, u32* len);
++u8* rsx_vcache_blob_put(u64 key, u32 len, u32 frame);
++/* Stats since the last take: hits, stores, uncached conversions, blocks found,
++ * blocks made, draws skipped, hash bytes, hash TSC ticks, checked, mismatched,
++ * resident bytes. */
++enum { VCS_HIT, VCS_STORE, VCS_UNC, VCS_BFOUND, VCS_BNEW, VCS_SKIP, VCS_HBYTES,
++       VCS_HTSC, VCS_CHK, VCS_BAD, VCS_RES, VCS_RHIT, VCS_RSTORE, VCS_RMISS, VCS_RCHK, VCS_RBAD, VCS_RSTALE, VCS_N };
++extern unsigned long long rsx_vcache_stat[VCS_N];
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libs/video/rsx_vertex_fetch.c b/libs/video/rsx_vertex_fetch.c
+--- a/libs/video/rsx_vertex_fetch.c
++++ b/libs/video/rsx_vertex_fetch.c
+@@ -181,6 +181,7 @@
+ void rsx_fetch_plan_build(const rsx_state* st, rsx_fetch_plan* pl)
+ {
+     pl->n = 0;
++    memset(pl->at, -1, sizeof pl->at);
+     for (int i = 0; i < 16; i++) {
+         pl->tmpl[i][0] = st->vertex_data4f[i][0];
+         pl->tmpl[i][1] = st->vertex_data4f[i][1];
+@@ -198,6 +199,7 @@
+         e->main = (a->offset & 0x80000000u) ? 1 : 0;
+         e->base = a->offset & 0x7FFFFFFFu;
+         e->local0 = e->main ? 0u : cellGcmResolveLocated(1, 0);
++        pl->at[i] = (signed char)(pl->n - 1);
+     }
+ }
+ void rsx_fetch_vertex16(const rsx_fetch_plan* pl, u32 vi, float out[16][4])
+@@ -214,3 +216,251 @@
+         fetch_decode(&e->attr, e->idx, p, out[e->idx]);
+     }
+ }
++
++void rsx_fetch_vertex_pk(const rsx_fetch_plan* pl, u32 vi, const u8* idx, u32 nslots, u8* dst)
++{
++    for (u32 j = 0; j < nslots; j++) {
++        const int i = idx[j] & 15;
++        float o[4];
++        memcpy(o, pl->tmpl[i], sizeof o);
++        const int a = pl->at[i];
++        if (a >= 0) {
++            const rsx_fetch_plan_attr* e = &pl->a[a];
++            const u32 ei = e->mode == 0 ? vi
++                         : e->mode == 1 ? (vi % e->attr.frequency) : (vi / e->attr.frequency);
++            const u32 off = e->base + ei * e->attr.stride;
++            const u8* p = vm_base + (e->main ? cellGcmResolveLocated(0, off) : (u32)(e->local0 + off));
++            fetch_decode(&e->attr, e->idx, p, o);
++        }
++        memcpy(dst + 16u * j, o, sizeof o);
++    }
++}
++
++/* ---- RSX_VTX_CACHE: converted vertices kept across frames (rsx_vertex_fetch.h) ---- */
++#include <intrin.h>
++unsigned long long rsx_vcache_stat[VCS_N];
++int rsx_vcache_mode(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_VTX_CACHE"); v = e ? atoi(e) : 0; }
++    return v;
++}
++static size_t vc_budget(void)
++{
++    static size_t b = 0;
++    if (!b) { const char* e = getenv("RSX_VTX_CACHE_MB"); int mb = e ? atoi(e) : 192;
++              if (mb < 8) mb = 8; b = (size_t)mb << 20; }
++    return b;
++}
++/* Four independent 64-bit lanes (xxHash64 rounds): bound by load bandwidth,
++ * not by one multiply chain. */
++static inline u64 vc_rotl(u64 x, int r) { return (x << r) | (x >> (64 - r)); }
++static u64 vc_hash(const u8* p, size_t n, u64 seed)
++{
++    const u64 P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full;
++    u64 a = seed + P1 + P2, b = seed + P2, c = seed, d = seed - P1;
++    const size_t n0 = n;
++    while (n >= 32) {
++        u64 w0, w1, w2, w3;
++        memcpy(&w0, p, 8); memcpy(&w1, p + 8, 8); memcpy(&w2, p + 16, 8); memcpy(&w3, p + 24, 8);
++        a = vc_rotl(a + w0 * P2, 31) * P1; b = vc_rotl(b + w1 * P2, 31) * P1;
++        c = vc_rotl(c + w2 * P2, 31) * P1; d = vc_rotl(d + w3 * P2, 31) * P1;
++        p += 32; n -= 32;
++    }
++    u64 h = vc_rotl(a, 1) + vc_rotl(b, 7) + vc_rotl(c, 12) + vc_rotl(d, 18) + (u64)n0;
++    while (n >= 8) { u64 w; memcpy(&w, p, 8); h = vc_rotl(h ^ (vc_rotl(w * P2, 31) * P1), 27) * P1; p += 8; n -= 8; }
++    while (n) { h = vc_rotl(h ^ (*p * P1), 11) * P2; p++; n--; }
++    h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P1; h ^= h >> 32;
++    return h;
++}
++u64 rsx_hash64(const void* p, size_t n, u64 seed) { return vc_hash((const u8*)p, n, seed); }
++#define VC_NB 4096
++static rsx_vcache_blk* s_vcb[VC_NB];
++static size_t s_vc_bytes;
++static void vc_free_where(u32 older_than)
++{
++    for (int i = 0; i < VC_NB; i++) {
++        rsx_vcache_blk** pp = &s_vcb[i];
++        while (*pp) {
++            rsx_vcache_blk* b = *pp;
++            if ((int)(older_than - b->last) > 0) {
++                *pp = b->next; s_vc_bytes -= b->bytes; free(b);
++            } else pp = &b->next;
++        }
++    }
++}
++typedef struct { u32 s, e; int main, j; } vc_range;
++/* Element bytes fetch_decode reads for one vertex of the attribute. */
++static u32 vc_elem_bytes(const rsx_vertex_attrib* a)
++{
++    if (a->type == 6) return 4;
++    u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
++    const u32 t = rsx_vertex_type_size(a->type);
++    return n * (t ? t : 4);
++}
++u64 rsx_vcache_sig(const rsx_fetch_plan* pl, u32 pk_mask, u32 pk_stride, u32 lo, u32 hi)
++{
++    if (!vm_base || hi < lo || pk_stride == 0) return 0;
++    const u32 n = hi - lo + 1;
++    if ((u64)n * pk_stride > vc_budget() / 4) { rsx_vcache_stat[VCS_SKIP]++; return 0; }
++    const unsigned long long t0 = __rdtsc();
++    /* Signature: layout, range, constant registers, then per attribute its
++     * decode parameters and the bytes its elements lo..hi occupy. */
++    /* The signature is content-addressed: a converted vertex depends on the
++     * bytes it decodes, the decode parameters and the constant registers, not
++     * on where the bytes sit. This title streams its meshes into ring buffers,
++     * so the same vertices arrive at a new address every frame. Addresses
++     * enter only as each attribute's offset inside its (merged) byte range. */
++    u64 sig = vc_hash((const u8*)pl->tmpl, sizeof pl->tmpl, ((u64)pk_mask << 32) ^ pk_stride);
++    sig ^= (u64)n * 0x9E3779B97F4A7C15ull;
++    /* Byte ranges (offset space, per DMA) the elements occupy; attributes of
++     * one interleaved array overlap and are merged so each byte is hashed once. */
++    vc_range r[16]; int nr = 0;
++    for (int j = 0; j < pl->n; j++) {
++        const rsx_fetch_plan_attr* e = &pl->a[j];
++        if (e->mode != 0) { rsx_vcache_stat[VCS_SKIP]++; return 0; }   /* instanced: not cached */
++        const u32 eb = vc_elem_bytes(&e->attr);
++        const u64 s = (u64)e->base + (u64)lo * e->attr.stride;
++        const u64 en = (u64)e->base + (u64)hi * e->attr.stride + eb;
++        if (en > 0xFFFFFFFFull) { rsx_vcache_stat[VCS_SKIP]++; return 0; }
++        r[nr].s = (u32)s; r[nr].e = (u32)en; r[nr].main = e->main; r[nr].j = j; nr++;
++    }
++    for (int i = 1; i < nr; i++)   /* sort by (main, start): at most 16 */
++        for (int k = i; k > 0 && (r[k-1].main > r[k].main ||
++                                  (r[k-1].main == r[k].main && r[k-1].s > r[k].s)); k--) {
++            const vc_range t = r[k]; r[k] = r[k-1]; r[k-1] = t; }
++    u64 hb = 0;
++    for (int i = 0, g = 0; i < nr; g++) {
++        u32 s = r[i].s, en = r[i].e; const int m = r[i].main; int k = i + 1;
++        while (k < nr && r[k].main == m && r[k].s <= en) { if (r[k].e > en) en = r[k].e; k++; }
++        if (en - s > (256u << 20)) { rsx_vcache_stat[VCS_SKIP]++; return 0; }
++        for (int q = i; q < k; q++) {   /* the attributes read from this range */
++            const rsx_fetch_plan_attr* e = &pl->a[r[q].j];
++            const u64 key[3] = { ((u64)e->idx << 56) ^ ((u64)m << 48) ^ ((u64)g << 32) ^ (r[q].s - s),
++                                 ((u64)e->attr.type << 32) ^ e->attr.size ^ ((u64)e->attr.frequency << 40),
++                                 (u64)e->attr.stride };
++            sig = vc_hash((const u8*)key, sizeof key, sig);
++        }
++        i = k;
++        if (!m) {   /* LOCAL: one contiguous run of VRAM */
++            sig = vc_hash(vm_base + cellGcmResolveLocated(1, s), en - s, sig);
++        } else {    /* MAIN: the IO table maps 1 MB pages; hash page by page */
++            for (u32 c = s; c < en; ) {
++                const u32 ce = ((c >> 20) + 1) << 20;
++                const u32 ln = (ce < en ? ce : en) - c;
++                sig = vc_hash(vm_base + cellGcmResolveLocated(0, c), ln, sig ^ ln);
++                c += ln;
++            }
++        }
++        hb += en - s;
++    }
++    rsx_vcache_stat[VCS_HBYTES] += hb;
++    rsx_vcache_stat[VCS_HTSC] += __rdtsc() - t0;
++    return sig ? sig : 1;
++}
++static void* vc_alloc(rsx_vcache_blk*** headp, u64 sig, size_t bytes, u32 frame)
++{
++    if (s_vc_bytes + bytes > vc_budget()) {
++        vc_free_where(frame - 1);                        /* not used this frame or the last */
++        if (s_vc_bytes + bytes > vc_budget()) vc_free_where(frame);   /* then everything older */
++        if (s_vc_bytes + bytes > vc_budget()) { rsx_vcache_stat[VCS_SKIP]++; return NULL; }
++    }
++    rsx_vcache_blk* b = (rsx_vcache_blk*)malloc(bytes);
++    if (!b) return NULL;
++    rsx_vcache_blk** head = &s_vcb[(sig ^ (sig >> 29)) & (VC_NB - 1)];
++    b->next = *head; *head = b;
++    b->bytes = bytes; b->last = frame; b->sig = sig;
++    s_vc_bytes += bytes;
++    rsx_vcache_stat[VCS_RES] = s_vc_bytes;
++    (void)headp;
++    return b;
++}
++rsx_vcache_blk* rsx_vcache_block(u64 sig, u32 n, u32 pk_mask, u32 pk_stride, u32 lo, u32 frame)
++{
++    rsx_vcache_blk** head = &s_vcb[(sig ^ (sig >> 29)) & (VC_NB - 1)];
++    for (rsx_vcache_blk* b = *head; b; b = b->next)
++        if (b->sig == sig && b->n == n && b->stride == pk_stride && b->mask == pk_mask) {
++            b->lo = lo;   /* this draw's first vertex; entries are relative to it */
++            b->last = frame; rsx_vcache_stat[VCS_BFOUND]++; return b; }
++    const size_t bytes = sizeof(rsx_vcache_blk) + (size_t)n * pk_stride + n;
++    rsx_vcache_blk* b = (rsx_vcache_blk*)vc_alloc(NULL, sig, bytes, frame);
++    if (!b) return NULL;
++    b->lo = lo; b->n = n; b->stride = pk_stride; b->mask = pk_mask;
++    b->data = (u8*)(b + 1); b->valid = b->data + (size_t)n * pk_stride;
++    memset(b->valid, 0, n);
++    rsx_vcache_stat[VCS_BNEW]++;
++    return b;
++}
++/* Decode parameters of a plan, without addresses or contents: what a
++ * converted vertex depends on besides the bytes it reads. 0 = not cacheable
++ * (an instanced attribute). */
++u64 rsx_vcache_plan_sig(const rsx_fetch_plan* pl, u32 pk_mask, u32 pk_stride)
++{
++    u64 sig = vc_hash((const u8*)pl->tmpl, sizeof pl->tmpl, ((u64)pk_mask << 32) ^ pk_stride);
++    for (int j = 0; j < pl->n; j++) {
++        const rsx_fetch_plan_attr* e = &pl->a[j];
++        if (e->mode != 0) return 0;
++        const u64 key[2] = { ((u64)e->idx << 56) ^ ((u64)e->attr.type << 32) ^ e->attr.size,
++                             ((u64)e->attr.frequency << 32) ^ e->attr.stride };
++        sig = vc_hash((const u8*)key, sizeof key, sig);
++    }
++    return sig ? sig : 1;
++}
++/* Content hash of exactly the elements vertices idx[0..n) decode: each
++ * attribute's vc_elem_bytes at the address rsx_fetch_vertex16 reads. */
++u64 rsx_vcache_gather(const rsx_fetch_plan* pl, const u32* idx, u32 n)
++{
++    const unsigned long long t0 = __rdtsc();
++    const u64 P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full;
++    u64 h = 0x6A7Eull ^ n;
++    u64 bytes = 0;
++    for (int j = 0; j < pl->n; j++) {
++        const rsx_fetch_plan_attr* e = &pl->a[j];
++        const u32 eb = vc_elem_bytes(&e->attr);
++        u64 a = h + P1, b = h ^ P2;
++        for (u32 v = 0; v < n; v++) {
++            const u32 off = e->base + idx[v] * e->attr.stride;
++            const u8* p = vm_base + (e->main ? cellGcmResolveLocated(0, off) : (u32)(e->local0 + off));
++            u32 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
++            switch (eb) {   /* exactly the element's bytes, never past it */
++            case 16: memcpy(&w3, p + 12, 4); /* fallthrough */
++            case 12: memcpy(&w2, p + 8, 4);  /* fallthrough */
++            case 8:  memcpy(&w1, p + 4, 4);  /* fallthrough */
++            case 4:  memcpy(&w0, p, 4); break;
++            default: { u8 t[16] = {0}; memcpy(t, p, eb < 16 ? eb : 16);
++                       memcpy(&w0, t, 4); memcpy(&w1, t + 4, 4); memcpy(&w2, t + 8, 4); memcpy(&w3, t + 12, 4); }
++            }
++            a = vc_rotl(a + (((u64)w1 << 32) | w0) * P2, 31) * P1;
++            b = vc_rotl(b + (((u64)w3 << 32) | w2) * P2, 31) * P1;
++        }
++        h = vc_rotl(a, 7) ^ vc_rotl(b, 19) ^ ((u64)eb << 40) ^ (u64)j;
++        h *= P1;
++        bytes += (u64)eb * n;
++    }
++    h ^= h >> 29; h *= P2; h ^= h >> 32;
++    rsx_vcache_stat[VCS_HBYTES] += bytes;
++    rsx_vcache_stat[VCS_HTSC] += __rdtsc() - t0;
++    return h ? h : 1;
++}
++rsx_vcache_blk* rsx_vcache_begin(const rsx_fetch_plan* pl, u32 pk_mask, u32 pk_stride,
++                                 u32 lo, u32 hi, u32 frame)
++{
++    const u64 sig = rsx_vcache_sig(pl, pk_mask, pk_stride, lo, hi);
++    return sig ? rsx_vcache_block(sig, hi - lo + 1, pk_mask, pk_stride, lo, frame) : NULL;
++}
++/* Blobs: opaque byte strings under a 64-bit key, in the same table and
++ * budget as the vertex blocks (mask ~0 marks one; n is its length). */
++u8* rsx_vcache_blob_find(u64 key, u32 frame, u32* len)
++{
++    for (rsx_vcache_blk* b = s_vcb[(key ^ (key >> 29)) & (VC_NB - 1)]; b; b = b->next)
++        if (b->sig == key && b->mask == 0xFFFFFFFFu) { b->last = frame; *len = b->n; return b->data; }
++    return NULL;
++}
++u8* rsx_vcache_blob_put(u64 key, u32 len, u32 frame)
++{
++    rsx_vcache_blk* b = (rsx_vcache_blk*)vc_alloc(NULL, key, sizeof(rsx_vcache_blk) + len, frame);
++    if (!b) return NULL;
++    b->lo = 0; b->n = len; b->stride = 0; b->mask = 0xFFFFFFFFu;
++    b->data = (u8*)(b + 1); b->valid = NULL;
++    return b->data;
++}
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -708,7 +708,9 @@
+ #include <intrin.h>
+ static unsigned long long s_rp_tsc[2];   /* RSX_PROF=2: vertex fetch / heap write, TSC ticks */
+ static int s_rp_tsc_on = 0;
+-static int rsx_prof2(void) { const int v = rsx_prof_on() >= 2; s_rp_tsc_on = v; return v; }
++/* The per-vertex TSC split (vertex fetch / heap write, cached path) costs
++ * ~20 ns a vertex itself, so it runs only at RSX_PROF=3. */
++static int rsx_prof2(void) { const int v = rsx_prof_on() >= 2; s_rp_tsc_on = rsx_prof_on() >= 3; return v; }
+ static int pf2_on(void) { return perf_on() || rsx_prof2(); }
+ /* RSX_SPEED_CHECK=1 (or =<n>, see speed_chk_vtx): each speed path also computes the result of the path it
+  * replaces and counts differences (vertex bytes, VS slot, texture slot, PSO,
+@@ -730,6 +732,7 @@
+     return speed_chk() && (s_ck_every <= 1 || (++c % (unsigned)s_ck_every) == 0);
+ }
+ static void ck(int k, int bad) { s_ck_n[k]++; if (bad) s_ck_bad[k]++; }
++static void rsxperf_report(double frames);   /* RSX_VTX_CACHE / texture check stats */
+ static void rsx_prof_report(void)
+ {
+     static double t_last = 0.0;
+@@ -778,6 +781,7 @@
+         s_rp_tsc[0] = s_rp_tsc[1] = 0;
+     }
+     memset(s_rp, 0, sizeof s_rp); s_rp_conv = s_rp_srvw = 0;
++    rsxperf_report(f);
+     if (speed_chk())
+         fprintf(stderr, "[RSX_SPEED_CHECK] checked/mismatched (cumulative): vtx %llu/%llu vs %llu/%llu "
+                 "tex %llu/%llu pso %llu/%llu strip %llu/%llu%c",
+@@ -4529,6 +4533,17 @@
+     return (u32)(h ^ (h >> 32));
+ }
+ 
++/* RSX_PROF: the cached-texture checks (tex_csum / tex_csum_dense of a slot
++ * held from an earlier frame), TSC ticks and bytes, by kind. */
++static unsigned long long s_texck[9];   /* sparse n, sparse tsc, dense n, dense tsc, dense bytes, changed,
++                                         * uploads, evictions, upload tsc */
++static void texperf_csum(int dense, u32 nbytes, unsigned long long tsc, int same)
++{
++    if (dense) { s_texck[2]++; s_texck[3] += tsc; s_texck[4] += nbytes; }
++    else { s_texck[0]++; s_texck[1] += tsc; }
++    if (!same) s_texck[5]++;
++}
++
+ /* The DXGI format a guest texture is uploaded as -- the DECODED image's, which
+  * is not always the guest's: the packed 16-bit colour formats arrive unpacked
+  * to RGBA8, and DEPTH24_D8 as a float. rsx_texture_layout.h says which class
+@@ -4782,8 +4797,15 @@
+              * changed. Most of this scene's textures are static, and converting
+              * every one of them every frame was ~70% of the frame's CPU time. */
+             u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
++            const unsigned long long _tc0 = __rdtsc();
+             u32 cs = TEX_CSUM(vm_base + c->off, nb);
+             if (c->tail_n) cs ^= tex_csum(vm_base + c->off + c->tail_off, c->tail_n) * 31u;
++            texperf_csum(dense_csum, nb, __rdtsc() - _tc0, cs == c->csum);
++            { static int lg = -1, nl = 0;   /* RSX_TEX_CHG_LOG=<n>: the first n re-uploads by change */
++              if (lg < 0) { const char* e = getenv("RSX_TEX_CHG_LOG"); lg = e ? atoi(e) : 0; }
++              if (cs != c->csum && nl < lg) { nl++;
++                  fprintf(stderr, "[TEXCHG] frame %llu off=0x%08X %ux%u fmt=0x%02X %u bytes%c",
++                          (unsigned long long)s_d3d.frame_count, c->off, w, h, fmt, nb, 10); } }
+             if (cs == c->csum) { c->used = 1; return i; }
+             slot = i; break;                      /* stale: fall through and redo */
+         }
+@@ -4896,6 +4918,7 @@
+     if (slot < 0) slot = freeslot;
+     if (slot < 0) return -1;
+     VPTexSlot* t = &s_d3d.vp_tex[slot];
++    s_texck[6]++; if (t->res && t->key != key_off) s_texck[7]++;   /* RSX_PROF: uploads, evictions */
+     t->last_frame = s_d3d.frame_count;
+     t->pitch = pitch_arg;
+     /* TEX_DUMP / TEX_REPLACE: identify the texture by its guest bytes (only
+@@ -7807,9 +7830,11 @@
+                      _bf == 0x94 || _bf == 0x95 || _bf == 0x9C || _bf == 0x9F)) {
+                     double _tt = pf2_on() ? perf_now() : 0.0;
+                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
++                    const unsigned long long _up0 = s_texck[6], _ut0 = __rdtsc();
+                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
+                                                 dr->tex[_u].h, dr->tex[_u].fmt,
+                                                 _cube, dr->tex[_u].mips, dr->tex[_u].pitch);
++                    if (s_texck[6] != _up0) s_texck[8] += __rdtsc() - _ut0;
+                     if (_tt) s_rp[RP_PRE_TEX] += perf_now() - _tt;
+                     if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
+                         s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
+@@ -9630,14 +9655,166 @@
+     VPSlot t[16];
+     read_vp_vertex_to(state, vi, t, dst);
+ }
++/* RSX_VTX_CACHE (rsx_vertex_fetch.h): this draw's block of converted vertices
++ * kept across frames. The range is the draw's own vertices (indexed: the
++ * span of its indices); a vertex outside it (a strip join reaching into the
++ * previous batch) is converted as before. */
++static rsx_vcache_blk* s_vcb_cur;
++static u64 s_vcb_sig;            /* this draw's vertex content signature, 0 = not cached */
++static u32 s_vcb_lo, s_vcb_n;    /* the range it covers */
++static int s_vcb_tried;          /* block looked up (or refused) for this draw */
++static int s_vc_mode = -1;       /* rsx_vcache_mode(), read once */
++static unsigned long long s_vc_tsc[4];   /* RSX_PROF=3: cached-path ticks (packed, unpacked), calls */
++/* Signature of the vertices a draw reads: [first, first+count) of the vertex
++ * stream, or of the index stream when indexed (the span of its indices). */
++static void vcache_sync(const rsx_state* st, u32 first, u32 count, int indexed)
++{
++    extern uint8_t* vm_base;
++    extern u32 cellGcmResolveLocated(int local, u32 offset);
++    s_vcb_cur = NULL; s_vcb_sig = 0; s_vcb_tried = 0;
++    if (s_vc_mode < 0) s_vc_mode = rsx_vcache_mode();
++    if (!s_vc_mode || !st || !count) return;
++    u32 lo = first, hi = first + count - 1;
++    if (indexed) {
++        const int local = ((st->index_array_dma & 0xF) == 0);
++        const u8* ip = vm_base + cellGcmResolveLocated(local, st->index_array_offset);
++        lo = 0xFFFFFFFFu; hi = 0;
++        if (((st->index_array_dma >> 4) & 0xF) == 1) {
++            for (u32 k = first; k < first + count; k++) {
++                const u32 ix = ((u32)ip[k * 2] << 8) | ip[k * 2 + 1];
++                if (ix < lo) lo = ix;
++                if (ix > hi) hi = ix;
++            }
++        } else {
++            for (u32 k = first; k < first + count; k++) {
++                const u32 ix = ((u32)ip[k * 4] << 24) | ((u32)ip[k * 4 + 1] << 16) |
++                               ((u32)ip[k * 4 + 2] << 8) | ip[k * 4 + 3];
++                if (ix < lo) lo = ix;
++                if (ix > hi) hi = ix;
++            }
++        }
++        /* A sparse span would hash more bytes than the draw converts. */
++        if ((u64)(hi - lo) + 1 > 8ull * count + 256) { rsx_vcache_stat[VCS_SKIP]++; return; }
++    }
++    s_vcb_sig = rsx_vcache_sig(&s_fplan, s_pk.mask, s_pk.stride, lo, hi);
++    s_vcb_lo = lo; s_vcb_n = hi - lo + 1;
++}
++/* Fetch plan and cache signature for the current draw, over an explicit
++ * range (the indexed runs call this before converting anything). */
++static void vtx_draw_sync(const rsx_state* st, u32 first, u32 count, int indexed)
++{
++    rsx_fetch_plan_build(st, &s_fplan);
++    s_fplan_serial = s_vtx_serial; s_fplan_st = st;
++    vcache_sync(st, first, count, indexed);
++}
++static int vcache_vertex(u32 vi, VPSlot* out16, u8* pk_dst)
++{
++    rsx_vcache_blk* b = s_vcb_cur;
++    const u32 k = vi - b->lo;
++    if (k >= b->n || b->mask != s_pk.mask || b->stride != s_pk.stride) {
++        rsx_vcache_stat[VCS_UNC]++; return 0; }
++    u8* src = b->data + (size_t)k * b->stride;
++    if (!b->valid[k]) {
++        float tmp[16][4];
++        rsx_fetch_vertex16(&s_fplan, vi, tmp);
++        pk_put(src, (const VPSlot*)tmp);
++        b->valid[k] = 1;
++        rsx_vcache_stat[VCS_STORE]++;
++        if (pk_dst) memcpy(pk_dst, src, b->stride);
++        else memcpy(out16, tmp, sizeof tmp);
++        return 1;
++    }
++    rsx_vcache_stat[VCS_HIT]++;
++    if (s_vc_mode == 2) {   /* re-convert and compare */
++        float tmp[16][4]; u8 fresh[256];
++        rsx_fetch_vertex16(&s_fplan, vi, tmp);
++        pk_put(fresh, (const VPSlot*)tmp);
++        rsx_vcache_stat[VCS_CHK]++;
++        if (memcmp(fresh, src, b->stride)) {
++            rsx_vcache_stat[VCS_BAD]++;
++            memcpy(src, fresh, b->stride);
++        }
++    }
++    if (pk_dst) { memcpy(pk_dst, src, b->stride); return 1; }
++    /* Unpacked caller: the stored attributes, the constant registers elsewhere
++     * (every caller packs the result with the same layout). */
++    memcpy(out16, s_fplan.tmpl, sizeof s_fplan.tmpl);
++    for (u32 j = 0; j < s_pk.n; j++) memcpy(&out16[s_pk.idx[j]], src + 16u * j, sizeof(VPSlot));
++    return 1;
++}
++static void rsxperf_report(double f)
++{
++    static unsigned long long tsc_last = 0; static double t_last = 0.0;
++    const unsigned long long tn = __rdtsc(); const double now = perf_now();
++    const double mhz = (tsc_last && now > t_last) ? (double)(tn - tsc_last) / (now - t_last) / 1e6 : 0.0;
++    tsc_last = tn; t_last = now;
++    unsigned long long* v = rsx_vcache_stat;
++    if (mhz > 0.0) {
++        const double k = 1.0 / (mhz * 1e3) / f;   /* ticks -> ms per frame */
++        extern unsigned cellGcm_flip_request_count(void);
++        fprintf(stderr, "[RSX_CACHE] flip %u vtx cache %s: hit %.0f store %.0f uncached %.0f /frame, blocks "
++                        "found %.0f new %.0f skipped %.0f /frame, replay hit %.0f store %.0f miss %.0f stale %.0f /frame "
++                "(checked %llu mismatched %llu), hash %.2f ms %.2f MB /frame, "
++                        "resident %.0f MB, checked %llu mismatched %llu | tex check: sparse %.0f "
++                        "%.2f ms, dense %.0f %.2f ms %.2f MB, changed %.0f, uploads %.1f (evict %.1f) %.2f ms /frame%c",
++                cellGcm_flip_request_count(),
++                rsx_vcache_mode() ? (rsx_vcache_mode() == 2 ? "check" : "on") : "off",
++                v[VCS_HIT] / f, v[VCS_STORE] / f, v[VCS_UNC] / f, v[VCS_BFOUND] / f,
++                v[VCS_BNEW] / f, v[VCS_SKIP] / f, v[VCS_RHIT] / f, v[VCS_RSTORE] / f, v[VCS_RMISS] / f, v[VCS_RSTALE] / f,
++                v[VCS_RCHK], v[VCS_RBAD], v[VCS_HTSC] * k, v[VCS_HBYTES] / f / 1048576.0,
++                v[VCS_RES] / 1048576.0, v[VCS_CHK], v[VCS_BAD],
++                s_texck[0] / f, s_texck[1] * k, s_texck[2] / f, s_texck[3] * k,
++                s_texck[4] / f / 1048576.0, s_texck[5] / f, s_texck[6] / f, s_texck[7] / f,
++                s_texck[8] * k, 10);
++        extern unsigned long long s_ixt[6];
++        fprintf(stderr, "[RSX_CACHE3] ix batches %.0f (replayed %.0f) /frame: sync %.2f key+find %.2f "
++                        "replay %.2f walk %.2f ms /frame%c", s_ixt[4] / f, s_ixt[5] / f, s_ixt[0] * k,
++                s_ixt[1] * k, s_ixt[2] * k, s_ixt[3] * k, 10);
++        memset(s_ixt, 0, sizeof s_ixt);
++        if (s_vc_tsc[2] + s_vc_tsc[3])
++            fprintf(stderr, "[RSX_CACHE2] vtx cached path: packed %.0f calls %.2f ms, unpacked %.0f calls %.2f ms /frame%c",
++                    s_vc_tsc[2] / f, s_vc_tsc[0] * k, s_vc_tsc[3] / f, s_vc_tsc[1] * k, 10);
++    }
++    const unsigned long long res = v[VCS_RES], chk = v[VCS_CHK], bad = v[VCS_BAD];
++    const unsigned long long rchk = v[VCS_RCHK], rbad = v[VCS_RBAD];
++    memset(rsx_vcache_stat, 0, sizeof rsx_vcache_stat);
++    v[VCS_RES] = res; v[VCS_CHK] = chk; v[VCS_BAD] = bad;   /* cumulative */
++    v[VCS_RCHK] = rchk; v[VCS_RBAD] = rbad;
++    memset(s_texck, 0, sizeof s_texck);
++    memset(s_vc_tsc, 0, sizeof s_vc_tsc);
++}
++/* RSX_VTX_DIRECT (default on; =0 off): a packed destination is filled by
++ * rsx_fetch_vertex_pk, attribute by stored attribute, instead of building
++ * all sixteen slots (a 256-byte template copy) and packing them. Off under
++ * VTX_POS, RSX_SPEED_CHECK and RSX_PROF=3, which read the sixteen slots. */
++static int vtx_direct_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_VTX_DIRECT"); v = (e && e[0] == '0') ? 0 : 1;
++                 if (getenv("VTX_POS")) v = 0; }
++    return v;
++}
+ static void read_vp_vertex_to(const rsx_state* state, u32 vi, VPSlot* out16, u8* pk_dst)
+ {
+     if (s_vs_on > 0) s_vs.conv++;
+     s_rp_conv++;
+     if (vtx_fast_on()) {
+-        if (s_fplan_serial != s_vtx_serial || s_fplan_st != state) {
+-            rsx_fetch_plan_build(state, &s_fplan);
+-            s_fplan_serial = s_vtx_serial; s_fplan_st = state;
++        if (s_fplan_serial != s_vtx_serial || s_fplan_st != state)
++            vtx_draw_sync(state, s_dd_cur.first, s_dd_cur.count, s_dd_cur.indexed);
++        if (s_vcb_sig && !s_vcb_tried) {
++            s_vcb_tried = 1;
++            s_vcb_cur = rsx_vcache_block(s_vcb_sig, s_vcb_n, s_pk.mask, s_pk.stride, s_vcb_lo,
++                                         (u32)s_d3d.frame_count);
++        }
++        if (s_vcb_cur) {
++            const unsigned long long _h0 = s_rp_tsc_on ? __rdtsc() : 0;
++            const int _hit = vcache_vertex(vi, out16, pk_dst);
++            if (_h0) { s_vc_tsc[pk_dst ? 0 : 1] += __rdtsc() - _h0; s_vc_tsc[pk_dst ? 2 : 3]++; }
++            if (_hit) return;
++        }
++        if (pk_dst && vtx_direct_on() && !s_rp_tsc_on && !speed_chk()) {
++            rsx_fetch_vertex_pk(&s_fplan, vi, s_pk.idx, s_pk.n, pk_dst);
++            return;
+         }
+         float tmp[16][4];
+         const unsigned long long _c0 = s_rp_tsc_on ? __rdtsc() : 0;
+@@ -10093,6 +10270,123 @@
+            s_d3d.vp_vb_offset == s_ix_vbyte + s_ix_nverts * s_pk.stride;
+ }
+ 
++/* RSX_VTX_REPLAY (on when RSX_VTX_CACHE is 1 or 2; =0 off): an indexed run's
++ * batch -- the vertices it converts, in order, and its run-relative indices --
++ * kept under a key of what decides its shape: the decode parameters
++ * (formats, strides, constant registers, packed layout), the index bytes,
++ * the batch kind and, for a batch that continues a run, the chain of the
++ * run so far. The blob also holds the content hash of exactly the source
++ * elements its new vertices decode (rsx_vcache_gather); a repeat re-hashes
++ * those elements and is used only when they are unchanged, which costs a
++ * fraction of converting them. A repeat is then two block copies and a pass
++ * over its new vertices to restamp them, instead of a per-index walk with a
++ * conversion per vertex. The chain folds in each batch's content hash, so a
++ * continuing batch is only replayed over an identical start. With
++ * RSX_VTX_CACHE=2 a repeat is also rebuilt the normal way and compared. */
++static u64 s_ixr_chain;                 /* the run so far; 0 = unknown */
++unsigned long long s_ixt[6];            /* RSX_PROF: ticks in sync, key+find, replay, walk; batches, replays */
++static u64 s_ixr_psig;                  /* this draw's rsx_vcache_plan_sig */
++static u32* s_ixr_uniq; static u32* s_ixr_ib; static u8* s_ixr_vb;
++static u32 s_ixr_cap;                   /* indices the scratch buffers hold */
++#define IXR_HDR 16u                     /* u32 nnew, u32 count, u64 content */
++static int ixr_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_VTX_REPLAY"); v = (e && e[0] == '0') ? 0 : 1; }
++    if (s_vc_mode < 0) s_vc_mode = rsx_vcache_mode();
++    return v && s_vc_mode > 0;
++}
++/* Plan for an indexed run's batch: the per-vertex block cache is left off
++ * (its range hash would read every element of the index span); the replay
++ * validates exactly the elements it reuses instead. */
++static void vtx_draw_sync_ix(const rsx_state* st)
++{
++    rsx_fetch_plan_build(st, &s_fplan);
++    s_fplan_serial = s_vtx_serial; s_fplan_st = st;
++    s_vcb_cur = NULL; s_vcb_sig = 0; s_vcb_tried = 0;
++    s_ixr_psig = ixr_on() ? rsx_vcache_plan_sig(&s_fplan, s_pk.mask, s_pk.stride) : 0;
++}
++/* The batch's key, 0 when it cannot be cached. */
++static u64 ixr_key(int kind, int cont, const u8* idx, u32 idx_bytes, u32 a, u32 b)
++{
++    if (!s_ixr_psig || (cont && !s_ixr_chain)) return 0;
++    const u64 hdr[4] = { cont ? s_ixr_chain : 0x5EEDull, s_ixr_psig,
++                         ((u64)kind << 56) ^ ((u64)s_ix_nverts << 24) ^ s_pk.mask,
++                         ((u64)a << 32) ^ b };
++    const u64 h = rsx_hash64(idx, idx_bytes, rsx_hash64(hdr, sizeof hdr, 0x1D5Eull));
++    return h ? h : 1;
++}
++static u64 ixr_chain(u64 key, u64 content)
++{
++    const u64 c[2] = { key, content };
++    const u64 h = rsx_hash64(c, sizeof c, 0xC4A1ull);
++    return h ? h : 1;
++}
++/* Scratch for recording a batch of `count` indices; 0 if it cannot grow. */
++static int ixr_scratch(u32 count)
++{
++    if (count <= s_ixr_cap) return 1;
++    u32 c = count < 4096 ? 4096 : count;
++    free(s_ixr_uniq); free(s_ixr_ib); free(s_ixr_vb);
++    s_ixr_uniq = malloc((size_t)c * 4); s_ixr_ib = malloc((size_t)c * 4); s_ixr_vb = malloc((size_t)c * 256);
++    if (!s_ixr_uniq || !s_ixr_ib || !s_ixr_vb) {
++        free(s_ixr_uniq); free(s_ixr_ib); free(s_ixr_vb);
++        s_ixr_uniq = s_ixr_ib = NULL; s_ixr_vb = NULL; s_ixr_cap = 0; return 0;
++    }
++    s_ixr_cap = c;
++    return 1;
++}
++/* Blob layout: header, u32 uniq[nnew], u32 ib[count], vertices. Returns the
++ * content hash when the blob was replayed, 0 when it cannot be (shape, room,
++ * or its source elements changed). */
++static u64 ixr_replay(const u8* blob, u32 blen, u32 count, u8* vb, u32* ib, u32* n)
++{
++    u32 nnew, cnt; u64 content;
++    memcpy(&nnew, blob, 4); memcpy(&cnt, blob + 4, 4); memcpy(&content, blob + 8, 8);
++    const u64 vbytes = (u64)nnew * s_pk.stride;
++    if (cnt != count || blen != IXR_HDR + 4ull * nnew + 4ull * count + vbytes) return 0;
++    if ((u64)s_ix_vbyte + (u64)(*n + nnew) * s_pk.stride > VP_HALF) return 0;
++    const u32* uq = (const u32*)(blob + IXR_HDR);
++    if (rsx_vcache_gather(&s_fplan, uq, nnew) != content) { rsx_vcache_stat[VCS_RSTALE]++; return 0; }
++    memcpy(ib, blob + IXR_HDR + 4u * nnew, 4ull * count);
++    memcpy(pk_vtx(vb, *n), blob + IXR_HDR + 4u * nnew + 4u * count, vbytes);
++    for (u32 j = 0; j < nnew; j++) { s_ix_stamp[uq[j]] = s_ix_gen; s_ix_slot[uq[j]] = *n + j; }
++    *n += nnew;
++    return content;
++}
++/* After a recorded batch: publish its vertices and indices, then store the
++ * blob (or, in check mode, compare it with the one held). Returns the
++ * batch's content hash. */
++static u64 ixr_finish(u64 key, const u8* old, u32 oldlen, u32 n0, u32 n, u32 count, u8* vb, u32* ib)
++{
++    const u32 nnew = n - n0;
++    const u64 vbytes = (u64)nnew * s_pk.stride;
++    memcpy(pk_vtx(vb, n0), s_ixr_vb, vbytes);
++    memcpy(ib, s_ixr_ib, 4ull * count);
++    const u64 content = rsx_vcache_gather(&s_fplan, s_ixr_uniq, nnew);
++    const u64 len = IXR_HDR + 4ull * nnew + 4ull * count + vbytes;
++    if (old && s_vc_mode == 2) {
++        u64 oc; memcpy(&oc, old + 8, 8);
++        if (oc == content) {   /* same source: the held blob must be this batch */
++            rsx_vcache_stat[VCS_RCHK]++;
++            if (oldlen != len || memcmp(old, &nnew, 4) || memcmp(old + IXR_HDR, s_ixr_uniq, 4ull * nnew) ||
++                memcmp(old + IXR_HDR + 4u * nnew, s_ixr_ib, 4ull * count) ||
++                memcmp(old + IXR_HDR + 4u * nnew + 4u * count, s_ixr_vb, vbytes))
++                rsx_vcache_stat[VCS_RBAD]++;
++            return content;
++        }
++    }
++    if (len > 0xFFFFFFFFull) return content;
++    u8* b = rsx_vcache_blob_put(key, (u32)len, (u32)s_d3d.frame_count);   /* newest first in its bucket */
++    if (!b) return content;
++    memcpy(b, &nnew, 4); memcpy(b + 4, &count, 4); memcpy(b + 8, &content, 8);
++    memcpy(b + IXR_HDR, s_ixr_uniq, 4ull * nnew);
++    memcpy(b + IXR_HDR + 4u * nnew, s_ixr_ib, 4ull * count);
++    memcpy(b + IXR_HDR + 4u * nnew + 4u * count, s_ixr_vb, vbytes);
++    rsx_vcache_stat[VCS_RSTORE]++;
++    return content;
++}
++
+ /* Returns the number of indices written; 0 means "use the list path". */
+ static u32 upload_tris_vp_ix(const rsx_state* state, u32 first, u32 count, int cont)
+ {
+@@ -10117,6 +10411,26 @@
+     const u8* ip = vm_base + cellGcmResolveLocated(local, state->index_array_offset);
+     const int sixteen = (((state->index_array_dma >> 4) & 0xF) == 1);
+     u32 n = s_ix_nverts;
++    /* RSX_VTX_REPLAY: this batch from the cache, or recorded for it. */
++    const unsigned long long _x0 = rsx_prof_on() ? __rdtsc() : 0;
++    if (vtx_fast_on() && (s_fplan_serial != s_vtx_serial || s_fplan_st != state))
++        vtx_draw_sync_ix(state);
++    const unsigned long long _x1 = _x0 ? __rdtsc() : 0;
++    const u64 rkey = ixr_key(0, cont, ip + (u64)first * (sixteen ? 2u : 4u), count * (sixteen ? 2u : 4u), count, 0);
++    s_ixr_chain = 0;
++    u32 rlen = 0;
++    const u8* rold = rkey ? rsx_vcache_blob_find(rkey, (u32)s_d3d.frame_count, &rlen) : NULL;
++    const unsigned long long _x2 = _x0 ? __rdtsc() : 0;
++    u64 rcontent = 0;
++    if (rold && s_vc_mode != 2 && (rcontent = ixr_replay(rold, rlen, count, vb, ib, &n)) != 0) {
++        rsx_vcache_stat[VCS_RHIT]++;
++        if (_x0) { s_ixt[2] += __rdtsc() - _x2; s_ixt[5]++; }
++        goto ix_done;
++    }
++    if (rkey && !rold) rsx_vcache_stat[VCS_RMISS]++;
++    const int rec = rkey && ixr_scratch(count);
++    const u32 n0 = n;
++    u32* ibw = rec ? s_ixr_ib : ib;
+     for (u32 k = 0; k < count; k++) {
+         const u32 kk = first + k;
+         const u32 ix = sixteen ? (((u32)ip[kk * 2] << 8) | ip[kk * 2 + 1])
+@@ -10132,11 +10446,17 @@
+         if (s_ix_stamp[ix] != s_ix_gen) {
+             s_ix_stamp[ix] = s_ix_gen;
+             s_ix_slot[ix] = n;
+-            read_vp_vertex_pk(state, ix, pk_vtx(vb, n));
++            if (rec) { s_ixr_uniq[n - n0] = ix; read_vp_vertex_pk(state, ix, s_ixr_vb + (size_t)(n - n0) * s_pk.stride); }
++            else read_vp_vertex_pk(state, ix, pk_vtx(vb, n));
+             n++;
+         }
+-        ib[k] = s_ix_slot[ix];
++        ibw[k] = s_ix_slot[ix];
+     }
++    if (rec) rcontent = ixr_finish(rkey, rold, rlen, n0, n, count, vb, ib);
++    if (_x0) s_ixt[3] += __rdtsc() - _x2;
++ix_done:
++    if (_x0) { s_ixt[0] += _x1 - _x0; s_ixt[1] += _x2 - _x1; s_ixt[4]++; }
++    s_ixr_chain = rcontent ? ixr_chain(rkey, rcontent) : 0;
+     s_d3d.vp_vb_offset += (n - s_ix_nverts) * s_pk.stride;
+     s_ix_nverts = n;
+     s_d3d.vp_ib_offset += count;
+@@ -10556,6 +10876,27 @@
+     const u8* ip = vm_base + cellGcmResolveLocated(local, state->index_array_offset);
+     const int sixteen = (((state->index_array_dma >> 4) & 0xF) == 1);
+     u32 n = s_ix_nverts, k = 0;
++    /* RSX_VTX_REPLAY (see upload_tris_vp_ix); the signature spans every index
++     * the batch reads, the strip's start included. */
++    const unsigned long long _x0 = rsx_prof_on() ? __rdtsc() : 0;
++    if (vtx_fast_on() && (s_fplan_serial != s_vtx_serial || s_fplan_st != state))
++        vtx_draw_sync_ix(state);
++    const unsigned long long _x1 = _x0 ? __rdtsc() : 0;
++    const u64 rkey = ixr_key(fan ? 2 : 1, cont, ip + (u64)s * (sixteen ? 2u : 4u), (end - s) * (sixteen ? 2u : 4u), prev_end - s, end - s);
++    s_ixr_chain = 0;
++    u32 rlen = 0;
++    const u8* rold = rkey ? rsx_vcache_blob_find(rkey, (u32)s_d3d.frame_count, &rlen) : NULL;
++    const unsigned long long _x2 = _x0 ? __rdtsc() : 0;
++    u64 rcontent = 0;
++    if (rold && s_vc_mode != 2 && (rcontent = ixr_replay(rold, rlen, count, vb, ib, &n)) != 0) {
++        rsx_vcache_stat[VCS_RHIT]++;
++        if (_x0) { s_ixt[2] += __rdtsc() - _x2; s_ixt[5]++; }
++        goto strip_done;
++    }
++    if (rkey && !rold) rsx_vcache_stat[VCS_RMISS]++;
++    const int rec = rkey && ixr_scratch(count);
++    const u32 n0 = n;
++    u32* ibw = rec ? s_ixr_ib : ib;
+     for (u32 t = t0; t < t1; t++) {
+         u32 pos[3] = { s + (fan ? 0 : t), s + t + 1, s + t + 2 };
+         if (!fan && (t & 1)) { u32 tmp = pos[1]; pos[1] = pos[2]; pos[2] = tmp; }
+@@ -10572,12 +10913,18 @@
+             if (s_ix_stamp[ix] != s_ix_gen) {
+                 s_ix_stamp[ix] = s_ix_gen;
+                 s_ix_slot[ix] = n;
+-                read_vp_vertex_pk(state, ix, pk_vtx(vb, n));
++                if (rec) { s_ixr_uniq[n - n0] = ix; read_vp_vertex_pk(state, ix, s_ixr_vb + (size_t)(n - n0) * s_pk.stride); }
++                else read_vp_vertex_pk(state, ix, pk_vtx(vb, n));
+                 n++;
+             }
+-            ib[k++] = s_ix_slot[ix];
++            ibw[k++] = s_ix_slot[ix];
+         }
+     }
++    if (rec) rcontent = ixr_finish(rkey, rold, rlen, n0, n, count, vb, ib);
++    if (_x0) s_ixt[3] += __rdtsc() - _x2;
++strip_done:
++    if (_x0) { s_ixt[0] += _x1 - _x0; s_ixt[1] += _x2 - _x1; s_ixt[4]++; }
++    s_ixr_chain = rcontent ? ixr_chain(rkey, rcontent) : 0;
+     if (speed_chk()) {   /* each corner == the vertex the list path writes there */
+         k = 0;
+         for (u32 t = t0; t < t1; t++) {
