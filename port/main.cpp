@@ -341,14 +341,21 @@ static void keep_explorer_message_open(int argc)
 }
 
 #ifdef _WIN32
-static bool matches_fixed_elf(FILE* file)
+static bool matches_target_elf(FILE* file)
 {
-    // SHA-256 of profiles.fix-1.02.decrypted_elf_sha256 in config/target.json.
+    // SHA-256 of the selected profile's decrypted_elf_sha256 in config/target.json.
     static const uint8_t expected[] = {
+#ifdef HSG_TARGET_OFFICIAL_1_03
+        0x8c, 0xb1, 0x8c, 0x2e, 0xc0, 0x6c, 0x8a, 0x0e,
+        0xd2, 0xde, 0x12, 0xd3, 0xdd, 0x3b, 0xdd, 0x09,
+        0xca, 0xa3, 0x6a, 0xf5, 0x5d, 0x49, 0xc1, 0x8a,
+        0x86, 0x9d, 0xba, 0xc0, 0xf5, 0x2e, 0x14, 0x0b,
+#else
         0x42, 0xbd, 0xdd, 0xc5, 0xe4, 0x19, 0xf7, 0xe1,
         0x8b, 0xcb, 0xec, 0xdf, 0x02, 0xeb, 0x24, 0x74,
         0x8d, 0xd1, 0xda, 0x91, 0x1e, 0xa7, 0x25, 0x7d,
         0x86, 0xd8, 0x47, 0x7e, 0x24, 0x77, 0x7a, 0x8b,
+#endif
     };
     // Reject incomplete or oversized inputs before the hash reads their data.
     constexpr int64_t expected_size = 14340360;
@@ -639,7 +646,8 @@ int main(int argc, char** argv)
     ResolvedPaths rp;
     cli_resolve(opt, exe_dir, rp);
     for (auto* path : {&rp.build_dir, &rp.elf, &rp.vfs_root, &rp.hdd0, &rp.hdd1,
-                       &rp.savedata, &rp.log_dir, &rp.log_file, &rp.audio_wav})
+                       &rp.savedata, &rp.log_dir, &rp.log_file, &rp.audio_wav,
+                       &rp.tex_dump, &rp.tex_replace})
         if (!make_absolute(*path)) return 1;
 #ifdef _WIN32
     if (rp.rsx_shader_cache != "0" && !make_absolute(rp.rsx_shader_cache)) return 1;
@@ -657,7 +665,7 @@ int main(int argc, char** argv)
     if (sfo.empty()) {
         fprintf(stderr,
                 "Game files not found.\n"
-                "Put PARAM.SFO and USRDIR/EBOOT.elf for the fixed 1.02 build in:\n"
+                "Put PARAM.SFO and USRDIR/EBOOT.elf for this build's game profile in:\n"
                 "  %s\n"
                 "Use --game-dir or --elf to select another location.\n"
                 "ELF path checked: %s\n",
@@ -671,9 +679,14 @@ int main(int argc, char** argv)
     // cannot be modified or replaced between the two reads.
     std::unique_ptr<FILE, decltype(&fclose)> pinned_elf(
         _fsopen(rp.elf.c_str(), "rb", _SH_DENYWR), fclose);
-    if (!matches_fixed_elf(pinned_elf.get())) {
-        fprintf(stderr, "Unsupported or unreadable EBOOT.elf at %s. Use the decrypted fixed 1.02 ELF for this build.\n",
-                rp.elf.c_str());
+    if (!matches_target_elf(pinned_elf.get())) {
+#ifdef HSG_TARGET_OFFICIAL_1_03
+        const char* target_profile = "official 1.03";
+#else
+        const char* target_profile = "fixed 1.02";
+#endif
+        fprintf(stderr, "Unsupported or unreadable EBOOT.elf at %s. Use the decrypted %s ELF for this build.\n",
+                rp.elf.c_str(), target_profile);
         keep_explorer_message_open(argc);
         return 1;
     }

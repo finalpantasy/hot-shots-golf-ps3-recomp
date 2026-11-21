@@ -83,6 +83,11 @@ message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 if(CMAKE_C_COMPILER_ARG1 MATCHES "driver-mode=cl")
     add_compile_options(/clang:-O2 -msse4.1)
     set(PORT_CL_DRIVER ON)
+    # CMake detects this clang.exe --driver-mode=cl combination as a GNU
+    # frontend and otherwise emits -MD/-MT/-MF directly. clang-cl treats -MD
+    # as the CRT switch and ignores -MF, leaving Ninja with zero header deps.
+    set(CMAKE_DEPFILE_FLAGS_C "/MD /clang:-MMD /clang:-MT<DEP_TARGET> /clang:-MF<DEP_FILE>")
+    set(CMAKE_DEPFILE_FLAGS_CXX "${CMAKE_DEPFILE_FLAGS_C}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -208,6 +213,15 @@ add_executable(${PROJECT_NAME}
     ${RECOMP_SOURCES}
     ${SPU_SOURCES}
 )
+
+set(HSG_TARGET_PROFILE "fix-1.02" CACHE STRING "Game code profile used by this executable")
+set_property(CACHE HSG_TARGET_PROFILE PROPERTY STRINGS fix-1.02 official-1.03)
+if(HSG_TARGET_PROFILE STREQUAL "official-1.03")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE HSG_TARGET_OFFICIAL_1_03=1)
+elseif(NOT HSG_TARGET_PROFILE STREQUAL "fix-1.02")
+    message(FATAL_ERROR "Unsupported HSG_TARGET_PROFILE: ${HSG_TARGET_PROFILE}")
+endif()
+message(STATUS "Game profile:    ${HSG_TARGET_PROFILE}")
 
 # The lifted SPU sources use bare #include "spu_context.h". Scope that include
 # directory (and their flags) to those TUs alone: adding it to the whole target
