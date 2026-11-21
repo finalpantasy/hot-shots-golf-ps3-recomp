@@ -1,0 +1,488 @@
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -891,6 +891,7 @@
+ 
+ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
+ {
++    { extern void hsg_tweaks_tick(void); hsg_tweaks_tick(); }   /* HSG_TWEAKS per-frame writes */
+     { static int _once = 0;
+       if (!_once++) printf("[cellPad] GetData polling begins (port %u)\n", port_no); }
+     if (!s_pad_initialized)
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3685,6 +3685,7 @@
+ /* Default used by the PS3 executable entry path when PROC_PARAM is absent. */
+ static int32_t g_ppu_primary_priority = 1001;
+ 
++extern "C" void hsg_tweaks_boot(void);   /* libs/system/hsg_tweaks.c */
+ extern "C" uint32_t ppu_load_elf(const char* path)
+ {
+     g_ppu_primary_priority = 1001;
+@@ -3872,6 +3873,8 @@
+               }
+           }
+       } }
++    /* HSG_TWEAKS "when": "boot" writes and insn guards (libs/system/hsg_tweaks.c). */
++    hsg_tweaks_boot();
+     return entry;
+ }
+ 
+--- /dev/null
++++ b/libs/system/hsg_tweaks.c
+@@ -0,0 +1,456 @@
++/*
++ * ps3recomp - guest tweak layer (HSG_TWEAKS)
++ *
++ * HSG_TWEAKS=<file.json> writes guest memory values while the title runs, and
++ * switches compiled-in instruction patches. Unset (the default), nothing here
++ * does anything: hsg_tweaks_boot() and hsg_tweaks_tick() return after one
++ * getenv.
++ *
++ * Hooks (two lines elsewhere):
++ *   hsg_tweaks_boot()  ppu_load_elf, after the segments are in guest RAM and
++ *                      before any guest code runs ("when": "boot").
++ *   hsg_tweaks_tick()  cellPadGetData, the title's once-a-frame input poll
++ *                      ("when": "once" / "frame", flip windows, dumps).
++ *
++ * File format (JSON; "//" line comments allowed):
++ *   {
++ *     "tweaks": [
++ *       { "name": "shadow far", "addr": "0xD9F2E0", "type": "f32", "value": 11.0,
++ *         "when": "frame",            // boot | once | frame   (default frame)
++ *         "from_flip": 0, "to_flip": 0,   // flip window, 0 = open
++ *         "if": { "addr": "[0xDB8D68]+0xC", "type": "u32", "eq": 56 } },  // or "ne"
++ *       ...
++ *     ],
++ *     "insn":  [ { "addr": "0x1C0C8", "value": "0x38800034" } ],
++ *     "dumps": [ { "at_flip": 3000, "addr": "0xD9C000", "len": "0xE000",
++ *                  "file": "work/verify-tweaks/data.bin" } ],
++ *     "watch": [ { "name": "seq", "addr": "[0xDB8D68]+0xC", "type": "u32" } ]  // log each change
++ *   }
++ *   addr: a number, "0x..." string, or a pointer chain: "[0xDB8D68]+0x10" reads
++ *         the big-endian u32 at 0xDB8D68 and adds 0x10 (nesting allowed). A
++ *         chain through a null pointer leaves the tweak pending.
++ *   type: u8 u16 u32 u64 s8 s16 s32 f32 f64.
++ *   value: a number or a "0x..." string.
++ *   insn: a statically recompiled title cannot have .text rewritten at run
++ *         time, so code patches are lifted in (ppu_lifter --insn-patches with
++ *         a guard from k_insn below) and this only flips their guard. An
++ *         entry with no compiled-in match is logged and skipped.
++ * Every applied tweak logs one "[TWEAK]" line (frame tweaks: the first write,
++ * then each time the title had changed the value back, up to 8 times).
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include "ps3emu/ps3types.h"
++#include "../../runtime/ppu/ppu_memory.h"
++
++extern u32 cellGcm_flip_request_count(void);
++
++/* ---------------------------------------------------------------------------
++ * Compiled-in instruction patches. Each guard is switched on by a matching
++ * "insn" entry; the same (addr, orig, new, guard) lines go in the lifter's
++ * --insn-patches file (work/tweaks/insn-patches.json).
++ * -----------------------------------------------------------------------*/
++int g_hsg_tw_insn_0001C0C8 = 0;   /* Main_Run: li r4,0x36 -> 0x34 (debug start menu) */
++int g_hsg_tw_insn_0001C4C8 = 0;   /* Main_Run after new save: li r4,0x36 -> 0x34 */
++
++static const struct { u32 addr, orig, repl; int* guard; const char* note; } k_insn[] = {
++    { 0x0001C0C8u, 0x38800036u, 0x38800034u, &g_hsg_tw_insn_0001C0C8, "boot sequence FIRST -> DBG_START_MENU" },
++    { 0x0001C4C8u, 0x38800036u, 0x38800034u, &g_hsg_tw_insn_0001C4C8, "boot sequence (new save) FIRST -> DBG_START_MENU" },
++};
++
++/* ---------------------------------------------------------------------------
++ * Minimal JSON reader (objects, arrays, strings, numbers, literals).
++ * -----------------------------------------------------------------------*/
++enum { JN_NULL, JN_NUM, JN_STR, JN_ARR, JN_OBJ, JN_BOOL };
++typedef struct jn {
++    int t; double num; char* str; char* key;
++    struct jn* kid; struct jn* next;
++} jn;
++
++static const char* jp;
++static void j_ws(void)
++{
++    for (;;) {
++        while (*jp && isspace((unsigned char)*jp)) jp++;
++        if (jp[0] == '/' && jp[1] == '/') { while (*jp && *jp != '\n') jp++; continue; }
++        break;
++    }
++}
++static char* j_strlit(void)
++{
++    if (*jp != '"') return NULL;
++    jp++;
++    size_t cap = 64, n = 0; char* s = (char*)malloc(cap);
++    while (*jp && *jp != '"') {
++        char c = *jp++;
++        if (c == '\\' && *jp) { c = *jp++; if (c == 'n') c = '\n'; else if (c == 't') c = '\t'; }
++        if (n + 2 > cap) s = (char*)realloc(s, cap *= 2);
++        s[n++] = c;
++    }
++    if (*jp == '"') jp++;
++    s[n] = 0;
++    return s;
++}
++static jn* j_val(void)
++{
++    j_ws();
++    jn* v = (jn*)calloc(1, sizeof *v);
++    if (*jp == '{' || *jp == '[') {
++        const char close = (*jp == '{') ? '}' : ']';
++        v->t = (*jp == '{') ? JN_OBJ : JN_ARR; jp++;
++        jn** tail = &v->kid;
++        for (;;) {
++            j_ws();
++            if (*jp == close) { jp++; break; }
++            if (!*jp) break;
++            char* key = NULL;
++            if (v->t == JN_OBJ) { key = j_strlit(); j_ws(); if (*jp == ':') jp++; }
++            jn* k = j_val(); k->key = key;
++            *tail = k; tail = &k->next;
++            j_ws(); if (*jp == ',') jp++;
++        }
++    } else if (*jp == '"') { v->t = JN_STR; v->str = j_strlit(); }
++    else if (!strncmp(jp, "true", 4))  { v->t = JN_BOOL; v->num = 1; jp += 4; }
++    else if (!strncmp(jp, "false", 5)) { v->t = JN_BOOL; v->num = 0; jp += 5; }
++    else if (!strncmp(jp, "null", 4))  { v->t = JN_NULL; jp += 4; }
++    else {
++        char* end = NULL;
++        if (jp[0] == '0' && (jp[1] == 'x' || jp[1] == 'X')) v->num = (double)strtoull(jp, &end, 16);
++        else v->num = strtod(jp, &end);
++        v->t = JN_NUM;
++        if (end == jp) { jp++; v->t = JN_NULL; } else jp = end;
++    }
++    return v;
++}
++static jn* j_get(const jn* o, const char* key)
++{
++    if (!o || o->t != JN_OBJ) return NULL;
++    for (jn* k = o->kid; k; k = k->next) if (k->key && !strcmp(k->key, key)) return k;
++    return NULL;
++}
++/* A number, or a numeric string ("0x34", "-1.5"). */
++static int j_num(const jn* v, double* out, unsigned long long* iout)
++{
++    if (!v) return 0;
++    if (v->t == JN_NUM || v->t == JN_BOOL) { *out = v->num; *iout = (unsigned long long)(long long)v->num; return 1; }
++    if (v->t == JN_STR && v->str) {
++        const char* s = v->str; char* end = NULL;
++        if ((s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) || (s[0] == '-' && s[1] == '0' && (s[2] == 'x' || s[2] == 'X'))) {
++            int neg = (*s == '-');
++            unsigned long long u = strtoull(s + neg, &end, 16);
++            *iout = neg ? (unsigned long long)(-(long long)u) : u; *out = neg ? -(double)u : (double)u;
++        } else { *out = strtod(s, &end); *iout = (unsigned long long)(long long)*out; }
++        return end != s;
++    }
++    return 0;
++}
++
++/* ---------------------------------------------------------------------------
++ * Address expressions: N | [expr] | expr+N | expr-N
++ * -----------------------------------------------------------------------*/
++static int a_expr(const char** p, u32* out);
++static int a_term(const char** p, u32* out)
++{
++    while (**p == ' ') (*p)++;
++    if (**p == '[') {
++        (*p)++;
++        u32 a; if (!a_expr(p, &a)) return 0;
++        while (**p == ' ') (*p)++;
++        if (**p != ']') return 0;
++        (*p)++;
++        if (a < 0x10000u || a >= 0xF0000000u) return -1;   /* not a guest data address */
++        u32 v = vm_read32(a);
++        if (!v) return -1;                                 /* null pointer: pending */
++        *out = v; return 1;
++    }
++    char* end = NULL;
++    unsigned long long u = strtoull(*p, &end, 0);
++    if (end == *p) return 0;
++    *p = end; *out = (u32)u; return 1;
++}
++static int a_expr(const char** p, u32* out)
++{
++    int r = a_term(p, out); if (r <= 0) return r;
++    for (;;) {
++        while (**p == ' ') (*p)++;
++        if (**p != '+' && **p != '-') return 1;
++        const char op = *(*p)++;
++        u32 b; r = a_term(p, &b); if (r <= 0) return r;
++        *out = (op == '+') ? *out + b : *out - b;
++    }
++}
++
++/* ---------------------------------------------------------------------------
++ * Tweaks
++ * -----------------------------------------------------------------------*/
++enum { T_U8, T_U16, T_U32, T_U64, T_S8, T_S16, T_S32, T_F32, T_F64 };
++static const char* const k_tname[] = { "u8", "u16", "u32", "u64", "s8", "s16", "s32", "f32", "f64" };
++static int type_of(const char* s)
++{
++    if (!s) return T_U32;
++    for (int i = 0; i < 9; i++) if (!strcmp(s, k_tname[i])) return i;
++    if (!strcmp(s, "float")) return T_F32;
++    if (!strcmp(s, "double")) return T_F64;
++    if (!strcmp(s, "int") || !strcmp(s, "i32")) return T_S32;
++    if (!strcmp(s, "byte") || !strcmp(s, "bool")) return T_U8;
++    return -1;
++}
++static int type_size(int t) { static const int s[] = { 1, 2, 4, 8, 1, 2, 4, 4, 8 }; return s[t]; }
++
++typedef struct { double f; unsigned long long u; } tval;
++static tval rd_val(u32 a, int t)
++{
++    tval v = { 0, 0 };
++    switch (t) {
++    case T_U8:  v.u = vm_read8(a);  v.f = (double)v.u; break;
++    case T_S8:  v.u = (unsigned long long)(long long)(signed char)vm_read8(a); v.f = (double)(signed char)vm_read8(a); break;
++    case T_U16: v.u = vm_read16(a); v.f = (double)v.u; break;
++    case T_S16: v.u = (unsigned long long)(long long)(short)vm_read16(a); v.f = (double)(short)vm_read16(a); break;
++    case T_U32: v.u = vm_read32(a); v.f = (double)v.u; break;
++    case T_S32: v.u = (unsigned long long)(long long)(int)vm_read32(a); v.f = (double)(int)vm_read32(a); break;
++    case T_U64: v.u = vm_read64(a); v.f = (double)v.u; break;
++    case T_F32: v.f = vm_read_f32(a); v.u = vm_read32(a); break;
++    case T_F64: v.f = vm_read_f64(a); v.u = vm_read64(a); break;
++    }
++    return v;
++}
++static void fmt_val(char* b, size_t n, int t, tval v)
++{
++    if (t == T_F32 || t == T_F64) snprintf(b, n, "%g", v.f);
++    else if (t == T_S8 || t == T_S16 || t == T_S32) snprintf(b, n, "%lld", (long long)v.u);
++    else snprintf(b, n, "0x%llX", v.u);
++}
++
++enum { W_BOOT, W_ONCE, W_FRAME };
++typedef struct {
++    char name[64], addr[128], cond_addr[128];
++    int type, when, cond_type, cond_ne, has_cond;
++    double fval; unsigned long long ival;   /* value */
++    double cf; unsigned long long ci;       /* condition value */
++    u32 from_flip, to_flip;
++    int done, logs;
++} tweak;
++typedef struct { u32 at_flip, len; char addr[128], file[260]; int done; } tdump;
++typedef struct { char name[64], addr[128]; int type, have, n; unsigned long long last; } twatch;
++
++static int s_state = -1;          /* -1 unread, 0 off, 1 on */
++static tweak* s_tw; static int s_ntw;
++static tdump* s_dp; static int s_ndp;
++static twatch* s_wt; static int s_nwt;
++static int s_insn_pending;        /* insn entries are applied at boot (or first tick) */
++static jn* s_insn_list;
++
++static int write_tweak(tweak* t, u32 a, const char* why)
++{
++    const tval before = rd_val(a, t->type);
++    int same;
++    if (t->type == T_F32) same = (float)before.f == (float)t->fval;
++    else if (t->type == T_F64) same = before.f == t->fval;
++    else same = (before.u & (type_size(t->type) == 8 ? ~0ull : ((1ull << (8 * type_size(t->type))) - 1))) ==
++                (t->ival & (type_size(t->type) == 8 ? ~0ull : ((1ull << (8 * type_size(t->type))) - 1)));
++    if (same && t->logs) return 0;   /* already holds it (logged before): nothing to do */
++    switch (t->type) {
++    case T_U8: case T_S8:   vm_write8(a, (uint8_t)t->ival); break;
++    case T_U16: case T_S16: vm_write16(a, (uint16_t)t->ival); break;
++    case T_U32: case T_S32: vm_write32(a, (uint32_t)t->ival); break;
++    case T_U64:             vm_write64(a, (uint64_t)t->ival); break;
++    case T_F32:             vm_write_f32(a, (float)t->fval); break;
++    case T_F64:             vm_write_f64(a, t->fval); break;
++    }
++    if (t->logs < 8) {
++        char ob[48], nb[48];
++        fmt_val(ob, sizeof ob, t->type, before);
++        fmt_val(nb, sizeof nb, t->type, rd_val(a, t->type));
++        fprintf(stderr, "[TWEAK] %s '%s' %s=0x%08X %s %s -> %s (flip %u)%s\n", why, t->name, t->addr, a,
++                k_tname[t->type], ob, nb, cellGcm_flip_request_count(),
++                t->logs == 7 ? " [further rewrites not logged]" : "");
++        fflush(stderr);
++        t->logs++;
++    }
++    return 1;
++}
++
++static int cond_ok(const tweak* t)
++{
++    if (!t->has_cond) return 1;
++    const char* p = t->cond_addr; u32 a;
++    if (a_expr(&p, &a) <= 0) return 0;
++    const tval v = rd_val(a, t->cond_type);
++    int eq = (t->cond_type == T_F32 || t->cond_type == T_F64) ? (v.f == t->cf) : (v.u == t->ci);
++    return t->cond_ne ? !eq : eq;
++}
++
++static void apply_insn(void)
++{
++    for (jn* e = s_insn_list ? s_insn_list->kid : NULL; e; e = e->next) {
++        double f; unsigned long long a = 0, w = 0;
++        jn* ja = j_get(e, "addr"); jn* jw = j_get(e, "value");
++        if (!j_num(ja, &f, &a)) continue;
++        const int have_w = j_num(jw, &f, &w);
++        jn* jon = j_get(e, "enable");
++        const int on = jon ? (jon->num != 0) : 1;
++        int hit = 0;
++        for (size_t i = 0; i < sizeof k_insn / sizeof k_insn[0]; i++) {
++            if (k_insn[i].addr != (u32)a) continue;
++            if (have_w && (u32)w != k_insn[i].repl) continue;
++            *k_insn[i].guard = on; hit = 1;
++            fprintf(stderr, "[TWEAK] insn 0x%08X %08X -> %08X guard %s (%s; live only in a build lifted with its --insn-patches line)\n", k_insn[i].addr, k_insn[i].orig,
++                    k_insn[i].repl, on ? "ON" : "off", k_insn[i].note);
++        }
++        if (!hit)
++            fprintf(stderr, "[TWEAK] insn 0x%08llX value 0x%08llX: not compiled in (add it to the lifter's "
++                    "--insn-patches file and to k_insn in hsg_tweaks.c, then re-lift); skipped\n", a, w);
++    }
++    fflush(stderr);
++}
++
++static void load(void)
++{
++    const char* path = getenv("HSG_TWEAKS");
++    s_state = 0;
++    if (!path || !*path) return;
++    FILE* f = fopen(path, "rb");
++    if (!f) { fprintf(stderr, "[TWEAK] HSG_TWEAKS=%s: cannot open; tweaks off\n", path); return; }
++    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
++    char* buf = (char*)calloc(1, (size_t)n + 1);
++    if (fread(buf, 1, (size_t)n, f) != (size_t)n) n = 0;
++    fclose(f);
++    jp = buf;
++    jn* root = j_val();
++    if (!root || root->t != JN_OBJ) { fprintf(stderr, "[TWEAK] %s: not a JSON object; tweaks off\n", path); return; }
++
++    jn* list = j_get(root, "tweaks");
++    int cnt = 0; for (jn* e = list ? list->kid : NULL; e; e = e->next) cnt++;
++    s_tw = (tweak*)calloc(cnt ? cnt : 1, sizeof *s_tw);
++    for (jn* e = list ? list->kid : NULL; e; e = e->next) {
++        jn* ja = j_get(e, "addr");
++        tweak* t = &s_tw[s_ntw];
++        memset(t, 0, sizeof *t);
++        jn* jen = j_get(e, "enable");
++        if (jen && !jen->num) continue;
++        if (!ja) { fprintf(stderr, "[TWEAK] entry without addr skipped\n"); continue; }
++        if (ja->t == JN_STR) snprintf(t->addr, sizeof t->addr, "%s", ja->str);
++        else snprintf(t->addr, sizeof t->addr, "0x%llX", (unsigned long long)ja->num);
++        jn* jt = j_get(e, "type");
++        t->type = type_of(jt && jt->t == JN_STR ? jt->str : NULL);
++        if (t->type < 0) { fprintf(stderr, "[TWEAK] %s: unknown type '%s' skipped\n", t->addr, jt->str); continue; }
++        if (!j_num(j_get(e, "value"), &t->fval, &t->ival)) { fprintf(stderr, "[TWEAK] %s: no value, skipped\n", t->addr); continue; }
++        jn* jnm = j_get(e, "name");
++        snprintf(t->name, sizeof t->name, "%s", jnm && jnm->t == JN_STR ? jnm->str : t->addr);
++        jn* jw = j_get(e, "when");
++        const char* w = jw && jw->t == JN_STR ? jw->str : "frame";
++        t->when = !strcmp(w, "boot") ? W_BOOT : !strcmp(w, "once") ? W_ONCE : W_FRAME;
++        double d; unsigned long long u;
++        if (j_num(j_get(e, "from_flip"), &d, &u)) t->from_flip = (u32)u;
++        if (j_num(j_get(e, "to_flip"), &d, &u)) t->to_flip = (u32)u;
++        jn* jc = j_get(e, "if");
++        if (jc) {
++            jn* jca = j_get(jc, "addr"); jn* jct = j_get(jc, "type");
++            if (jca && jca->t == JN_STR) snprintf(t->cond_addr, sizeof t->cond_addr, "%s", jca->str);
++            else if (jca) snprintf(t->cond_addr, sizeof t->cond_addr, "0x%llX", (unsigned long long)jca->num);
++            t->cond_type = type_of(jct && jct->t == JN_STR ? jct->str : NULL);
++            if (t->cond_type < 0) t->cond_type = T_U32;
++            jn* jv = j_get(jc, "eq"); if (!jv) { jv = j_get(jc, "ne"); t->cond_ne = 1; }
++            t->has_cond = jca && j_num(jv, &t->cf, &t->ci);
++        }
++        s_ntw++;
++    }
++
++    jn* dl = j_get(root, "dumps");
++    cnt = 0; for (jn* e = dl ? dl->kid : NULL; e; e = e->next) cnt++;
++    s_dp = (tdump*)calloc(cnt ? cnt : 1, sizeof *s_dp);
++    for (jn* e = dl ? dl->kid : NULL; e; e = e->next) {
++        tdump* p = &s_dp[s_ndp]; double d; unsigned long long u;
++        jn* ja = j_get(e, "addr"); jn* jf = j_get(e, "file");
++        if (!ja || !jf || jf->t != JN_STR || !j_num(j_get(e, "len"), &d, &u)) continue;
++        p->len = (u32)u;
++        if (ja->t == JN_STR) snprintf(p->addr, sizeof p->addr, "%s", ja->str);
++        else snprintf(p->addr, sizeof p->addr, "0x%llX", (unsigned long long)ja->num);
++        snprintf(p->file, sizeof p->file, "%s", jf->str);
++        if (j_num(j_get(e, "at_flip"), &d, &u)) p->at_flip = (u32)u;
++        s_ndp++;
++    }
++    jn* wl = j_get(root, "watch");
++    cnt = 0; for (jn* e = wl ? wl->kid : NULL; e; e = e->next) cnt++;
++    s_wt = (twatch*)calloc(cnt ? cnt : 1, sizeof *s_wt);
++    for (jn* e = wl ? wl->kid : NULL; e; e = e->next) {
++        twatch* w = &s_wt[s_nwt]; jn* ja = j_get(e, "addr"); jn* jt = j_get(e, "type"); jn* jnm = j_get(e, "name");
++        if (!ja) continue;
++        if (ja->t == JN_STR) snprintf(w->addr, sizeof w->addr, "%s", ja->str);
++        else snprintf(w->addr, sizeof w->addr, "0x%llX", (unsigned long long)ja->num);
++        w->type = type_of(jt && jt->t == JN_STR ? jt->str : NULL); if (w->type < 0) w->type = T_U32;
++        snprintf(w->name, sizeof w->name, "%s", jnm && jnm->t == JN_STR ? jnm->str : w->addr);
++        s_nwt++;
++    }
++    s_insn_list = j_get(root, "insn");
++    s_insn_pending = s_insn_list != NULL;
++    s_state = 1;
++    int nin = 0; for (jn* e = s_insn_list ? s_insn_list->kid : NULL; e; e = e->next) nin++;
++    fprintf(stderr, "[TWEAK] HSG_TWEAKS=%s: %d tweaks, %d dumps, %d insn entries\n", path, s_ntw, s_ndp, nin);
++    for (int i = 0; i < s_ntw; i++)
++        fprintf(stderr, "[TWEAK]   #%d '%s' %s %s = %.9g when=%s flips[%u,%u)%s\n", i, s_tw[i].name, s_tw[i].addr,
++                k_tname[s_tw[i].type], (s_tw[i].type == T_F32 || s_tw[i].type == T_F64) ? s_tw[i].fval : (double)(long long)s_tw[i].ival,
++                s_tw[i].when == W_BOOT ? "boot" : s_tw[i].when == W_ONCE ? "once" : "frame",
++                s_tw[i].from_flip, s_tw[i].to_flip, s_tw[i].has_cond ? " (conditional)" : "");
++    fflush(stderr);
++}
++
++void hsg_tweaks_boot(void)
++{
++    if (s_state < 0) load();
++    if (s_state <= 0) return;
++    if (s_insn_pending) { apply_insn(); s_insn_pending = 0; }
++    for (int i = 0; i < s_ntw; i++) {
++        tweak* t = &s_tw[i];
++        if (t->when != W_BOOT || t->done) continue;
++        const char* p = t->addr; u32 a;
++        if (a_expr(&p, &a) <= 0) { fprintf(stderr, "[TWEAK] boot '%s': address %s did not resolve\n", t->name, t->addr); continue; }
++        write_tweak(t, a, "boot"); t->done = 1;
++    }
++}
++
++void hsg_tweaks_tick(void)
++{
++    if (s_state < 0) load();
++    if (s_state <= 0) return;
++    if (s_insn_pending) { apply_insn(); s_insn_pending = 0; }
++    const u32 fl = cellGcm_flip_request_count();
++    for (int i = 0; i < s_ntw; i++) {
++        tweak* t = &s_tw[i];
++        if (t->done || t->when == W_BOOT) continue;
++        if (fl < t->from_flip || (t->to_flip && fl >= t->to_flip)) continue;
++        if (!cond_ok(t)) continue;
++        const char* p = t->addr; u32 a;
++        if (a_expr(&p, &a) <= 0) continue;
++        write_tweak(t, a, t->when == W_ONCE ? "once" : "frame");
++        if (t->when == W_ONCE) t->done = 1;
++    }
++    for (int i = 0; i < s_nwt; i++) {
++        twatch* w = &s_wt[i];
++        const char* p = w->addr; u32 a;
++        if (a_expr(&p, &a) <= 0) continue;
++        const tval v = rd_val(a, w->type);
++        if (w->have && v.u == w->last) continue;
++        w->have = 1; w->last = v.u;
++        if (w->n++ < 64) {
++            char b[48]; fmt_val(b, sizeof b, w->type, v);
++            fprintf(stderr, "[TWEAK] watch '%s' 0x%08X = %s (flip %u)\n", w->name, a, b, fl);
++            fflush(stderr);
++        }
++    }
++    for (int i = 0; i < s_ndp; i++) {
++        tdump* d = &s_dp[i];
++        if (d->done || fl < d->at_flip) continue;
++        const char* p = d->addr; u32 a;
++        if (a_expr(&p, &a) <= 0) continue;
++        d->done = 1;
++        FILE* f = fopen(d->file, "wb");
++        if (!f) { fprintf(stderr, "[TWEAK] dump %s: cannot write\n", d->file); continue; }
++        fwrite(vm_ptr8(a), 1, d->len, f);
++        fclose(f);
++        fprintf(stderr, "[TWEAK] dump 0x%08X+0x%X -> %s (flip %u)\n", a, d->len, d->file, fl);
++        fflush(stderr);
++    }
++}
