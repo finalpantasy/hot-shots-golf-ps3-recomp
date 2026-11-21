@@ -77,3 +77,28 @@ The executable expects the US title ID `NPUA80864` in `PARAM.SFO`. On Windows it
 | 0 | Normal exit, `--help`, `--version`, or `--exit-after` |
 | 1 | Startup failed because of game files, paths, or runtime initialization |
 | 2 | Bad command-line option |
+
+## Settings launcher
+
+`tools/hsg_launcher.py` is a small settings window, so you do not have to type flags or environment variables. It needs only Python 3 (Tkinter comes with it). From the project folder:
+
+```
+.venv/Scripts/python.exe tools/hsg_launcher.py
+```
+
+The window has four tabs. Display holds resolution, aspect mode and window mode (windowed, fullscreen or hidden). Textures holds the HD pack folder, its memory budget and the texture dump folder. Frame rate holds the experimental frame rate choice. Advanced holds the exe path, the guest tweaks file, mute, the game, hdd0, hdd1, save and dev_flash folders, and a box for extra arguments. A blank path means the default from the table above, and the launcher passes no flag for it.
+
+Press Check to see the exact command, or Save and Play to save and start the game. If `HotShotsGolfRecomp.exe` or `EBOOT.elf` is missing, the window shows the missing path in red and does not start. Settings go in `hsg_settings.json` next to the launcher. Use Settings folder (or `--settings <file or folder>`) to keep the file elsewhere.
+
+Without a window:
+
+```
+python tools/hsg_launcher.py --print-command   # print the command and environment, do not start
+python tools/hsg_launcher.py --run             # start the game from the saved settings
+```
+
+Experimental items are marked in the window. They are shown even where the current build does not support them yet:
+
+- Aspect `expand` is planned for patch 0055. Current builds accept only `stretch` and `fit`, and exit with code 2 on `expand`.
+- Frame rate (`HSG_FPS`) is in progress. Nothing in the code reads it yet, so it has no effect.
+- Guest tweaks (`HSG_TWEAKS=<file.json>`) come from patch 0059. They write game memory values while the title runs.
