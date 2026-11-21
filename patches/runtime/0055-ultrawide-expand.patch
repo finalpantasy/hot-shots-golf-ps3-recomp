@@ -1,0 +1,240 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 2e86821..119a6e9 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -250,6 +250,7 @@ typedef struct {
+     u32   srv_win;      /* SRV heap index of this draw's t0-t15 window */
+     ID3D12PipelineState* pso_pre;   /* vp_get_fp_pso result from the pre-pass */
+     u32   pso_tag;      /* fp_tag() when pso_pre was taken; 0 = none */
++    int   expand_clip;  /* RSX_ASPECT=expand: 2D kept in the centered 16:9 area, scissored to it */
+ } D3D12DrawRecord;
+ 
+ /* Capture-only: the guest draw call behind each record, for the rsxcap manifest. */
+@@ -362,6 +363,7 @@ typedef struct {
+     ID3DBlob* vs;
+     int uses_c03;
+     u32 in_mask;            /* attributes the program reads (0xFFFF if not exact) */
++    int pos_rx, pos_rw;     /* o0.x / o0.w = dot4(v0, vp_c[row]), else -1 (RSX_ASPECT=expand) */
+ } VPVSEntry;
+ #define VP_VS_CACHE 128 /* wave uses 5+ distinct VPs; at 4 the cache
+                          * thrashed every frame and eviction shifted slots
+@@ -2415,7 +2417,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+                               if (x < lo[c]) lo[c] = x; if (x > hi[c]) hi[c] = x; } }
+                 { static const char* cb = (const char*)1; static u32 want = 0;
+                   if (cb == (const char*)1) { cb = getenv("RSX_CAP_CB"); want = cb ? (u32)strtoul(cb, NULL, 16) : 0; }
+-                  int hit = 0;
++                  int hit = cb && !strcmp(cb, "display") && dr_is_display_draw(r);   /* every display draw */
+                   for (int u = 0; u < 16; u++) if (want && r->tex[u].set && r->tex[u].raw == want) hit = 1;
+                   { static int sbw = -2;   /* RSX_CAP_SRCBLEND: the matching draws too */
+                     if (sbw == -2) { const char* e = getenv("RSX_CAP_SRCBLEND"); sbw = e ? atoi(e) : -1; }
+@@ -2544,6 +2546,37 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+            (unsigned long long)s_d3d.frame_count, dir, ndraws);
+ }
+ 
++/* RSX_ASPECT=expand: the constant rows a vertex program builds its clip x and
++ * w from, when it writes each lane of o[0] exactly once as
++ *     o[0].c = dot4(v[0], vp_c[N])
++ * (the game's 2D program does: rows 396..399). -1 when it does anything else.
++ * vp_record_cb uses them to find a 2D draw's clip-space extent on the CPU. */
++static void vs_pos_rows(const char* hlsl, int* rx, int* rw)
++{
++    *rx = *rw = -1;
++    int n = 0;
++    for (const char* q = hlsl; (q = strstr(q, "o[0].")) != NULL; q += 5) n++;
++    if (n != 4) return;
++    for (int lane = 0; lane < 2; lane++) {
++        char tail[48];
++        snprintf(tail, sizeof tail, "o[0].%c = _v.%c;", lane ? 'w' : 'x', lane ? 'w' : 'x');
++        const char* t = strstr(hlsl, tail);
++        if (!t) return;
++        const char* head = "vp_dot4(((v[0]).xyzw),((vp_c[";
++        const char* best = NULL;
++        for (const char* q = hlsl; (q = strstr(q, head)) != NULL && q < t; q++) best = q;
++        if (!best) return;
++        const char* e = best + strlen(head);
++        int row = atoi(e);
++        e = strstr(e, "]).xyzw)));");
++        if (!e || row < 0 || row >= 512) return;
++        e += strlen("]).xyzw)));");
++        while (e < t && (*e == ' ' || *e == '\r' || *e == '\n' || *e == '\t')) e++;
++        if (e != t) return;
++        if (lane) *rw = row; else *rx = row;
++    }
++}
++
+ /* Decompile the captured RSX vertex program to HLSL and build the VP PSO
+  * (decompiled VS + atlas alpha-test PS). One-shot per program. */
+ static void compile_vp(void)
+@@ -2821,6 +2854,10 @@ static int vp_get_vs_impl(const rsx_state* st)
+     static char hlsl[262144];
+     int ni = rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
+     if (ni <= 0) return -1;
++    { const char* dd = getenv("VP_DUMP_DIR");   /* every per-draw VS, by hash */
++      if (dd && *dd) { char fp[400]; CreateDirectoryA(dd, NULL);
++          snprintf(fp, sizeof fp, "%s/vs_%08X.hlsl", dd, hash);
++          FILE* f = fopen(fp, "w"); if (f) { fputs(hlsl, f); fclose(f); } } }
+     if (getenv("VP_DUMP")) { static int _d=0; if (PS3_LOG_FIRST(_d, 4)) {
+         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
+         if (f) { fprintf(f, "/* per-draw VS hash pending, %d instrs */%s%s", ni, hlsl, "\n"); fclose(f); } } }
+@@ -2913,6 +2950,7 @@ static int vp_get_vs_impl(const rsx_state* st)
+     s_d3d.vp_vs[slot].uses_c03 =
+         (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
+          strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
++    vs_pos_rows(hlsl, &s_d3d.vp_vs[slot].pos_rx, &s_d3d.vp_vs[slot].pos_rw);
+     /* RSX_VB_PACK: the attributes this VS reads. The compiled shader's own
+      * input signature is the authority -- it lists exactly the ATTRn the GPU
+      * will fetch -- with the ucode analysis as the fallback and all 16 when
+@@ -3648,13 +3686,107 @@ static int wpos_scale_on(void)
+     return v;
+ }
+ 
+-static int aspect_fit_on(void)
++/* RSX_ASPECT (--aspect): unset = the guest picture stretched over the window;
++ * "fit" = kept at 16:9 and centered (pillarbox or letterbox); "expand" = Hor+
++ * on windows wider than 16:9: display draws that cover the whole guest
++ * surface (the 3D scene, the HUD, full-screen 2D) get the full window width
++ * and their clip-space x is divided by aspect_expand_k() (window aspect /
++ * 16:9), so the vertical field of view stays and the 3D scene shows more at
++ * the sides while 2D keeps its proportions in the centered 16:9 area. A
++ * 16:9 window gives k = 1 (the default output); a narrower one gives "fit". */
++static int aspect_mode(void)
+ {
+     static int v = -1;
+-    if (v < 0) { const char* e = getenv("RSX_ASPECT"); v = e && !strcmp(e, "fit"); }
++    if (v < 0) {
++        const char* e = getenv("RSX_ASPECT");
++        v = !e ? 0 : !strcmp(e, "fit") ? 1 : !strcmp(e, "expand") ? 2 : 0;
++        if (v) fprintf(stderr, "[aspect] RSX_ASPECT=%s%c", e, 10);
++    }
+     return v;
+ }
+ 
++static int aspect_fit_on(void) { return aspect_mode() != 0; }
++
++static float aspect_expand_k(void)
++{
++    if (aspect_mode() != 2 || !s_d3d.width || !s_d3d.height) return 1.0f;
++    const float k = ((float)s_d3d.width / (float)s_d3d.height) / (16.0f / 9.0f);
++    return k > 1.002f ? k : 1.0f;
++}
++
++/* Expand mode: a display draw whose guest viewport spans the whole surface
++ * width. It gets the full window width (render_frame) and x / k (b0). */
++static int expand_wide_draw(const D3D12DrawRecord* dr)
++{
++    if (!dr || dr->rt_off || dr->no_color || aspect_expand_k() <= 1.0f) return 0;
++    if (dr->surf_w < 16 || dr->surf_h < 16 || dr->surf_w > 4096 || dr->surf_h > 4096) return 0;
++    if (!dr->vp_w || !dr->vp_h) return 1;          /* no guest viewport: the whole target */
++    return dr->vp_x == 0 && dr->vp_w >= dr->surf_w;
++}
++
++/* RSX_ASPECT_HUD=edges: also move 2D elements that lie wholly in the left or
++ * right third of the 16:9 picture out to the window edge on their side.
++ * Default (center): the HUD stays in the centered 16:9 area, where the 2D
++ * markers the game places over 3D objects (gauge, yardage) still line up. */
++static int expand_hud_edges(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_ASPECT_HUD"); v = e && !strcmp(e, "edges"); }
++    return v;
++}
++
++/* Expand mode, per whole-surface display draw (b0 epilogue: pos.x = x * s +
++ * w * o). Default s = 1/k: Hor+ for 3D, centered 16:9 for 2D. A 2D draw --
++ * the program's clip w row is (0,0,0,1) -- gets its clip-space x extent from
++ * its vertices on the CPU: one that spans the whole 16:9 width (a fade, a
++ * menu backdrop, the saved course picture behind the shot close-up) keeps
++ * s = 1 and fills the window; with RSX_ASPECT_HUD=edges an element wholly in
++ * an outer third is offset to that window edge. */
++static void expand_wide_cb(D3D12DrawRecord* dr, int vs_idx, const float* c, float* vpx)
++{
++    const float k = aspect_expand_k();
++    vpx[0] = 1.0f / k;
++    dr->expand_clip = 0;
++    if (!dr->is_vp || vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n || !s_d3d.vp_vb_mapped) return;
++    const int rx = s_d3d.vp_vs[vs_idx].pos_rx, rw = s_d3d.vp_vs[vs_idx].pos_rw;
++    if (rx < 0 || rw < 0) return;
++    const float* cw = c + rw * 4;
++    if (cw[0] != 0.0f || cw[1] != 0.0f || cw[2] != 0.0f || cw[3] != 1.0f) return;   /* not 2D */
++    if (!dr->vertex_count || dr->vertex_count > 256) return;
++    const u32 rm = (vb_pack_on() && dr->pk_mask) ? dr->pk_mask : 0xFFFFu;
++    const u64 end = (u64)dr->vb_byte_offset + (u64)dr->vertex_count * pk_stride_of(rm);
++    if (end > (u64)VP_HALF) return;
++    const u8* vb = (const u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * VP_HALF + dr->vb_byte_offset;
++    const float* cx = c + rx * 4;
++    float lo = 1e30f, hi = -1e30f;
++    for (u32 v = 0; v < dr->vertex_count; v++) {
++        const float* a = pk_rec_attr(vb, rm, v, 0);
++        if (a[3] != 1.0f) return;
++        const float x = a[0] * cx[0] + a[1] * cx[1] + a[2] * cx[2] + cx[3];
++        if (x < lo) lo = x;
++        if (x > hi) hi = x;
++    }
++    if (lo <= -0.98f && hi >= 0.98f) { vpx[0] = 1.0f; return; }   /* full width */
++    if (expand_hud_edges() && hi <= -1.0f / 3.0f) vpx[4] = -(1.0f - 1.0f / k);
++    else if (expand_hud_edges() && lo >= 1.0f / 3.0f) vpx[4] = 1.0f - 1.0f / k;
++    else dr->expand_clip = 1;
++}
++
++/* Expand mode: a display sub-viewport (the hole-number flag, the wind and
++ * ball-lie insets) keeps its 16:9 size and place; with RSX_ASPECT_HUD=edges it
++ * moves to the window edge on its side: -x0 in the left third, +x0 in the
++ * right third, 0 in the middle (x0 = the pillar width fit would use). */
++static float expand_inset_shift(const D3D12DrawRecord* dr)
++{
++    if (!dr || dr->rt_off || dr->no_color || expand_wide_draw(dr) || !dr->vp_w) return 0.0f;
++    if (!expand_hud_edges()) return 0.0f;
++    const float k = aspect_expand_k();
++    if (k <= 1.0f || dr->surf_w < 16 || dr->surf_w > 4096) return 0.0f;
++    const float x0 = ((float)s_d3d.width - (float)s_d3d.width / k) * 0.5f;
++    const float cx = (float)dr->vp_x + (float)dr->vp_w * 0.5f, sw = (float)dr->surf_w;
++    return cx < sw / 3.0f ? -x0 : cx > sw * 2.0f / 3.0f ? x0 : 0.0f;
++}
++
+ static void display_rect(float* x, float* y, float* w, float* h)
+ {
+     *x = 0.0f; *y = 0.0f;
+@@ -5324,7 +5456,7 @@ static void vp_record_cb_impl(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+             if (vsc && (dr->surf_w != (u32)dw || dr->surf_h != (u32)dh)) {
+                 ts[3] = (float)dr->surf_w / dw;
+                 ts[7] = (float)dr->surf_h / dh;
+-                ts[11] = -dx * ts[3];
++                ts[11] = -(dx + expand_inset_shift(dr)) * ts[3];
+                 ts[15] = -dy * ts[7];
+             }
+         }
+@@ -5431,6 +5563,10 @@ static void vp_record_cb_impl(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+     vpx[4] = vpx[5] = vpx[7] = 0.0f;
+     if (vs_[2] != 0.0f) { vpx[2] = vs_[2]; vpx[6] = vo_[2]; }
+     else                { vpx[2] = 1.0f;   vpx[6] = 0.0f;   }
++    /* RSX_ASPECT=expand: a whole-surface display draw is drawn over the full
++     * window width with x / k -- Hor+ for the 3D scene, centered 16:9 for 2D
++     * (full-width 2D stretched; see expand_wide_cb). */
++    if (expand_wide_draw(dr)) expand_wide_cb((D3D12DrawRecord*)dr, vs_idx, (const float*)dst, vpx);
+     /* DBG_ZOOM=<k> with DBG_CENTER="cx,cy": a debug camera applied in CLIP space,
+      * not a framebuffer crop -- the geometry is re-rasterized at full resolution.
+      * The shader epilogue already computes
+@@ -8234,9 +8370,23 @@ static void render_frame(void)
+                         dvp.Width    = gw;
+                         dvp.Height   = gh;
+                     }
++                    /* RSX_ASPECT=expand: whole-surface display draws span the
++                     * window (their x is scaled by 1/k in b0); with
++                     * RSX_ASPECT_HUD=edges sub-viewports move to the window
++                     * edge on their side. Centered 2D keeps the 16:9 scissor,
++                     * so scrolling captions and slide-ins stay hidden past
++                     * the picture edge as on a 16:9 screen. */
++                    const int xw = cur_rt < 0 && !cur_nc && expand_wide_draw(dr);
++                    if (xw) { dvp.TopLeftX = 0.0f; dvp.Width = (float)s_d3d.width; }
++                    else if (cur_rt < 0 && !cur_nc) dvp.TopLeftX += expand_inset_shift(dr);
+                     D3D12_RECT dsc = {(LONG)dvp.TopLeftX, (LONG)dvp.TopLeftY,
+                                       (LONG)(dvp.TopLeftX + dvp.Width),
+                                       (LONG)(dvp.TopLeftY + dvp.Height)};
++                    if (xw && dr->expand_clip) {
++                        const float cw = (float)s_d3d.width / aspect_expand_k();
++                        dsc.left  = (LONG)(((float)s_d3d.width - cw) * 0.5f + 0.5f);
++                        dsc.right = dsc.left + (LONG)(cw + 0.5f);
++                    }
+                     dvp_x = dvp.TopLeftX; dvp_y = dvp.TopLeftY;
+                     dvp_w = dvp.Width;    dvp_h = dvp.Height;
+                     if (wpos_dbg_on() && dr->fp_addr && fp_reads_wpos(dr->fp_addr)) {
