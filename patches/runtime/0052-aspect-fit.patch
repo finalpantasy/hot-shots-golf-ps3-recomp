@@ -1,0 +1,120 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 52e5d16..472fba0 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -3648,6 +3648,29 @@ static int wpos_scale_on(void)
+     return v;
+ }
+ 
++static int aspect_fit_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_ASPECT"); v = e && !strcmp(e, "fit"); }
++    return v;
++}
++
++static void display_rect(float* x, float* y, float* w, float* h)
++{
++    *x = 0.0f; *y = 0.0f;
++    *w = (float)s_d3d.width; *h = (float)s_d3d.height;
++    if (!aspect_fit_on() || !s_d3d.width || !s_d3d.height) return;
++    const float want = 16.0f / 9.0f;
++    const float have = (float)s_d3d.width / (float)s_d3d.height;
++    if (have > want) {
++        *w = (float)s_d3d.height * want;
++        *x = ((float)s_d3d.width - *w) * 0.5f;
++    } else if (have < want) {
++        *h = (float)s_d3d.width / want;
++        *y = ((float)s_d3d.height - *h) * 0.5f;
++    }
++}
++
+ /* Route every WPOS read through _rsx_wpos_s, which scales the host position
+  * by rsx_texscale[0].w / [1].w when they are set. Needs the cbuffer that
+  * fp_rebind_b1 declares; the helper goes right after it. */
+@@ -3659,8 +3682,8 @@ static int fp_apply_wpos_scale(char* hlsl, size_t cap)
+     static const char helper[] =
+         "float4 _rsx_wpos_s(float4 p) {\n"
+         "    return rsx_texscale[0].w != 0.0\n"
+-        "        ? float4(p.x * rsx_texscale[0].w,\n"
+-        "                 p.y * rsx_texscale[1].w, p.z, p.w) : p;\n"
++        "        ? float4(p.x * rsx_texscale[0].w + rsx_texscale[2].w,\n"
++        "                 p.y * rsx_texscale[1].w + rsx_texscale[3].w, p.z, p.w) : p;\n"
+         "}\n";
+     if (strstr(hlsl, "_rsx_wpos_s(")) return -1;
+     char* at = strstr(hlsl, anchor);
+@@ -5293,13 +5316,16 @@ static void vp_record_cb_impl(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+         /* WPOS guest/host ratio (see fp_apply_wpos_scale): a display draw the
+          * draw loop scales from the guest surface to the backbuffer. */
+         if (dr && !dr->rt_off && !dr->no_color && wpos_scale_on() &&
+-            dr->surf_w >= 16 && dr->surf_h >= 16 && dr->surf_w <= 4096 && dr->surf_h <= 4096 &&
+-            (dr->surf_w != s_d3d.width || dr->surf_h != s_d3d.height)) {
++            dr->surf_w >= 16 && dr->surf_h >= 16 && dr->surf_w <= 4096 && dr->surf_h <= 4096) {
+             static int vsc = -1;
+             if (vsc < 0) { const char* e = getenv("RSX_VP_SCALE"); vsc = (e && e[0] == '0') ? 0 : 1; }
+-            if (vsc) {
+-                ts[3] = (float)dr->surf_w / (float)s_d3d.width;
+-                ts[7] = (float)dr->surf_h / (float)s_d3d.height;
++            float dx, dy, dw, dh;
++            display_rect(&dx, &dy, &dw, &dh);
++            if (vsc && (dr->surf_w != (u32)dw || dr->surf_h != (u32)dh)) {
++                ts[3] = (float)dr->surf_w / dw;
++                ts[7] = (float)dr->surf_h / dh;
++                ts[11] = -dx * ts[3];
++                ts[15] = -dy * ts[7];
+             }
+         }
+         /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
+@@ -6917,8 +6943,11 @@ static void scanout_auto_present(u32 fi)
+      * buffer copied 1:1 left the loading flips black on the right. */
+     static int vsc = -1;
+     if (vsc < 0) { const char* e = getenv("RSX_VP_SCALE"); vsc = (e && e[0] == '0') ? 0 : 1; }
+-    const u32 dw = (vsc || gw > s_d3d.width)  ? s_d3d.width  : gw;
+-    const u32 dh = (vsc || gh > s_d3d.height) ? s_d3d.height : gh;
++    float fx, fy, fw, fh;
++    display_rect(&fx, &fy, &fw, &fh);
++    const u32 dx = (u32)(fx + 0.5f), dy = (u32)(fy + 0.5f);
++    const u32 dw = (vsc || gw > (u32)fw) ? (u32)fw : gw;
++    const u32 dh = (vsc || gh > (u32)fh) ? (u32)fh : gh;
+     if (!dw || !dh) return;
+     const u32 up_pitch = (dw * 4u + 255u) & ~255u;   /* 256-byte rows */
+     static ID3D12Resource* up = NULL;
+@@ -6979,7 +7008,7 @@ static void scanout_auto_present(u32 fi)
+     sl.PlacedFootprint.Footprint.Height   = dh;
+     sl.PlacedFootprint.Footprint.Depth    = 1;
+     sl.PlacedFootprint.Footprint.RowPitch = up_pitch;
+-    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dl, 0, 0, 0, &sl, NULL);
++    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dl, dx, dy, 0, &sl, NULL);
+ 
+     gb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+     gb.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+@@ -8172,11 +8201,13 @@ static void render_frame(void)
+                 {
+                     float tw = (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].w : (float)s_d3d.width;
+                     float th = (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].h : (float)s_d3d.height;
++                    float ox = 0.0f, oy = 0.0f;
++                    if (cur_rt < 0 && !cur_nc) display_rect(&ox, &oy, &tw, &th);
+                     if (cur_nc && cur_z >= 0) {
+                         tw = (float)s_d3d.off_ds[cur_z].w;
+                         th = (float)s_d3d.off_ds[cur_z].h;
+                     }
+-                    D3D12_VIEWPORT dvp = {0, 0, tw, th, 0.0f, 1.0f};
++                    D3D12_VIEWPORT dvp = {ox, oy, tw, th, 0.0f, 1.0f};
+                     /* The backbuffer stands in for a display surface of the
+                      * guest's own size (1600x1080 here). Full-surface passes
+                      * failed the bounds test below and fell back to the full
+@@ -8193,11 +8224,11 @@ static void render_frame(void)
+                           dr->surf_w <= 4096 && dr->surf_h <= 4096 &&
+                           ((float)dr->surf_w != tw || (float)dr->surf_h != th)) {
+                           const float sx = tw / (float)dr->surf_w, sy = th / (float)dr->surf_h;
+-                          gx *= sx; gw *= sx; gy *= sy; gh *= sy;
++                          gx = ox + gx * sx; gw *= sx; gy = oy + gy * sy; gh *= sy;
+                       } }
+                     if (gw >= 1.0f && gh >= 1.0f &&
+-                        gx + gw <= tw + 0.5f &&
+-                        gy + gh <= th + 0.5f) {
++                        gx + gw <= ox + tw + 0.5f &&
++                        gy + gh <= oy + th + 0.5f) {
+                         dvp.TopLeftX = gx;
+                         dvp.TopLeftY = gy;
+                         dvp.Width    = gw;
