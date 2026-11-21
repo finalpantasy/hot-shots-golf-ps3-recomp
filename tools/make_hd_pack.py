@@ -213,6 +213,7 @@ def main():
                     help='output scale for sources wider or taller than 256px (default 2; 4 permits 4K)')
     ap.add_argument('--wrap-k', type=float, default=2.2, help='wrap pad an axis when seam delta <= k*inner delta + 2')
     ap.add_argument('--prev-k', type=float, default=2.2, help='k used for outputs that have no manifest entry')
+    ap.add_argument('--bleed-thr', type=int, default=128, help='bleed fills RGB of texels with alpha below this (8 for soft/blended effect textures)')
     ap.add_argument('--only-alpha', action='store_true', help='process only textures that have an alpha channel')
     ap.add_argument('--no-match', action='store_true', help='skip the post-upscale colour match')
     ap.add_argument('--rematch', action='store_true', help='only colour-match the files already in --out (no upscaling)')
@@ -285,7 +286,7 @@ def main():
             shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
         for t in b:
             ff(t['path'], os.path.join(din, t['n']), t['g'])
-            if t['alpha']: bleed_rgb(os.path.join(din, t['n']))
+            if t['alpha']: bleed_rgb(os.path.join(din, t['n']), thr=a.bleed_thr)
         cmd = [exe, '-i', din, '-o', dout, '-n', a.model, '-f', 'png']
         if a.models: cmd += ['-m', a.models]
         t0 = time.time()
