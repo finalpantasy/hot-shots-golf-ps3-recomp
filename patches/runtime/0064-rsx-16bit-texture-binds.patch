@@ -1,0 +1,45 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -4686,6 +4686,21 @@
+     }
+ }
+ 
++/* RSX_TEX_MOREFMT (default on; =0 off): the packed 16-bit colours (A1R5G5B5,
++ * A4R4G4B4, R5G6B5, R5G5B5A1, X1R5G5B5), D8R8G8B8, the HILO pairs and
++ * W32Z32Y32X32_FLOAT are bound and uploaded too -- rsx_texture_layout decodes
++ * them. Left out of d3d12_bind_texture's list, the unit kept the previous
++ * draw's texture: Hot Shots Golf's HUD wind arrow (A4R4G4B4 32x64) sampled
++ * the tee-box grass of the ball-lie inset drawn just before it. Left out of
++ * the upload list, it would get no SRV and render black. */
++static int tex_fmt_more(u32 bf)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_TEX_MOREFMT"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v && (bf == 0x82 || bf == 0x83 || bf == 0x84 || bf == 0x97 || bf == 0x9D ||
++                 bf == 0x9E || bf == 0x8C || bf == 0x8D || bf == 0x9B);
++}
++
+ /* ---- TEX_DUMP / TEX_REPLACE (see rsx_texrep.inc) --------------------------- */
+ #include "rsx_texrep.inc"
+ 
+@@ -7990,7 +8005,8 @@
+                 if (dr->tex[_u].off &&
+                     (_bf == 0x81 || _bf == 0x85 || _bf == 0x8B ||
+                      (_bf >= 0x86 && _bf <= 0x88) || _bf == 0x9A ||
+-                     _bf == 0x94 || _bf == 0x95 || _bf == 0x9C || _bf == 0x9F)) {
++                     _bf == 0x94 || _bf == 0x95 || _bf == 0x9C || _bf == 0x9F ||
++                     tex_fmt_more(_bf))) {
+                     double _tt = pf2_on() ? perf_now() : 0.0;
+                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
+                     const unsigned long long _up0 = s_texck[6], _ut0 = __rdtsc();
+@@ -11783,6 +11799,9 @@
+           * it every glyph drew as a solid quad), Y16_X16, X32_FLOAT and
+           * Y16_X16_FLOAT (its post-process intermediates). */
+          base_fmt == 0x94 || base_fmt == 0x95 || base_fmt == 0x9C || base_fmt == 0x9F ||
++         /* Packed 16-bit colours, D8R8G8B8, HILO, W32Z32Y32X32_FLOAT
++          * (tex_fmt_more; RSX_TEX_MOREFMT=0 restores the old list). */
++         tex_fmt_more(base_fmt) ||
+          /* Depth formats (DEPTH24_D8, DEPTH16 and their float forms): a
+           * depth surface sampled as a texture, a shadow map. Dropping them
+           * left the unit holding whatever was bound before, or nothing, and
