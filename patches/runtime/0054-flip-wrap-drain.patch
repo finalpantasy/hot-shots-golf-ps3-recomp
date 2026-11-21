@@ -1,0 +1,81 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 825c468..b1575a3 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -3687,6 +3687,68 @@
+          * progress like cellGcm_fifo_recycle. GCM_FLIP_WRAP_WAIT=0 skips it. */
+         static int wrap_wait = -1;
+         if (wrap_wait < 0) { const char* e = getenv("GCM_FLIP_WRAP_WAIT"); wrap_wait = (e && e[0] == '0') ? 0 : 1; }
++        /* The half test above is not enough. Official 1.03 stalled with the
++         * walker at 0xCFB3C, two bytes past half (0xCFB3A): no wait, and the
++         * walker had not yet even seen `put` cover this lap's second frame.
++         * The guest then wrote the next lap's first frame from begin, a little
++         * longer than the old one, and flushed `put` to 0xCFCEC. The walker's
++         * next look saw put ahead of get in the same lap, walked the 0x1B0
++         * bytes between them (now new-lap commands) and stopped there. Nothing
++         * told it a lap had gone by, so the old lap's second frame, its flip
++         * marker and the JUMP back were never run, and the title waited in
++         * cellGcmGetFlipStatus for that flip forever. A ring has no lap count;
++         * on the PS3 the SDK's buffer-full callback prevents this by waiting
++         * for the RSX to come round before the CPU writes at begin again.
++         *
++         * Do that here: publish `put` up to this flip marker (the commands
++         * before it are complete; the title flushes them itself right after),
++         * then wait until the walker has executed everything before the
++         * marker. Once get sits at the marker, the next lap's `put` lands
++         * behind it, which the walker reads as a wrap, and the region the
++         * next lap overwrites has been consumed. The marker itself is left to
++         * the title's next flush: executed here, before gcm_flip_request
++         * marks the flip WAITING, its completion was consumed early and the
++         * title then waited on a status that never turned DONE. No flip is
++         * completed here. Bounded on the walker making no progress for 2 s,
++         * as cellGcm_fifo_recycle is. GCM_FLIP_WRAP_DRAIN=0 restores the half
++         * test below. */
++        static int wrap_drain = -1;
++        if (wrap_drain < 0) { const char* e = getenv("GCM_FLIP_WRAP_DRAIN"); wrap_drain = (e && e[0] == '0') ? 0 : 1; }
++        /* Wait for get to sit exactly on the marker (or the marker to have
++         * run), not merely for get to leave [begin, marker): the walker
++         * follows the title's CALLs into command blocks outside the ring
++         * (get=0x7662BC with the marker at 0x180C6C), and a range test read
++         * that as "done" and wrapped with the walker still a frame behind.
++         * The guards above keep get from being past the marker in this lap,
++         * so a get outside the ring is in a CALL or JUMP and comes back. */
++        const u32 put0 = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
++        if (wrap_wait && wrap_drain && put0 >= io_begin && put0 <= marker_io) {
++            static int s_drain_logs = 0;
++            const u32 get0 = s_fifo_getoff, fq = s_fifo_flips_queued;
++            if (put0 != marker_io) {
++                /* The commands before the marker in memory before `put`. */
++                atomic_thread_fence(memory_order_release);
++                vm_write32(GCM_CONTROL_GUEST_ADDR + 0, marker_io);
++            }
++            if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
++            int ms = 0, idle = 0;
++            u32 last_get = get0;
++            while (s_fifo_getoff != marker_io && s_fifo_flips_reached != fq && idle < 2000 && ms < 10000) {
++                Sleep(1); ms++;
++                if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
++                else idle++;
++            }
++            const int gave_up = s_fifo_getoff != marker_io && s_fifo_flips_reached != fq;
++            /* A give-up is the stall this wait exists to prevent: always say so.
++             * Otherwise the first few, then one line every 256 wraps. */
++            static unsigned s_drains = 0, s_gave_up = 0;
++            s_drains++; s_gave_up += (unsigned)gave_up;
++            if (PS3_LOG_FIRST(s_drain_logs, 4) || gave_up || (s_drains & 255u) == 0)
++                printf("[cellGcmSys] flip wrap drain #%u: marker io=0x%X, walker get=0x%X -> 0x%X after %d ms, "
++                       "fq=%u fr=%u, gave up %u%s%c",
++                       s_drains, marker_io, get0, s_fifo_getoff, ms, fq, s_fifo_flips_reached, s_gave_up,
++                       gave_up ? " -- WALKER MADE NO PROGRESS, WRAPPING ANYWAY: this flip may never complete" : "", 10);
++        } else {
+         const u32 io_cur = gcm_ea2io(cur);
+         const u32 half = io_begin + (io_cur - io_begin) / 2;
+         const u32 put_now = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+@@ -3709,6 +3771,7 @@
+                        get0, half, io_cur, ms, s_fifo_getoff,
+                        idle >= 2000 ? " -- walker stalled, wrapping anyway" : "", 10);
+         }
++        }
+         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
+         vm_write32(ctx + 8, begin);
+         return 1;
