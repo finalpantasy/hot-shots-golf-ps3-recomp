@@ -1,0 +1,408 @@
+{
+  "schema_version": 1,
+  "comment": "SPURS job images in the official 1.03 EBOOT. Fifteen are byte-identical to fixed 1.02 at relocated EAs; job 79D3C33093353269 changed to 967C7596863E15FD. Code ranges and strict lifting checks are retained from tools/spu_jobs.json.",
+  "input": "work/extracted/update-1.03/USRDIR/EBOOT.elf",
+  "jobs": [
+    {
+      "ea": "0x00CB5100",
+      "size": "0xE40",
+      "fingerprint": "3A3C233081147367",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x60",
+          "0xAC8"
+        ]
+      ],
+      "extra_entries": [
+        "0x138",
+        "0x16C"
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_3A3C233081147367_3648.bin",
+      "evidence": [
+        "First job of chain 0x11041700 ('chlib/spu/Spu.cpp'); dispatch MISS in work/runtime/logs/boot-fix-1.02-tocspill.log. TOC 0xD96990 holds (0x00CB3580, 0x00000E40).",
+        "0x00-0x20: crt entry (ila watermarks, br 0x18, br 0xE0).",
+        "0x20-0x60: data. 0xA5 fill, 'JOBCRT Ver14', bss end 0xE00 at 0x3C, bss start 0xC20 at 0x40, init flag at 0x44 (the crt stores 1 there).",
+        "0x60-0xAC8: code. Ends with 'bi $r0' at 0xAC4; 0xAC8-0xACC are stop 0 padding.",
+        "0xAD0-0xB6C: printf strings ('_exit() has been called', 'Error!! Memory error occurred'); 0xB80: 'JOBCRT Ver' compare key; 0xBA0: relocation list; 0xC00-0xC20: data; 0xC20-0xE00: bss cleared by the crt (Duff loop at 0x5E0); 0xE00-0xE40: '%SPURS JOB INFO%' trailer.",
+        "extra_entries: 0x138 is _exit() (ila $r4,0xAD0 then printf and stopd), reached by no direct branch; 0x16C is the epilogue after the stopd at 0x168. Both are lifted so every non-padding instruction in code_ranges is covered."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00D0BA80",
+      "size": "0xD020",
+      "fingerprint": "CB9BD0241BB0DE67",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x8CA0"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_CB9BD0241BB0DE67_53280.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "101 dispatch misses in boot-fix-1.02-guards2.log (job[0] eaBinary=0x00D09F00 size=53280). Code ends at 0x8CA0 (bi $r0 at 0x8C98, lnop); shuffle-mask/float data from 0x8CA0. Three inline switch tables (0x824, 0x747C, 0x7D64)."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CDF400",
+      "size": "0x8790",
+      "fingerprint": "FDFFAAC1BCD5352E",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x7E38"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_FDFFAAC1BCD5352E_34704.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "86 misses. EA from the dump's unique match in the EBOOT. Code ends at 0x7E38 (bi $r0 0x7E30, lnop); 0x7E38-0x7E40 zero, strings from 0x7E40. Three inline switch tables (0xB4, 0x50EC, 0x6A1C)."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CF8C80",
+      "size": "0x2510",
+      "fingerprint": "ABD49FC58F53F368",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x22F8"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_ABD49FC58F53F368_9488.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "9 misses. EA from the dump's unique match in the EBOOT. Code ends at 0x22F8 (bi $r0 0x22F0, lnop); strings from 0x2300."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CB5F80",
+      "size": "0xFD90",
+      "fingerprint": "F523F26F69764538",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0xDD70"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_F523F26F69764538_64912.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "5 misses (job[0] eaBinary=0x00CB4400 size=64912; TOC 0xDB6968 says 0xFD88, the descriptor rounds to 16). Code ends at 0xDD70 (bi $r0 0xDD68, lnop); '*** sgx-work...' strings from 0xDD70.",
+        "extra_entries: function starts reached by no direct branch, each right after a return/branch plus padding: 0x230C (leaf, lqd $r12,0x5E0($r3) ... bi $r0), 0x99D4 (prologue stqd $r80..$r84, $r0, $r126), 0xCCD8 (leaf shli/il/a/bi $r0), 0xCE48, 0xCEE8, 0xCFE8 (hbrr; stqd $r126; ila; brsl $r126 PIC prologue). No absolute pointer to any of them exists in the image; lifted so the code ranges are fully covered."
+      ],
+      "extra_entries": [
+        "0x230C",
+        "0x99D4",
+        "0xCCD8",
+        "0xCE48",
+        "0xCEE8",
+        "0xCFE8"
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CC5D80",
+      "size": "0x3610",
+      "fingerprint": "1B6BDAC375C5438D",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x3170"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_1B6BDAC375C5438D_13840.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "3 misses. EA from the dump's unique match in the EBOOT. Code ends at 0x3170 (bi $r0 0x3168, lnop); strings from 0x3170."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CEC880",
+      "size": "0x6090",
+      "fingerprint": "49C1D6C47E80AF43",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x5730"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_49C1D6C47E80AF43_24720.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "Miss on job 0x1192CB80 in boot-fix-1.02-ab-fallback-off.log. Code ends at 0x5730 (helper bi $r0 0x5728, lnop); float data from 0x5730. EA from the dump's unique match in the EBOOT.",
+        "extra_entries: 0x50 is an empty function (bi $r0; lnop) right after the empty function at 0x48; no direct branch reaches it."
+      ],
+      "extra_entries": [
+        "0x50"
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CCD880",
+      "size": "0x11b10",
+      "fingerprint": "5DA195169669A5FF",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x11610"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_5DA195169669A5FF_72464.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "Miss on job 0x1192CB80 in boot-fix-1.02-ab-fallback-off.log. Code ends at 0x11610; strings (socedly) from 0x11610. EA from the dump's unique match in the EBOOT."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CE7C00",
+      "size": "0x4c20",
+      "fingerprint": "80435D36E623FAA0",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x4670"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_80435D36E623FAA0_19488.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "Miss on job 0x1192CB80 in boot-fix-1.02-ab-fallback-off.log. Code ends at 0x4670; float data from 0x4670. EA from the dump's unique match in the EBOOT.",
+        "extra_entries: 0x39F8 is a PIC getter (ila $r2,0x3A00; brsl $r4,0x3A00; returns 0x4C00+delta via bi $r0) right after a bi $r0; lnop; no direct branch reaches it."
+      ],
+      "extra_entries": [
+        "0x39F8"
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CC9400",
+      "size": "0x4410",
+      "fingerprint": "82D0BE145EC28AEE",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x4060"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_82D0BE145EC28AEE_17424.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "Miss on job 0x1192CB80 in boot-fix-1.02-ab-fallback-off.log. Code ends at 0x4060; strings (socecomp) from 0x4060. EA from the dump's unique match in the EBOOT."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CF2980",
+      "size": "0x6290",
+      "fingerprint": "48AF2BC79A72CB50",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x5688"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_48AF2BC79A72CB50_25232.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "Earlier-phase dump, not yet seen in the newest log. Code ends at 0x5688; zero pad then float data. EA from the dump's unique match in the EBOOT.",
+        "extra_entries: 0x50 is an empty function (bi $r0; lnop) right after the empty function at 0x48; no direct branch reaches it."
+      ],
+      "extra_entries": [
+        "0x50"
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00D06980",
+      "size": "0x5090",
+      "fingerprint": "9804ABA84566F431",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x4478"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_9804ABA84566F431_20624.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "Earlier-phase dump, not yet seen in the newest log. Code ends at 0x4478; zero pad then strings (soceumix). EA from the dump's unique match in the EBOOT."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CFB200",
+      "size": "0xb750",
+      "fingerprint": "FE031AF67ED048DE",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x30",
+          "0x9060"
+        ]
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_FE031AF67ED048DE_46928.bin",
+      "evidence": [
+        "sgx job layout (sgx-spurs- instance, job chain 'soc-job' 0x1192C900, jobs 0x1192CB80/0x1192CC00): 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0x30); 0x20-0x30 zero words; 0x30 job entry (r2=ctx, r3=desc+0x30, r4=ctx->sBuffer, br main). Code ends after the shared mailbox helper (clgtbi $r8,$r3,63 ... bi $r0; lnop); data (strings 'soce...', shuffle masks, floats) follows.",
+        "Earlier-phase dump, not yet seen in the newest log. Code ends at 0x9060; shuffle masks from 0x9060. EA from the dump's unique match in the EBOOT."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CAF500",
+      "size": "0x45F0",
+      "fingerprint": "967C7596863E15FD",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x60",
+          "0x4068"
+        ]
+      ],
+      "extra_entries": [
+        "0x138",
+        "0x16C"
+      ],
+      "evidence": [
+        "Dispatched 24+ times while loading the title menu: '[spurs-job] dispatch MISS fp=0x79D3C33093353269 size=17904' in work/runtime/logs/boot-fix-1.02-evt3-4.log. Runtime dump is byte-identical to the EBOOT at file offset 0xC9D980.",
+        "JOBCRT layout, same crt as 0x00CB3580: 0x00-0x20 crt entry (ila watermarks, br 0x18, br 0xE0); 0x20-0x60 data (0xA5 fill, 'JOBCRT Ver14', bss end 0x45B0 at 0x3C, bss start 0x4330 at 0x40).",
+        "0x60-0x4068: code. Ends with 'bi $r0' at 0x4064; 0x4068-0x4070 are stop 0 padding; 0x4070 starts the printf strings ('\n_exit() has been called', 'Memory error occurred', chlib source paths), then 'JOBCRT Ver' key at 0x4290, data, bss 0x4330-0x45B0 and the '%SPURS JOB INFO%' trailer at 0x45C0. Every lqr/stqr in the code addresses 0x0-0x40 or 0x40B0 and up, never inside 0x60-0x4068.",
+        "The only data inside 0x60-0x4068 is a 5-entry inline switch table at 0x2C14-0x2C28 (words 0x14,0x30C,0x7DC,0x454,0x58C; targets 0x2C28,0x2F20,0x33F0,0x3068,0x31A0): ila $r21,0x2C14 at 0x2AF0, a $r5,$r21,$r126 at 0x2B18, clgti $r8,$r10,4 at 0x2B88, lqx/rotqby/a at 0x2B94-0x2BA0, bi $r2 at 0x2C10. The tool finds and subtracts it (compiler bound check); this is the 'data inside code at 0x2C18' an earlier pass stopped at. The two zero words at 0x3948 follow br 0x38C8; lnop and are alignment padding.",
+        "Every other in-code ila to a code address (0x80, 0x150, 0x1818, 0x2260, 0x2AF0, 0x3750, 0x37E0, 0x3A28, 0x3B10, 0x3BE4) is the PIC base idiom (ila rX,next; brsl $r126,next). extra_entries: 0x138 is _exit() (ila $r4,0x4070 then printf and stopd), reached by no direct branch; 0x16C is the epilogue after the stopd at 0x168. The second stopd at 0x3AF0 (memory-error abort) has its epilogue 0x3AF4 seeded by find_spu_functions."
+      ],
+      "fixed_1_02_runtime_dump": "analysis/spu-miss/spujob_79D3C33093353269_17904.bin",
+      "official_1_03_mapping": "353 byte differences from fixed 1.02; code ranges revalidated by spu_lift_jobs.py"
+    },
+    {
+      "ea": "0x00CACF80",
+      "size": "0x2540",
+      "fingerprint": "B24195A9C86BC758",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x60",
+          "0x1AE8"
+        ]
+      ],
+      "extra_entries": [
+        "0x168",
+        "0x19C"
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_B24195A9C86BC758_9536.bin",
+      "evidence": [
+        "Pushed about 32 times per frame in the course demo: '[spurs-job] dispatch MISS fp=0xB24195A9C86BC758 size=9536'. Image is 0x2540 bytes at EA 0x00CAB400.",
+        "JOBCRT Ver14 layout like the other jobs: 0x00-0x20 crt entry, 0x20-0x60 data (0xA5 fill, 'JOBCRT Ver14', bss end 0x3040 at 0x3C, bss start 0x2540 at 0x40), code 0x60-0x1AE8 (last 'bi $r0' at 0x1AE4, stop 0 padding to 0x1AF0), then the _exit() strings at 0x1AF0, float constants, JOBCRT Ver key 0x2400 and the trailer.",
+        "No inline jump tables: no il/ila of a code address followed by a bi table. bisl at 0xE0 and 0x1384 are call-through-pointer (ctor/dtor lists and a function pointer). bi $r7 at 0x15FC is a computed jump into the unrolled stqd loop at 0x1604-0x1628 (memset-style tail, PIC base 0x15E0); it lies inside a function so it cannot be an extra entry, watch the runtime log for unknown indirect targets.",
+        "extra_entries: 0x168 is _exit() (ila $r4,0x1AF0, then printf and stopd at 0x198), reached by no direct branch; 0x19C is the epilogue after that stopd."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    },
+    {
+      "ea": "0x00CB3B00",
+      "size": "0x15C0",
+      "fingerprint": "16CB89234CCC254E",
+      "entry": "0x0",
+      "code_ranges": [
+        [
+          "0x0",
+          "0x20"
+        ],
+        [
+          "0x60",
+          "0x1218"
+        ]
+      ],
+      "extra_entries": [
+        "0x138",
+        "0x16C"
+      ],
+      "runtime_dump": "analysis/spu-miss/spujob_16CB89234CCC254E_5568.bin",
+      "evidence": [
+        "Dispatched 32 times at startup: '[spurs-job] dispatch MISS fp=0x16CB89234CCC254E size=5568' in work/runtime/logs/boot-fix-1.02-job15-1.log (first 150 s run, load-timing dependent). Image is 0x15C0 bytes.",
+        "JOBCRT Ver14 layout like the other jobs: 0x00-0x20 crt entry, 0x20-0x60 data (bss end 0x1580 at 0x3C, bss start 0x13A0 at 0x40), code 0x60-0x1218 (last 'bi $r0' at 0x1214, stop 0 padding to 0x1220), then the _exit() strings at 0x1220, 'JOBCRT Ver' key at 0x12E0 and the '%SPURS JOB INFO%' trailer at 0x1590.",
+        "No inline jump tables. bisl at 0xACC is a call through a pointer (ctor/dtor list); bi $r7 at 0xD2C is a computed jump into an unrolled store tail (memset-style, same as the 0x00CAB400 job).",
+        "extra_entries: 0x138 is _exit() (ila $r4,0x1220, then printf and stopd at 0x168), reached by no direct branch; 0x16C is the epilogue after that stopd. The second stopd at 0xCA0 has its epilogue 0xCA4 seeded by find_spu_functions."
+      ],
+      "official_1_03_mapping": "byte-identical to fixed 1.02"
+    }
+  ],
+  "derived_from": "tools/spu_jobs.json"
+}

@@ -18,5 +18,6 @@ generated/
 work/
 analysis/
 port/spu/
+port/spu-1.03/
 mngolf6alldlcps3u/
 __pycache__/

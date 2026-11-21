@@ -317,6 +317,7 @@ def write_registry(path, regs, register_fn):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manifest", default="tools/spu_jobs.json")
+    ap.add_argument("--input", help="PPU ELF to read; defaults to the manifest's input")
     ap.add_argument("--lifted", default="port/spu", help="directory receiving <name>/spu_recomp.c")
     ap.add_argument("--out", default="port/spu/spu_jobs_register.c")
     ap.add_argument("--register-fn", default="port_spu_jobs_register_all")
@@ -326,7 +327,8 @@ def main():
     tools = (ROOT / args.ps3recomp / "tools").resolve()
     sys.path.insert(0, str(tools))
     manifest = json.loads((ROOT / args.manifest).read_text(encoding="utf-8"))
-    elf = (ROOT / manifest["input"]).read_bytes()
+    input_path = args.input or manifest["input"]
+    elf = (ROOT / input_path).read_bytes()
     lifted = (ROOT / args.lifted).resolve()
     out = (ROOT / args.out).resolve()
     if out.parent != lifted:
@@ -337,7 +339,7 @@ def main():
 
     stage = Path(tempfile.mkdtemp(prefix="spu_jobs.stage-", dir=lifted.parent))
     report = dict(schema_version=1, generator="spu_lift_jobs", manifest=args.manifest,
-                  input=manifest["input"], input_sha256=hashlib.sha256(elf).hexdigest(),
+                  input=input_path, input_sha256=hashlib.sha256(elf).hexdigest(),
                   jobs=[], complete=False)
     regs, failed = [], False
     try:

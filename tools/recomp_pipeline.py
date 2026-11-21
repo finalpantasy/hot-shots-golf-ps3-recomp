@@ -35,10 +35,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("stages", nargs="*", default=["analyze", "spu", "lift", "build"])
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--config", default="pipeline.toml")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
-    config = tomllib.loads((root / "pipeline.toml").read_text(encoding="utf-8"))
-    lock_path = root / "config/generated.lock"
+    config = tomllib.loads((root / args.config).read_text(encoding="utf-8"))
+    lock_name = "generated.lock" if args.config == "pipeline.toml" else args.config.removesuffix(".toml") + ".lock"
+    lock_path = root / "config" / lock_name
     lock = json.loads(lock_path.read_text(encoding="utf-8")) if lock_path.exists() else {"stages": {}}
     values = dict(config["toolchain"])
     values["root"] = str(root).replace("\\", "/")

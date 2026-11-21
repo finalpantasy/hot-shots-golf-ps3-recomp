@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "profile": "hybrid-1.03",
+  "description": "Official 1.03 update content running with the working fixed-1.02 executable; this does not claim official 1.03 code compatibility.",
+  "executable": "build/fix-1.02/HotShotsGolfRecomp.exe",
+  "executable_sha256": "c699adb94dbfcc51637163812a844dc78d482c7deb718b77d6fcd8018252942c",
+  "elf": "work/extracted/fix-1.02/USRDIR/EBOOT.elf",
+  "game_dir": "work/game/base-1.00",
+  "hdd0": "work/runtime-1.03/hdd0",
+  "hdd1": "work/runtime-1.03/hdd1",
+  "savedata": "work/runtime-1.03/savedata",
+  "dev_flash": "work/runtime/firmware-codex/dev_flash",
+  "update_title_id": "NPUA80864",
+  "update_app_ver": "01.03",
+  "official_code_decryption_status": "superseded_by_official-1.03_profile",
+  "required_license_filename": "UP9000-NPUA80864_00-0000111122223333.rap"
+}
