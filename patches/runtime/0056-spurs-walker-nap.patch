@@ -1,0 +1,148 @@
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2950,6 +2950,7 @@
+     return CELL_OK;
+ }
+ 
++static void jc_kick(void);   /* wakes a walker napping on a guard (jc_nap) */
+ /* cellSpursJobGuardNotify(CellSpursJobGuard* jobGuard) -- one argument. */
+ s32 cellSpursJobGuardNotify(u64 guard_ea)
+ {
+@@ -2971,6 +2972,7 @@
+       u32 remaining = (pend >= rst) ? 0u : rst - pend;
+       s_jobguards[i].count = remaining;
+       vm_write32(ea, remaining); }
++    jc_kick();
+     { static int _n = 0;
+       if (PS3_LOG_FIRST(_n, 8))
+           printf("[cellSpurs] JobGuardNotify(0x%08X) -> %u remaining\n",
+@@ -3009,6 +3011,81 @@
+         s_jobchains[t_jc_slot].wd_state = (st); s_jobchains[t_jc_slot].wd_pc = (pcv); \
+         s_jobchains[t_jc_slot].wd_aux = (aux); } } while (0)
+ 
++/* JC_NAP_US=<us> (default 250; 0 = the old Sleep(1)): how long a job chain
++ * walker naps between polls of a parked slot or a closed guard.
++ *
++ * Both waits used Sleep(1), which is 1-2 ms with a 1 ms system timer and a
++ * whole 15.6 ms tick when Windows ignores the process's timer request (a
++ * hidden, occluded or muted window on Windows 11). Hot Shots Golf's main
++ * thread appends jobs to a parked chain several times a frame and then waits
++ * for their done counter, so each nap was paid in frame time. A high
++ * resolution waitable timer keeps the CPU cost of a sleep and wakes on time,
++ * and jc_kick ends a nap at once: cellSpursJobGuardNotify calls it, and so
++ * does sys_timer_usleep when a PPU thread starts a new poll episode. */
++#ifdef _WIN32
++/* One auto-reset event per walker slot, set by jc_kick while that walker naps. */
++static HANDLE s_jc_nap_ev[MAX_JOBCHAINS];
++static volatile LONG s_jc_napping[MAX_JOBCHAINS];
++static volatile LONG s_jc_nappers;
++static int jc_nap_us(void)
++{
++    static int v = -1;
++    if (v < 0) {
++        const char* e = getenv("JC_NAP_US");
++        v = e ? atoi(e) : 250;
++        if (v < 0) v = 0;
++        if (v > 1000) v = 1000;
++    }
++    return v;
++}
++/* Wake every napping walker: a guard was notified, or a PPU thread started
++ * waiting (sys_timer_usleep's poll episode), which is when it has just
++ * appended work to a parked chain and wants it run. */
++static void jc_kick(void)
++{
++    if (s_jc_nappers <= 0) return;
++    for (int i = 0; i < MAX_JOBCHAINS; i++)
++        if (s_jc_napping[i] && s_jc_nap_ev[i]) SetEvent(s_jc_nap_ev[i]);
++}
++static void jc_nap(void)
++{
++    const int us = jc_nap_us();
++    const int slot = t_jc_slot;
++#if defined(_MSC_VER)
++    static __declspec(thread) HANDLE tmr; static __declspec(thread) int tmr_failed;
++#else
++    static __thread HANDLE tmr; static __thread int tmr_failed;
++#endif
++    if (us && !tmr && !tmr_failed) {
++        tmr = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
++                                     TIMER_ALL_ACCESS);
++        if (!tmr) tmr_failed = 1;
++        { extern void (*g_rt_usleep_kick)(void); g_rt_usleep_kick = jc_kick; }
++    }
++    if (us && tmr) {
++        HANDLE ev = NULL;
++        if (slot >= 0 && slot < MAX_JOBCHAINS) {
++            if (!s_jc_nap_ev[slot]) s_jc_nap_ev[slot] = CreateEventW(NULL, FALSE, FALSE, NULL);
++            ev = s_jc_nap_ev[slot];
++        }
++        LARGE_INTEGER due; due.QuadPart = -((LONGLONG)us * 10);
++        if (SetWaitableTimer(tmr, &due, 0, NULL, NULL, FALSE)) {
++            HANDLE hs[2] = { tmr, ev };
++            if (ev) { s_jc_napping[slot] = 1; InterlockedIncrement(&s_jc_nappers); }
++            if (WaitForMultipleObjects(ev ? 2 : 1, hs, FALSE, 2) == WAIT_OBJECT_0 + 1)
++                CancelWaitableTimer(tmr);
++            if (ev) { InterlockedDecrement(&s_jc_nappers); s_jc_napping[slot] = 0; }
++            return;
++        }
++    }
++    Sleep(1);
++}
++#else
++static void jc_kick(void) {}
++static void jc_nap(void) { usleep(1000); }
++#endif
++
++
+ static int jg_wait(u32 ea)
+ {
+     int i = jg_find(ea);
+@@ -3031,11 +3108,7 @@
+             vm_write32(ea, s_jobguards[i].count);
+             return 1;
+         }
+-#ifdef _WIN32
+-        Sleep(1);
+-#else
+-        usleep(1000);
+-#endif
++        jc_nap();
+     }
+ }
+ 
+@@ -3545,7 +3618,7 @@
+             JC_WD(1, pc, 0);
+             while (vm_read64(pc) == cmd) {
+                 if (t_jc_stop && *t_jc_stop) return;
+-                if (++spins < 200) SwitchToThread(); else Sleep(1);
++                if (++spins < 200) SwitchToThread(); else jc_nap();
+                 if (pon && (spins & 255) == 0) {
+                     u64 n = jc_now_ns(); prof.park_ns += n - pp0; pp0 = n;
+                     jc_par_prof_sync(jp);
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -151,6 +151,11 @@
+ #else
+ void rt_idle_wake(void) {}
+ #endif
++/* Set by cellSpurs.c once a job chain walker naps (JC_NAP_US). Called when a
++ * PPU thread starts a new short-usleep poll episode: it has usually just
++ * appended jobs to a parked chain and now waits for their done counter, so
++ * the walker should look now rather than at the end of its nap. */
++void (*g_rt_usleep_kick)(void);
+ 
+ int64_t sys_timer_usleep(ppu_context* ctx)
+ {
+@@ -348,7 +353,10 @@
+         static __thread int64_t ep_start, ep_last;
+         static __thread HANDLE tmr; static __thread int tmr_failed;
+         if (s_iw) {
+-            if (qpc_start.QuadPart - ep_last > s_iw_spin) ep_start = qpc_start.QuadPart;
++            if (qpc_start.QuadPart - ep_last > s_iw_spin) {
++                ep_start = qpc_start.QuadPart;
++                if (g_rt_usleep_kick) g_rt_usleep_kick();
++            }
+             if (qpc_start.QuadPart - ep_start >= s_iw_spin && !tmr_failed) {
+                 if (!tmr) {
+                     tmr = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,

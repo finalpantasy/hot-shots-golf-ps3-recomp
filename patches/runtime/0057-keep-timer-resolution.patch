@@ -1,0 +1,29 @@
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -144,6 +144,26 @@
+  * which a polling loop just re-polls. */
+ static HANDLE s_idle_wake_ev;
+ static volatile long s_idle_sleepers;
++
++/* RT_KEEP_TIMER_RES (default on; =0 leaves Windows' default): Windows 11
++ * stops honouring a process's timeBeginPeriod(1) once its window is hidden,
++ * minimized or fully covered and it plays no sound, and may run it with
++ * EcoQoS. Every Sleep(1), WaitForSingleObject(ev, ms) and condition-variable
++ * timeout in the runtime then lasts a 15.6 ms tick, the frame clock's FIFO
++ * kick wait included, so a --hidden --mute run (or a covered window) measured
++ * and played slower than a visible one. Opt out of both throttles at start. */
++__attribute__((constructor)) static void rt_keep_timer_res(void)
++{
++    const char* e = getenv("RT_KEEP_TIMER_RES");
++    if (e && e[0] == '0') return;
++    PROCESS_POWER_THROTTLING_STATE st;
++    memset(&st, 0, sizeof st);
++    st.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
++    st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
++                     PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
++    st.StateMask   = 0;   /* controlled and off: never throttle */
++    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st);
++}
+ void rt_idle_wake(void)
+ {
+     if (s_idle_sleepers > 0 && s_idle_wake_ev) SetEvent(s_idle_wake_ev);
