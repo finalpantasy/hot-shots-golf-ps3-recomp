@@ -16,13 +16,17 @@ struct CliOptions {
     std::string hdd1;
     std::string savedata;
     std::string title;        /* window caption */
+    std::string aspect;       /* --aspect: stretch or fit */
     std::string log_file;     /* --log */
     std::string rsx_shader_cache;
     std::string audio_wav;
+    std::string tex_dump;
+    std::string tex_replace;
     int  verbose    = -1;     /* --verbose <n> */
     int  width      = 0;      /* --width, 0 = default */
     int  height     = 0;
     int  exit_after = 0;      /* --exit-after <seconds>, 0 = never */
+    int  tex_replace_mb = -1;
     int  rsx_disp_tex = -1;
     int  rsx_disp_depth_tex = -1;
     int  rsx_disp_depth_keep = -1;
@@ -76,6 +80,8 @@ struct ResolvedPaths {
     std::string log_file;     /* empty = log to the console */
     std::string rsx_shader_cache; /* empty = inherit, "0" = disable */
     std::string audio_wav;    /* empty = inherit */
+    std::string tex_dump;
+    std::string tex_replace;
     std::string title;        /* empty = use the title from PARAM.SFO */
     int verbose = 0;
 };

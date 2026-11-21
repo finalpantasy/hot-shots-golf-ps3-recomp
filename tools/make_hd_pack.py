@@ -5,7 +5,7 @@ Usage:
   python make_hd_pack.py --in DUMP_DIR [DUMP_DIR ...] --out PACK_DIR
       [--work TMP_DIR] [--esrgan realesrgan-ncnn-vulkan.exe] [--models MODELS_DIR]
       [--model realesrgan-x4plus] [--pad 32] [--batch-mpx 6] [--limit N]
-      [--lock BUILD.lock --owner NAME]
+      [--large-scale 4] [--lock BUILD.lock --owner NAME]
 
 Needs only the standard library, ffmpeg/ffprobe on PATH and realesrgan-ncnn-vulkan.
 Dumps are merged by file name (<hash16>_<w>x<h>_f<fmt>.png); output keeps the names.
@@ -23,17 +23,30 @@ Per texture:
   match  (needs numpy+Pillow) after upscaling, each output is shifted per channel so its mean (and,
          up to a 1.25x gain, its std) at source size equals the source's, weighted by the source
          alpha. Real-ESRGAN darkens opaque textures by 2-20 levels. Alpha is never touched.
-  scale  4x for long side <= 256, else 4x then lanczos down to 2x. The padded center
-         is cropped back, so output is exactly (w*s, h*s): same aspect as the original.
-Resumable: files already in --out are skipped. Batches are bounded (--batch-mpx input
-megapixels per esrgan process) and, with --lock, each batch waits for and holds the
-shared lock file (created exclusively, removed only if it still names --owner).
+  scale  4x for long side <= 256, else 2x by default. --large-scale 4 keeps 4x for
+         larger sources too, so a 1024px source becomes 4096px. The padded center is
+         cropped back, so output is exactly (w*s, h*s): same aspect as the original.
+Resumable: files already in --out are skipped when their wrap policy and dimensions match.
+Batches are bounded (--batch-mpx input megapixels per esrgan process) and, with --lock,
+each batch waits for and holds the shared lock file (created exclusively, removed only
+if it still names --owner).
 """
-import argparse, os, re, shutil, subprocess, sys, time, json
+import argparse, os, re, shutil, struct, subprocess, sys, time, json
 
 NAME = re.compile(r'^([0-9a-f]{16})_(\d+)x(\d+)_f([0-9a-f]+)\.png$', re.I)
 NOWIN = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 BELOW = 0x4000  # BELOW_NORMAL_PRIORITY_CLASS
+
+
+def png_size(path):
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(24)
+        if header[:8] == b'\x89PNG\r\n\x1a\n':
+            return struct.unpack('>II', header[16:24])
+    except OSError:
+        pass
+    return None
 
 
 def run(cmd, **kw):
@@ -196,6 +209,8 @@ def main():
     ap.add_argument('--pad', type=int, default=32)
     ap.add_argument('--batch-mpx', type=float, default=6.0)
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--large-scale', type=int, choices=(2, 4), default=2,
+                    help='output scale for sources wider or taller than 256px (default 2; 4 permits 4K)')
     ap.add_argument('--wrap-k', type=float, default=2.2, help='wrap pad an axis when seam delta <= k*inner delta + 2')
     ap.add_argument('--prev-k', type=float, default=2.2, help='k used for outputs that have no manifest entry')
     ap.add_argument('--only-alpha', action='store_true', help='process only textures that have an alpha channel')
@@ -238,14 +253,17 @@ def main():
             skips[n] = why; log('SKIP %s: %s' % (n, why)); continue
         if a.only_alpha and not has_alpha: continue
         if a.rematch: continue
-        if os.path.exists(os.path.join(out, n)):
+        scale = 4 if mx <= 256 else a.large_scale
+        out_path = os.path.join(out, n)
+        if os.path.exists(out_path):
             prev = manifest.get(n)
             if prev is None:
                 prev = [sx <= a.prev_k * ix + 2, sy <= a.prev_k * iy + 2]
-            if list(prev) == [wx, wy]:
+            actual = png_size(out_path)
+            if list(prev) == [wx, wy] and actual == (w * scale, h * scale):
                 continue
-            log('REDO %s: wrap %s -> %s' % (n, prev, [wx, wy]))
-        scale = 4 if mx <= 256 else 2
+            log('REDO %s: wrap %s -> %s, size %s -> %s' %
+                (n, prev, [wx, wy], actual, (w * scale, h * scale)))
         graph, px, py = pad_graph(w, h, a.pad, wx, wy, has_alpha)
         todo.append(dict(n=n, path=path, w=w, h=h, scale=scale, px=px, py=py, g=graph, alpha=has_alpha, wx=wx, wy=wy))
         if a.limit and len(todo) >= a.limit: break
@@ -311,8 +329,11 @@ def main():
     for f in os.listdir(out):
         m = NAME.match(f)
         if not m: continue
-        w, h = int(m.group(2)), int(m.group(3)); s = 4 if max(w, h) <= 256 else 2
-        tot += os.path.getsize(os.path.join(out, f)); gpu += w * s * h * s * 4 * 4 // 3; n += 1
+        path = os.path.join(out, f)
+        size = png_size(path)
+        if size is None: continue
+        w, h = size
+        tot += os.path.getsize(path); gpu += w * h * 4 * 4 // 3; n += 1
     log('pack: %d files, %.1f MB on disk, est GPU %.0f MB (RGBA8 + mips) vs default cap 768 MB' % (n, tot / 1048576, gpu / 1048576))
 
 

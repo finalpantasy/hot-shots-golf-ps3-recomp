@@ -23,6 +23,7 @@ On Windows, the launcher sets the game process's profile and temp paths under `<
 | `--windowed` | none | on | Start in a window. | wired (default) |
 | `--width <px>` | none | 1280 | Render surface and windowed client width. | wired |
 | `--height <px>` | none | 720 | Render surface and windowed client height. | wired |
+| `--aspect <mode>` | `RSX_ASPECT` | `stretch` | `fit` centers a 16:9 image with black bars instead of stretching it. | wired |
 | `--verbose <n>` | `PS3_VERBOSE` | 0 | Use 0 for normal logs or 1 through 9 to enable additional runtime diagnostics. | wired |
 | `--rsx-shader-cache <dir or 0>` | `RSX_SHADER_CACHE` | `<build dir>/shader_cache_d3d12` | Windows D3D12 bytecode cache directory. A value of 0 disables disk caching. | wired |
 | `--rsx-disp-tex <0 or 1>` | `RSX_DISP_TEX` | 1 | Sample the D3D12 display buffer as a texture on Windows. A value of 0 uploads from guest memory. | wired |
@@ -44,6 +45,9 @@ On Windows, the launcher sets the game process's profile and temp paths under `<
 | `--rsx-speed-check <n>` | `RSX_SPEED_CHECK` | 0 | Compare optimized and original draw results. For vertex and strip checks, sample one in every n. Use with `--rsx-prof` to see the counts. | wired |
 | `--mute` | `PS3_MUTE` | off | Silence Windows audio output. Mixing and WAV capture stay active. | wired |
 | `--audio-wav <file>` | `AUDIO_WAV` | off | Record the mixed stereo audio as a 48 kHz floating-point WAV file. | wired |
+| `--tex-dump <dir>` | `TEX_DUMP` | off | Save stable textures for HD pack creation. | wired |
+| `--tex-replace <dir>` | `TEX_REPLACE` | off | Load matching PNG or DDS replacement textures. | wired |
+| `--tex-replace-mb <MB>` | `TEX_REPLACE_MB` | 768 | GPU memory budget for replacement textures. | wired |
 | `--jc-parallel <0–8>` | `JC_PARALLEL` | 4 | SPURS job-chain lanes. Values of 0 and 1 both select serial execution. | wired |
 | `--pad-script-hold <polls>` | `PAD_SCRIPT_HOLD` | 40 | Positive number of pad polls to hold each scripted press. | wired |
 | `--log <file>` | none | console | Save standard output and errors in one file. A bare name goes in `<build dir>/logs`. | wired |
@@ -54,7 +58,7 @@ On Windows, the launcher sets the game process's profile and temp paths under `<
 
 `--fullscreen` and `--windowed` cannot be used together.
 
-Relative `RSX_SHADER_CACHE` and `AUDIO_WAV` environment values resolve from the build folder. Relative `--rsx-shader-cache` and `--audio-wav` arguments resolve from the launch directory. `--audio-wav` creates any missing parent directories and recording replaces a file at the selected path.
+Relative `RSX_SHADER_CACHE` and `AUDIO_WAV` environment values resolve from the build folder. Relative `--rsx-shader-cache`, `--audio-wav`, `--tex-dump`, and `--tex-replace` arguments resolve from the launch directory. `--audio-wav` creates any missing parent directories and recording replaces a file at the selected path.
 
 The local PS3 user's saves live in `dev_hdd0/home/00000001/savedata` under the save root. The older `PS3_GAMEDATA_ROOT` variable also works when no save root is specified.
 
@@ -62,9 +66,9 @@ The US font set uses `data/font/SCE-PS3-RD-R-LATIN2.TTF` under the firmware fold
 
 ## Game files
 
-Put the extracted US game files in the `game` folder next to the executable. The folder needs `PARAM.SFO` and `USRDIR/EBOOT.elf` from the inputs for the fixed 1.02 build. The launcher also checks for both files directly next to the executable. An alternate game root can contain the same layout under `PS3_GAME`.
+Put the extracted US game files in the `game` folder next to the executable. The folder needs `PARAM.SFO` and `USRDIR/EBOOT.elf` from the inputs for the selected fixed 1.02 or official 1.03 build. The launcher also checks for both files directly next to the executable. An alternate game root can contain the same layout under `PS3_GAME`.
 
-The executable expects the US title ID `NPUA80864` in `PARAM.SFO`. On Windows it checks the ELF against the fixed 1.02 SHA-256 in the project manifest before running the lifted code. Missing or incompatible startup files produce a setup message and exit code 1. A fresh Explorer console waits for Enter so the message stays visible.
+The executable expects the US title ID `NPUA80864` in `PARAM.SFO`. On Windows it checks the ELF against the selected profile's SHA-256 in the project manifest before running the lifted code. Missing or incompatible startup files produce a setup message and exit code 1. A fresh Explorer console waits for Enter so the message stays visible.
 
 ## Exit codes
 

@@ -34,6 +34,8 @@ static const char kHelp[] =
 "  --windowed          Start in a window (default).\n"
 "  --width <px>        Window width. Default 1280.\n"
 "  --height <px>       Window height. Default 720.\n"
+"  --aspect <mode>     stretch (default) or fit: center 16:9 without distortion.\n"
+"                      Env RSX_ASPECT.\n"
 "  --verbose <n>       Runtime diagnostics: 0 off, 1 to 9 on. Env PS3_VERBOSE.\n"
 "  --rsx-shader-cache <dir|0>  D3D12 bytecode cache directory or 0 to disable.\n"
 "                      Env RSX_SHADER_CACHE. Default: <build dir>/shader_cache_d3d12.\n"
@@ -75,6 +77,11 @@ static const char kHelp[] =
 "                      Env PS3_MUTE.\n"
 "  --audio-wav <file>  Record the stereo audio mix to a WAV file.\n"
 "                      Env AUDIO_WAV. Disabled by default.\n"
+"  --tex-dump <dir>    Dump stable game textures for an HD pack. Env TEX_DUMP.\n"
+"  --tex-replace <dir> Load matching PNG/DDS textures from an HD pack.\n"
+"                      Env TEX_REPLACE. Disabled by default.\n"
+"  --tex-replace-mb <MB>  GPU memory budget for replacement textures.\n"
+"                      Env TEX_REPLACE_MB. Default: 768.\n"
 "  --jc-parallel <n>   SPURS job-chain lanes, 0 to 8. Use 0 or 1 for serial.\n"
 "                      Env JC_PARALLEL. Default: 4.\n"
 "  --pad-script-hold <polls>  Positive poll count for each scripted press.\n"
@@ -158,7 +165,8 @@ static const RsxOption* find_rsx_option(const std::string& flag)
 
 bool cli_has_d3d12_options(const CliOptions& o)
 {
-    if (!o.rsx_shader_cache.empty()) return true;
+    if (!o.rsx_shader_cache.empty() || !o.tex_dump.empty() || !o.aspect.empty() ||
+        !o.tex_replace.empty() || o.tex_replace_mb >= 0) return true;
     for (const auto& option : kRsxOptions) {
         if (o.*option.value >= 0) return true;
     }
@@ -204,6 +212,13 @@ bool cli_parse(int argc, char** argv, CliOptions& o, std::string& err)
                                            if (!to_int(v, 160, 16384, o.width, "--width", err)) return false; }
         else if (name == "--height")     { if (!take_value(argc, argv, i, eq_val, v, err)) return false;
                                            if (!to_int(v, 90, 16384, o.height, "--height", err)) return false; }
+        else if (name == "--aspect") {
+            if (!take_value(argc, argv, i, eq_val, o.aspect, err)) return false;
+            if (o.aspect != "stretch" && o.aspect != "fit") {
+                err = "--aspect requires 'stretch' or 'fit'";
+                return false;
+            }
+        }
         else if (name == "--verbose")    { if (!take_value(argc, argv, i, eq_val, v, err)) return false;
                                            if (!to_int(v, 0, 9, o.verbose, "--verbose", err)) return false; }
         else if (name == "--rsx-shader-cache") {
@@ -219,6 +234,18 @@ bool cli_parse(int argc, char** argv, CliOptions& o, std::string& err)
                 err = "--audio-wav requires a file";
                 return false;
             }
+        }
+        else if (name == "--tex-dump" || name == "--tex-replace") {
+            std::string& path = name == "--tex-dump" ? o.tex_dump : o.tex_replace;
+            if (!take_value(argc, argv, i, eq_val, path, err)) return false;
+            if (path.empty()) {
+                err = name + " requires a directory";
+                return false;
+            }
+        }
+        else if (name == "--tex-replace-mb") {
+            if (!take_value(argc, argv, i, eq_val, v, err) ||
+                !to_int(v, 1, 65536, o.tex_replace_mb, "--tex-replace-mb", err)) return false;
         }
         else if (const auto* option = find_rsx_option(name)) {
             if (!take_value(argc, argv, i, eq_val, v, err) ||
@@ -327,7 +354,9 @@ void cli_resolve(const CliOptions& o, const std::string& exe_dir, ResolvedPaths&
     r.title    = pick(o.title,    "PS3_TITLE",         "");
     r.log_dir  = r.build_dir + "/logs";
     r.audio_wav = o.audio_wav;
-    slashes(r.audio_wav);
+    r.tex_dump = pick(o.tex_dump, "TEX_DUMP", "");
+    r.tex_replace = pick(o.tex_replace, "TEX_REPLACE", "");
+    slashes(r.audio_wav); slashes(r.tex_dump); slashes(r.tex_replace);
 #ifdef _WIN32
     r.rsx_shader_cache = o.rsx_shader_cache;
     if (r.rsx_shader_cache.empty() && env_or_empty("RSX_SHADER_CACHE").empty())
@@ -352,7 +381,11 @@ void cli_apply_tuning(const CliOptions& o, const ResolvedPaths& r)
 {
     if (!r.rsx_shader_cache.empty()) cli_setenv("RSX_SHADER_CACHE", r.rsx_shader_cache.c_str());
     if (o.mute) cli_setenv("PS3_MUTE", "1");
+    if (!o.aspect.empty()) cli_setenv("RSX_ASPECT", o.aspect.c_str());
     if (!r.audio_wav.empty()) cli_setenv("AUDIO_WAV", r.audio_wav.c_str());
+    if (!r.tex_dump.empty()) cli_setenv("TEX_DUMP", r.tex_dump.c_str());
+    if (!r.tex_replace.empty()) cli_setenv("TEX_REPLACE", r.tex_replace.c_str());
+    if (o.tex_replace_mb >= 0) cli_setenv("TEX_REPLACE_MB", std::to_string(o.tex_replace_mb).c_str());
     for (const auto& option : kRsxOptions) {
         const int value = o.*option.value;
         if (value >= 0) cli_setenv(option.env, std::to_string(value).c_str());
