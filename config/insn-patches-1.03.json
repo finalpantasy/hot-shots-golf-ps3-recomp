@@ -1,0 +1,95 @@
+{
+ "patches": [
+  {
+   "addr": "0x0001C0C8",
+   "orig": "0x38800036",
+   "new": "0x38800034",
+   "guard": "g_hsg_tw_insn_0001C0C8",
+   "note": "HSG_TWEAKS insn: Main_Run boot request li r4,0x36 (SEQ_FIRST) -> 0x34 (SEQ_DBG_START_MENU)"
+  },
+  {
+   "addr": "0x0001C4C8",
+   "orig": "0x38800036",
+   "new": "0x38800034",
+   "guard": "g_hsg_tw_insn_0001C4C8",
+   "note": "HSG_TWEAKS insn: Main_Run (after a new save) li r4,0x36 -> 0x34"
+  },
+  {
+   "addr": "0x008F1C9C",
+   "orig": "0x60000000",
+   "new": "0xC142E1A8",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): View_GetFrustumCorners: nop after tanf -> lfs f10,k (k at 0xD9C1F8)"
+  },
+  {
+   "addr": "0x008F1CCC",
+   "orig": "0x794A0020",
+   "new": "0xED8C02B2",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): View_GetFrustumCorners: clrldi r10 (r1+0x80, already 32-bit) -> fmuls f12,f12,f10 (aspect*k)"
+  },
+  {
+   "addr": "0x008F4FA4",
+   "orig": "0x60000000",
+   "new": "0xC3C2E1A8",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): View_CullSetupA: nop after tanf -> lfs f30,k (f30 dead until 0x8F4FB8)"
+  },
+  {
+   "addr": "0x008F4FB4",
+   "orig": "0x60000000",
+   "new": "0xEF9C07B2",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): View_CullSetupA: nop after tanf -> fmuls f28,f28,f30 (aspect*k)"
+  },
+  {
+   "addr": "0x008F5B6C",
+   "orig": "0x7A940020",
+   "new": "0xC15A02B0",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): View_CullSetupB: clrldi r20 (r1+0xC0) -> lfs f10,w(view)"
+  },
+  {
+   "addr": "0x008F5B74",
+   "orig": "0x7A730020",
+   "new": "0xC162E1A8",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): View_CullSetupB: clrldi r19 (r1+0xD0) -> lfs f11,k"
+  },
+  {
+   "addr": "0x008F5B94",
+   "orig": "0x7A520020",
+   "new": "0xED4A02F2",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): View_CullSetupB: clrldi r18 (r1+0xE0) -> fmuls f10,f10,f11 (w*k)"
+  },
+  {
+   "addr": "0x008F5B98",
+   "orig": "0x7A310020",
+   "new": "0xD1410190",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): View_CullSetupB: clrldi r17 (r1+0xB0) -> stfs f10,0x190(r1) (unused frame pad)"
+  },
+  {
+   "addr": "0x008F5BA8",
+   "orig": "0xC1BA02B0",
+   "new": "0xC1A10190",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): View_CullSetupB: lfs f13,w(view) after tanf -> lfs f13,0x190(r1) (w*k)"
+  },
+  {
+   "addr": "0x008E9648",
+   "orig": "0x78630020",
+   "new": "0xC062E1A8",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): Scene_RenderMain: clrldi r3 after lwz (already zero-extended) -> lfs f3,k for 0x900270"
+  },
+  {
+   "addr": "0x009002D8",
+   "orig": "0xFF001090",
+   "new": "0xEF0200F2",
+   "guard": "g_hsg_widecull",
+   "note": "ultrawide cull (0062): 0x900270 (shadow/cull pass, only caller 0x8E96B8): fmr f24,f2 -> fmuls f24,f2,f3 (aspect*k)"
+  }
+ ]
+}

@@ -47,11 +47,12 @@ inputs = [
   "analysis/official-1.03/EBOOT.functions.json",
   "analysis/official-1.03/EBOOT.imports.json",
   "external/ps3recomp/tools/ppu_lifter.py",
-  "external/ps3recomp/tools/gen_hle_nids.py"
+  "external/ps3recomp/tools/gen_hle_nids.py",
+  "config/insn-patches-1.03.json"
 ]
 outputs = ["generated/official-1.03/recompiled"]
 commands = [
-  ["${python}", "${ps3recomp}/tools/ppu_lifter.py", "${eboot}", "--functions", "analysis/official-1.03/EBOOT.functions.json", "--hle-stubs", "analysis/official-1.03/EBOOT.imports.json", "--code-end", "0xd18b98", "--chunks", "64", "--output", "generated/official-1.03/recompiled"],
+  ["${python}", "${ps3recomp}/tools/ppu_lifter.py", "${eboot}", "--functions", "analysis/official-1.03/EBOOT.functions.json", "--hle-stubs", "analysis/official-1.03/EBOOT.imports.json", "--code-end", "0xd18b98", "--chunks", "64", "--insn-patches", "config/insn-patches-1.03.json", "--output", "generated/official-1.03/recompiled"],
   ["${python}", "${ps3recomp}/tools/gen_hle_nids.py", "--all", "--out", "generated/official-1.03/recompiled/ppu_hle_nids.cpp"]
 ]
 

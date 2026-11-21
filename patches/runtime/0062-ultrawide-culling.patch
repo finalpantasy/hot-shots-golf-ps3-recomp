@@ -1,0 +1,124 @@
+--- /dev/null
++++ b/libs/system/hsg_widecull.c
+@@ -0,0 +1,92 @@
++/*
++ * ps3recomp - ultrawide culling for RSX_ASPECT=expand (Hot Shots Golf 1.03)
++ *
++ * RSX_ASPECT=expand widens the 3D view in the renderer backend (clip x / k,
++ * k = window aspect / 16:9), but the title still culls against its own 16:9
++ * frustum, so objects in the added side strips are dropped or pop in. The
++ * lifted code carries guarded copies of the culling aspect reads that scale
++ * the aspect (or the viewport width it is divided from) by a float k read
++ * from a guest word; this file owns that word and the guard.
++ *
++ *   g_hsg_widecull       guard of every "ultrawide cull" --insn-patches line
++ *                        (config/insn-patches-1.03.json). Set once, here,
++ *                        before guest code runs; never changed later, so no
++ *                        patched sequence can see it switch half way.
++ *   HSG_WIDECULL_K_ADDR  big-endian f32 k, engine TOC (0xD9E050) - 0x1E58.
++ *                        16 bytes of alignment padding between .tbss and the
++ *                        next data section: no instruction or pointer in the
++ *                        EBOOT refers to them, and the ELF image leaves them 0.
++ *
++ * hsg_widecull_boot()   ppu_load_elf, after the segments are in guest RAM:
++ *                       RSX_ASPECT=expand -> k = 1.0, guard on
++ *                       (HSG_WIDECULL=0 keeps it off).
++ * hsg_widecull_set_k(k) the D3D12 backend at each present, with its
++ *                       aspect_expand_k() (1.0 when the window is 16:9 or
++ *                       narrower). Ignored while the guard is off.
++ *                       HSG_WIDECULL_AB=<n> (debug) alternates k and 1.0
++ *                       every n flips for same-run comparisons;
++ *                       HSG_WIDECULL_K=<f> (debug) forces k.
++ *
++ * Guard off (any other RSX_ASPECT, or a build lifted without the lines):
++ * the original instructions run and the word is never written. Guard on with
++ * k = 1.0 is bit-identical to the original (x * 1.0f is exact).
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "ps3emu/ps3types.h"
++#include "../../runtime/ppu/ppu_memory.h"
++
++#define HSG_WIDECULL_K_ADDR 0x00D9C1F8u
++
++int g_hsg_widecull = 0;
++
++static float s_k = 1.0f;
++
++void hsg_widecull_boot(void)
++{
++    const char* e = getenv("RSX_ASPECT");
++    if (!e || strcmp(e, "expand") != 0) return;
++    {   /* HSG_WIDECULL=0: keep the title's 16:9 culling (A/B checks). */
++        const char* o = getenv("HSG_WIDECULL");
++        if (o && o[0] == '0') {
++            fprintf(stderr, "[widecull] HSG_WIDECULL=0: culling left at 16:9\n");
++            return;
++        }
++    }
++    /* The word must be the zero padding this build expects; anything else
++     * means another binary or layout, and the guard stays off. */
++    if (vm_read32(HSG_WIDECULL_K_ADDR) != 0u ||
++        vm_read32(HSG_WIDECULL_K_ADDR - 8u) != 0u) {
++        fprintf(stderr, "[widecull] k word 0x%08X not zero padding; culling left at 16:9\n",
++                HSG_WIDECULL_K_ADDR);
++        return;
++    }
++    vm_write_f32(HSG_WIDECULL_K_ADDR, 1.0f);
++    s_k = 1.0f;
++    g_hsg_widecull = 1;
++    fprintf(stderr, "[widecull] RSX_ASPECT=expand: culling aspect x k (k word 0x%08X)\n",
++            HSG_WIDECULL_K_ADDR);
++}
++
++void hsg_widecull_set_k(float k)
++{
++    static int ab = -1, logged = 0;
++    static float kforce = -1.0f;
++    if (!g_hsg_widecull) return;
++    if (!(k >= 1.0f && k <= 8.0f)) k = 1.0f;
++    /* HSG_WIDECULL_K=<f> (debug): use f instead of the window's k. */
++    if (kforce < 0.0f) { const char* e = getenv("HSG_WIDECULL_K"); kforce = e ? (float)atof(e) : 0.0f; }
++    if (kforce >= 0.25f && kforce <= 8.0f) k = kforce;
++    /* HSG_WIDECULL_AB=<n>: debug A/B inside one run -- k only in even
++     * n-flip windows, 1.0 (16:9 culling) in odd ones. */
++    if (ab < 0) { const char* e = getenv("HSG_WIDECULL_AB"); ab = e ? atoi(e) : 0; }
++    if (ab > 0) {
++        extern u32 cellGcm_flip_request_count(void);
++        if ((cellGcm_flip_request_count() / (u32)ab) & 1u) k = 1.0f;
++    }
++    if (k == s_k) return;
++    s_k = k;
++    vm_write_f32(HSG_WIDECULL_K_ADDR, k);
++    if (logged < 4) { logged++; fprintf(stderr, "[widecull] k = %.4f\n", (double)k); }
++}
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -12131,6 +12131,7 @@
+ void rsx_d3d12_backend_present(void)
+ {
+     stall_mark("flip-present");
++    { extern void hsg_widecull_set_k(float); hsg_widecull_set_k(aspect_expand_k()); }   /* 0062: guest culling k */
+     if (blink_dbg())
+         printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
+                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3686,6 +3686,7 @@
+ static int32_t g_ppu_primary_priority = 1001;
+ 
+ extern "C" void hsg_tweaks_boot(void);   /* libs/system/hsg_tweaks.c */
++extern "C" void hsg_widecull_boot(void);  /* libs/system/hsg_widecull.c */
+ extern "C" uint32_t ppu_load_elf(const char* path)
+ {
+     g_ppu_primary_priority = 1001;
+@@ -3875,6 +3876,8 @@
+       } }
+     /* HSG_TWEAKS "when": "boot" writes and insn guards (libs/system/hsg_tweaks.c). */
+     hsg_tweaks_boot();
++    /* RSX_ASPECT=expand: widen the guest culling aspect (patch 0062). */
++    hsg_widecull_boot();
+     return entry;
+ }
+ 
