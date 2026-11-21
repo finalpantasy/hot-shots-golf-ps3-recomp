@@ -5,7 +5,7 @@
 - Research and the selected toolchain are in `docs/research/ps3-static-recompilation-tooling.md`.
 - The ranked repository survey is in `docs/research/ps3-recomp-repository-survey.md`; the implementation process derived from it is in `docs/recomp-process.md`.
 - Default route: `sp00nznet/ps3recomp` v0.19.0, RPCS3 as the behavioral reference, and REA/Ghidra for targeted analysis of decrypted PPU/SPU binaries. REA currently rejects PowerPC machine 21 on this host, so use ps3recomp's PPC tools as the working fallback and preserve that limitation.
-- Current build profile is third-party fixed 1.02. Official 1.03 is the latest update but needs `UP9000-NPUA80864_00-0000111122223333.rap`; do not claim official 1.03 compatibility until its decrypted ELF is compared.
+- Official 1.03 is decrypted at `work/extracted/update-1.03/USRDIR/EBOOT.elf` (SHA-256 `8cb18c2ec06c8a0ed2de12d3dd3bdd09caa36af55d49c18a869dbac0f52e140b`). Its independent pipeline is `pipeline-1.03.toml`; preserve the fixed-1.02 baseline and verify the official 1.03 build separately.
 - Exclude `HP9000-NPHA80248`: it is the separate Asian Everybody's Golf 6 release, not the US target.
 - Run stages with `.venv/Scripts/python.exe tools/recomp_pipeline.py analyze lift build`; the lock is `config/generated.lock` and current evidence is in `docs/STATUS.md`.
 - Do not substitute Vita `pkg2zip` or the PSP Hot Shots Tennis matching decomp for this PS3 static-recompilation toolchain.

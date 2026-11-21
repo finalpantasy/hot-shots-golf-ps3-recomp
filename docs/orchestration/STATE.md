@@ -565,3 +565,19 @@ Profile heavy course views (3000+ draws at 12 to 17 FPS) and the 45 to 55 s no-f
 - 2026-11-19 07:30 run 49 (worker a5f16ea352489b3b1): grass lightening is runtime: an identity pack (original pixels) gives the same x1.3 shift, so the replace path (full box mip chain, RGBA8) differs from the original upload (level 0 only). Trees darkened by black transparent RGB bleeding through Real-ESRGAN; make_hd_pack.py adds bleed_rgb + match_color, v2 built (work/hdpack/v2), not tested in game.
 
 - 2026-11-19 09:10 run 50 (worker a275e40d13d43c8d7): 0051 uploads guest mip levels (75/128 tee textures declare mips) and honors CONTROL0 LOD; pack mips alpha-weighted, capped to guest levels for 1-level textures. RSX_GUEST_MIPS=0, TEX_REPLACE_MIPS=0/2, RSX_MIPDBG=1. Colors old/new/v2 match at 4K; the "1.3x grass" was a run-state where the bottom third of the frame is ~0.72x darker (open). VRAM +20 MB at 4K. Build sha8 9e9e7bbe.
+
+## 2026-11-19 Kimi modernization checkpoint
+
+- Current integration owner: Kimi in this session; no active workers or running game/build resources. No ownership transfer is implied for another host.
+- Official 1.03 executable `build/official-1.03/HotShotsGolfRecomp.exe`, SHA-256 `c6ab494ae36dc2ca5cb0c49bdfde4bba3420b2e534235a58cb623502a1c22ff0`. Profile: `config/profile-1.03.json`.
+- Verified: official-code title and scripted gameplay; native 3840x2160; official-compatible 1024->4096 texture with six mips and no load failures; texture CLI; true-4K pack-builder option; clang-cl header dependencies; 3440x1440 aspect-fit title and course frame.
+- Not verified/finished: full-round aspect-fit, expanded Hor+ ultrawide, full HD pack, save/DLC/physical-controller coverage, movie decoding.
+- Patch `0052` is aspect-fit; `0053` guards marker entry/write races. The guards fire but do not fix the later wrap stall. `official-1.03-fit-flipfix2.log` ends with `fq=4127 fr=4126`, marker `0x19DE44`, then the main thread waits in `cellGcmGetFlipStatus`.
+- Exact next action: in `gcm_flip_into_fifo`, test flushing the marker and letting the drain reach it before the ring wrap, with a bounded wait and no fake completion. Reuse the existing 230-second flip-clock script and fresh savedata. Do not call the race fixed without a run that exercises the wrap and continues rendering.
+- Detailed evidence and modernization priorities: `docs/STATUS.md` update 42 and `docs/MODERN-PC-ROADMAP.md`. No corrections file exists; no human art/feel approval is recorded.
+
+## 2026-11-19 19:45 Claude takes integration ownership
+
+- Integration owner: Claude (lead orchestrator chat), taking over from Kimi's checkpoint above. Kimi holds no workers, builds or game processes.
+- Verified at takeover: build/official-1.03/HotShotsGolfRecomp.exe SHA-256 starts c6ab494ae36dc2ca, EBOOT.elf starts 8cb18c2ec06c8a0e, both as recorded. Working tree has 15 modified and 9 untracked files from the 1.03 bring-up; left unstaged and uncommitted.
+- Paused (2026-11-20 evening, owner asked to slow down): patch 0054 committed (d221c51). Workers for ultrawide (0055), HD pack (58 of 420 PNGs in work/hdpack/official-1.03-png, no DDS yet), performance, 60/90/120 FPS and guest tweaks (0059, unverified) ended mid-task. Their runtime edits in external/ps3recomp are uncommitted and unreviewed; decomp map in work/decomp/. No lock or game process left.

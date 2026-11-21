@@ -351,3 +351,55 @@ The renderer uploaded only the top level of every game texture, though 75 of the
 Fine detail energy on the distant fairway dropped from 62 to 8, which is the shimmer going away. At 4K the tee grass, fairway and trees match within one or two levels across the old build, the new build and the new build with HD pack v2. The lighter grass seen in the first 4K test of HD pack v1 was a run-to-run state, not the pack: in some runs the bottom third of the frame is about 0.72x darker, with or without a pack. That state is not explained yet.
 
 GPU memory rises by the cost of the mip levels, from about 385 to 405 MB at 4K. FPS is unchanged within noise. The debug layer reported 0 errors over 9,000 frames, the golfer stays in swing frames, the hole 2 water is intact and a New Game round reached hole 3.
+
+## 2026-11-19 update 39: official 1.03 content profile
+
+A separate `hybrid-1.03` profile is prepared in `config/profile-hybrid-1.03.json`. It uses the current fixed-1.02 executable with the official 1.03 update files under `work/runtime-1.03/hdd0/game/NPUA80864`. Its `PARAM.SFO` reads `TITLE_ID=NPUA80864` and `APP_VER=01.03`.
+
+This profile does not claim official 1.03 code compatibility. At the time, the official 1.03 EBOOT still needed `UP9000-NPUA80864_00-0000111122223333.rap` and no RAP had been found (update 40 resolves this). The baseline executable remains unchanged. The run log is `work/runtime/logs/hybrid-1.03.log`.
+
+The hybrid profile reached the title screen and produced `work/runtime/shots-1.03/shot_30.bmp`. The image reports `Ver.1.02`, consistent with the fixed-1.02 code path. This verifies 1.03 content/VFS bring-up only, not official 1.03 code execution.
+
+## 2026-11-19 update 40: official 1.03 decrypted
+
+A 16-byte RAP with content ID `UP9000-NPUA80864_00-0000111122223333` was located and installed into the local RPCS3 exdata directory. RPCS3 then decrypted the official 1.03 EBOOT successfully. The ELF is valid ELF64 big-endian PowerPC with eight program headers and SHA-256 `8cb18c2ec06c8a0ed2de12d3dd3bdd09caa36af55d49c18a869dbac0f52e140b`.
+
+The official 1.03 ELF differs substantially from fixed 1.02, so a real rebuild is required. Its independent configuration is `pipeline-1.03.toml`; the lock is `config/pipeline-1.03.lock`, generated sources are under `generated/official-1.03/`, and the executable output is `build/official-1.03/HotShotsGolfRecomp.exe`. The fixed-1.02 and hybrid-1.03 profiles remain separate.
+
+## 2026-11-19 update 41: official 1.03 native build reaches the title
+
+`pipeline-1.03.toml` lifts 33,220 official PPU functions and builds successfully. The executable is `build/official-1.03/HotShotsGolfRecomp.exe`, SHA-256 `b42f36580a2f953f140b136f8957eae9bc4f745fe7a9102e09960a0d019425b1`. A compile-time profile check accepts the official 1.03 ELF for this build and keeps the fixed-1.02 default separate.
+
+The SPURS job stage now reads the selected official ELF rather than silently using the fixed-1.02 input. `tools/spu_jobs-1.03.json` maps all 16 official job images: 15 are byte-identical to their fixed-1.02 counterparts at relocated addresses; the former `79D3C33093353269` job is official fingerprint `967C7596863E15FD` at EA `0x00CAF500`, with 353 differing bytes. All 16 pass the strict SPU lifting and registration checks.
+
+A bounded hidden 1280x720 run of the official executable and official ELF reached the title in 30 seconds. `work/runtime/shots-official-1.03/shot_30.bmp` visibly reports `Ver.1.03`, proving official-code execution rather than the earlier hybrid. Evidence log: `work/runtime/logs/official-1.03.log`; build log: `work/runtime/logs/build-official-1.03.log`. The runnable profile is `config/profile-1.03.json`; the old content-only profile is preserved as `config/profile-hybrid-1.03.json`.
+
+The 180-second run exited cleanly with code 0. Its log has 0 unresolved imports, 0 unresolved indirect calls, 0 SPU dispatch misses, 0 NULL calls, and no D3D12 device-loss marker.
+
+This gate verifies the native build and title screen. It does not yet establish that a 1.03 round, save flow, DLC, or every previously tested rendering path works.
+
+## 2026-11-19 update 42: official 1.03 gameplay, 4K, HD textures and aspect fit
+
+Official 1.03 now reaches and plays a scripted round at native 3840x2160. Course, ball flight, golfer, HUD and swing frames were inspected in `work/runtime/shots-official-1.03-4k-hd-official/`. The run exited cleanly and logged no unresolved imports or SPU dispatch misses.
+
+The HD workflow now has `--tex-dump`, `--tex-replace` and `--tex-replace-mb`. `tools/make_hd_pack.py --large-scale 4` permits true 4096px output for 1024px sources, checks actual output dimensions on resume, and reports memory from those dimensions. Official 1.03 texture hashes must be used: a 1.02-only sample did not match, while an official 1024x1024 dump upscaled to 4096x4096 loaded in a native 4K round with six mips and no failures. Log: `official-1.03-4k-hd-official.log`.
+
+`--aspect fit` (`RSX_ASPECT=fit`) preserves 16:9 with centered black bars on other aspect ratios. The 3440x1440 title has 440px side bars; `shots-official-1.03-fit-flipfix/shot_165.bmp` also verifies a correctly proportioned course, golfer and HUD. Expanded-FOV ultrawide is not implemented yet; it needs a game camera/frustum hook and HUD anchoring.
+
+Two build/runtime fixes are recorded separately. The clang-cl dependency rule in `port/CMakeLists.txt` now preserves `/MD` and forwards real depfile generation; Ninja's `main.cpp` dependency count went from 0 to 392, fixing stale header builds. Patch `0053` guards flip markers behind or racing the walker. Those guards fire in real runs, but `official-1.03-fit-flipfix2.log` still shows one unreached marker after a later wrap, so the intermittent stall remains open. Do not call it fixed.
+
+Official executable at the time of this update: `build/official-1.03/HotShotsGolfRecomp.exe`, SHA-256 `c6ab494ae36dc2ca5cb0c49bdfde4bba3420b2e534235a58cb623502a1c22ff0`. Profile and roadmap: `config/profile-1.03.json` and `docs/MODERN-PC-ROADMAP.md`. Renderer patches: `0052-aspect-fit.patch` and `0053-flip-marker-behind-walker.patch`.
+
+## 2026-11-20 update 43: the flip freeze after a ring wrap is fixed (patch 0054)
+
+The official 1.03 build froze after a few thousand frames: the main thread waited in `cellGcmGetFlipStatus` with one flip queued and never completed. The cause was the wait before the command ring wraps back to its start. It treated the walker as finished once its read position left the range before the flip marker. The walker also follows the game's CALLs into command blocks outside the ring, so the wrap went ahead with the walker still a frame behind, and that frame's flip marker never ran.
+
+Patch `0054` publishes `put` up to the flip marker before the wrap. It then waits until the walker's read position sits on the marker or that flip has been reached. The wait gives up after 2 seconds without walker progress or 10 seconds in total, and it never completes a flip itself. A give-up is always logged. `GCM_FLIP_WRAP_DRAIN=0` restores the old range test.
+
+Verification used the flip-clock pad script on fresh savedata:
+
+- Run r2 (230 s) ended at fq 4967 and fr 4967, past the old stall point at fq 4127.
+- Run r7 (480 s) ended at fq 8783 and fr 8783 after 8810 flips, with over 1024 wraps and no give-ups. It was still drawing gameplay at the end.
+- A save was created on empty savedata and reloaded in a second run. The reload read every file back at the sizes written.
+
+Still open: one run hung at boot before its first flip, right after the first SPURS job chain. This looks like a separate boot race made more likely by heavy CPU load. One run also took 40 seconds to exit after logging its exit. Logs: `work/verify-0054/`.

@@ -35,3 +35,20 @@ Target set on 2026-11-18: 120+ FPS, 4K output, HD textures, upscaling and frame 
 
 No thread is at 100%. The renderer waits about 60% of each frame for the game, and the game waits for the renderer, so their work runs one after the other. Overlapping them is the first speed target, CPU vertex fetch the second. Resolution does not change FPS, so 4K is blocked only by the depth buffer size.
 
+## Official 1.03 modernization checkpoint (2026-11-19)
+
+- Native 3840x2160 gameplay is verified on official 1.03. Course, golfer, HUD, ball flight and swing frames render at full output size with a 3840x2160 display depth buffer.
+- `--tex-dump`, `--tex-replace` and `--tex-replace-mb` expose the HD texture workflow. Official texture identity must be dumped from official 1.03; an old 1.02-only sample did not match.
+- `tools/make_hd_pack.py --large-scale 4` supports true 4096px output for 1024px sources. Resume checks compare actual PNG dimensions, and memory estimates use the output dimensions.
+- An official 1.03 texture was upscaled from 1024x1024 to 4096x4096 and loaded in a native 4K scripted round with six mip levels and no load failures. Evidence: `work/runtime/logs/official-1.03-4k-hd-official.log` and `work/runtime/shots-official-1.03-4k-hd-official/`.
+- `--aspect fit` / `RSX_ASPECT=fit` preserves 16:9 on non-16:9 windows with centered black bars. A 3440x1440 title capture has 440px side bars and no stretching. This is the safe fallback, not expanded-FOV ultrawide.
+- Expanded ultrawide needs a Hot Shots camera/frustum hook and HUD anchoring. The RFOM recomp's camera-setter approach in `project/stubs.cpp` is the reference; scaling only the final frame is not accepted as expanded support.
+
+### Next priorities
+
+1. Fix the intermittent flip/FIFO wrap stall. Entry/write guards in patch `0053` catch real marker races, but `official-1.03-fit-flipfix2.log` still ends with one queued marker unreached after a wrap. The next hypothesis is to flush and drain the marker before allowing the ring wrap, not another blind retry.
+2. Ship DDS (BC7 where useful) packs to avoid PNG first-load stalls, then build a broader official 1.03 pack.
+3. Implement camera-based Hor+ ultrawide and HUD anchoring, with 21:9 and 32:9 course/swing evidence.
+4. Improve frame pacing and overlap guest/renderer work before pursuing 120 FPS or frame generation.
+5. Replace the `cellSail` movie skip with actual decoding, and broaden save, DLC, physical-controller and audio verification.
+
