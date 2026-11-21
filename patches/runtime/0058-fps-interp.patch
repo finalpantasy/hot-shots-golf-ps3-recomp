@@ -1,0 +1,486 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 37336a0..b62794e 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -30,7 +30,9 @@ static double pad_clock(unsigned long long t0_ms)
+ {
+     static int flips = -1;
+     if (flips < 0) { const char* e = getenv("PAD_CLOCK"); flips = e && !strcmp(e, "flips"); }
+-    return flips ? (double)cellGcm_flip_request_count()
++    /* Under HSG_FPS a flip is not a logic step; count logic steps (= flips otherwise). */
++    extern u32 hsg_fps_logic_flips(void);
++    return flips ? (double)hsg_fps_logic_flips()
+                  : (double)(GetTickCount64() - t0_ms) / 1000.0;
+ }
+ 
+@@ -892,6 +894,7 @@ void cellPad_poll(void)
+ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
+ {
+     { extern void hsg_tweaks_tick(void); hsg_tweaks_tick(); }   /* HSG_TWEAKS per-frame writes */
++    { extern void hsg_fps_poll(u32); hsg_fps_poll(port_no); }   /* HSG_FPS: logic step or in-between */
+     { static int _once = 0;
+       if (!_once++) printf("[cellPad] GetData polling begins (port %u)\n", port_no); }
+     if (!s_pad_initialized)
+@@ -1235,6 +1238,8 @@ emit:
+         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
+         for (int _i = 0; _i < CELL_PAD_MAX_CODES; _i++)                    /* button[] u16 */
+             vm_write16((unsigned long long)ea + 4 + (unsigned int)_i * 2, data->button[_i]);
++        /* HSG_FPS: the report changes only on polls that precede a logic step. */
++        { extern void hsg_fps_pad_filter(u32, u32); hsg_fps_pad_filter(port_no, ea); }
+     }
+     return CELL_OK;
+ }
+diff --git a/libs/system/hsg_fps.c b/libs/system/hsg_fps.c
+new file mode 100644
+index 0000000..b2f0080
+--- /dev/null
++++ b/libs/system/hsg_fps.c
+@@ -0,0 +1,364 @@
++/*
++ * ps3recomp - HSG_FPS=60|90|120: high frame rate for Hot Shots Golf 1.03
++ *
++ * The title runs its logic at 30 Hz, one step per flip. It already has a
++ * fixed-step + interpolation mode, used for its slow motion: Main_Tick
++ * (0x1AB94) counts a sub-frame S = (S+1) % D (GameMain 0xDB8D80 +8, divisor D
++ * at 0xD9C210), runs the logic phases only when S wraps to 0, and on every
++ * frame runs task phase 3 InterpUpdate((S+1)/D); Main_Render draws with phase
++ * 4 InterpDraw. The "fps" lines of config/insn-patches-1.03.json (guard
++ * g_hsg_fps) take that path on every frame, outside slow motion too, and this
++ * file drives it:
++ *
++ *   - D = K * n, where n is the game's own slow-motion factor (1 when there is
++ *     none) and K = HSG_FPS_K_ADDR (12: one logic step in twelfths). The
++ *     patched App_SetSlowMotion / App_StopSlowMotion scale by K, and
++ *     Game_GetTimeScale returns K/D (= 1/n, what the game asks for).
++ *   - Before each tick (the title's port-0 pad poll, hsg_fps_poll) S is set
++ *     from host time, so a logic step happens every 1/30 s (n/30 s in slow
++ *     motion) of wall clock whatever the frame rate, and the in-between
++ *     frames draw the fraction of the step that has passed. Below 30 FPS
++ *     every frame is a logic step, as in the stock game.
++ *   - The renderer time step (0x8D27AC, renderer +0x280 clock and +0x59C
++ *     phase) gets rate 30 * M with M = 1 / (the steps this frame advanced),
++ *     so the renderer clock follows game time (HSG_FPS_M_ADDR). A logic
++ *     frame steps the renderer twice (logic path, then the interpolation
++ *     path); the first call gets the "no advance" flag, as in slow motion.
++ *   - Pad reports change only on polls that precede a logic step (the input
++ *     layer shifts its history on every poll; a press on an in-between frame
++ *     would be gone before the logic saw it): hsg_fps_pad_filter. Input
++ *     devices get their 2 ticks (60 Hz units) only on logic frames.
++ *   - Flip pacing: the patched Renderer_WaitVBlankAndFlip flips on every
++ *     vblank at the 30 FPS setting; hsg_fps_vblank_ms() asks the present
++ *     thread (cellGcm_fifo_kick_wait) for extra vblanks at 30*N Hz above 60.
++ *
++ * The route is on only in SEQ_GAME (0x49, the course) at the 30 FPS setting.
++ * Menus and the 60 FPS swing gauge keep the stock path: in the menus the
++ * character select never takes its last confirm with it on, and the gauge
++ * has its own 60 FPS update. HSG_FPS_MENUS=1 forces it on in the menus too.
++ * The guard changes only at the pad poll, inside Main_Tick before any patched
++ * instruction of that tick reads it.
++ *
++ * HSG_FPS unset, 30 or invalid: hsg_fps_boot() returns after one getenv, the
++ * guard stays 0 and every patched instruction runs its original form.
++ *
++ * Guest words (16 bytes of alignment padding after the TLS template, which
++ * ends at 0xD9C1F0; nothing in the EBOOT refers to them, 0xD9C1F8 is the
++ * ultrawide-cull k of hsg_widecull.c):
++ *   HSG_FPS_KF_ADDR 0xD9C1F0  f32 K  (Game_GetTimeScale numerator)
++ *   HSG_FPS_K_ADDR  0xD9C1F4  s32 K  (slow-motion scale)
++ *   HSG_FPS_M_ADDR  0xD9C1FC  f32 M  (renderer rate multiplier)
++ *
++ * Env: HSG_FPS=60|90|120; HSG_FPS_MENUS=1; HSG_FPS_PACE=frames (fixed
++ * cadence D = N, one logic step every N frames, no host clock);
++ * HSG_FPS_LOG=<csv> (one line per frame: qpc ms, flip, logic steps, S, D, M).
++ * A "[fps]" line every 10 s gives frames/s, logic steps/s and the renderer
++ * clock rate (game seconds per wall second).
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "ps3emu/ps3types.h"
++#include "../../runtime/ppu/ppu_memory.h"
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#else
++#include <time.h>
++#endif
++
++#define HSG_FPS_KF_ADDR   0x00D9C1F0u
++#define HSG_FPS_K_ADDR    0x00D9C1F4u
++#define HSG_FPS_M_ADDR    0x00D9C1FCu
++#define HSG_DIV_ADDR      0x00D9C210u   /* slow-motion divisor D */
++#define HSG_GAMEMAIN      0x00DB8D80u   /* +4 slow motion on, +8 S */
++#define HSG_SEQ_PTR       0x00DB8D68u   /* [ptr]+0xC: global sequence */
++#define HSG_RENDERER_PTR  0x018D7C6Cu   /* [ptr]+0x260: target FPS */
++#define HSG_SEQ_GAME      0x49u
++
++int g_hsg_fps = 0;          /* guard of every "fps" --insn-patches line */
++
++static int s_n;             /* fps / 30 when HSG_FPS is on, else 0 */
++static int s_k;             /* sub-steps per logic step (D = s_k * n) */
++static int s_pace_frames;   /* HSG_FPS_PACE=frames */
++static int s_menus;         /* HSG_FPS_MENUS=1 */
++static int s_ui_frames;     /* HSG_FPS_UI=frames: UI updates every frame */
++static FILE* s_log;
++
++static double now_ms(void)
++{
++#ifdef _WIN32
++    static double f = 0;
++    LARGE_INTEGER c;
++    if (f == 0) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); f = (double)q.QuadPart / 1000.0; }
++    QueryPerformanceCounter(&c);
++    return (double)c.QuadPart / f;
++#else
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++#endif
++}
++
++static u32 seq_now(void)
++{
++    u32 p = vm_read32(HSG_SEQ_PTR);
++    return (p && p < 0xF0000000u) ? vm_read32(p + 0xC) : 0;
++}
++
++static u32 renderer_fps(void)
++{
++    u32 r = vm_read32(HSG_RENDERER_PTR);
++    return (r && r < 0xF0000000u) ? vm_read32(r + 0x260) : 0;
++}
++
++void hsg_fps_boot(void)
++{
++    const char* e = getenv("HSG_FPS");
++    if (!e || !*e) return;
++    int fps = atoi(e);
++    const char* lg = getenv("HSG_FPS_LOG");
++    if (lg && *lg && (fps == 30 || fps == 60 || fps == 90 || fps == 120)) {
++        s_log = fopen(lg, "w");
++        if (s_log) fprintf(s_log, "ms,flip,logic_flips,S,D,M,seq,rclock,rfps,slow,phase\n");
++    }
++    if (fps != 60 && fps != 90 && fps != 120) {
++        if (fps != 30) fprintf(stderr, "[fps] HSG_FPS=%s ignored (use 60, 90 or 120)\n", e);
++        else if (s_log) fprintf(stderr, "[fps] HSG_FPS=30: stock route, frame log only\n");
++        return;
++    }
++    /* The words must be the zero padding and the divisor its default 2;
++     * anything else is another binary or layout, and the route stays off. */
++    if (vm_read32(HSG_FPS_KF_ADDR) != 0u || vm_read32(HSG_FPS_K_ADDR) != 0u ||
++        vm_read32(HSG_FPS_M_ADDR) != 0u || vm_read32(HSG_DIV_ADDR) != 2u) {
++        fprintf(stderr, "[fps] guest words at 0x%08X are not this build's layout; HSG_FPS off\n",
++                HSG_FPS_KF_ADDR);
++        return;
++    }
++    const char* p = getenv("HSG_FPS_PACE");
++    s_pace_frames = p && !strcmp(p, "frames");
++    const char* m = getenv("HSG_FPS_MENUS");
++    s_menus = m && *m == '1';
++    const char* u = getenv("HSG_FPS_UI");
++    s_ui_frames = u && !strcmp(u, "frames");
++    s_n = fps / 30;
++    s_k = s_pace_frames ? s_n : 12;
++    vm_write_f32(HSG_FPS_KF_ADDR, (float)s_k);
++    vm_write32(HSG_FPS_K_ADDR, (u32)s_k);
++    vm_write_f32(HSG_FPS_M_ADDR, (float)s_k);
++    fprintf(stderr, "[fps] HSG_FPS=%d: logic 30 Hz, frames interpolated (%s, K=%d)%s\n", fps,
++            s_pace_frames ? "fixed cadence" : "host clock", s_k,
++            s_menus ? ", menus too" : ", course only");
++}
++
++/* State of the pacer, all on the title's main thread (its pad poll). */
++static int    s_on;               /* the guard as last set */
++static u32    s_last_flip = 0xFFFFFFFFu;   /* GameMain+0 tick of the last decision */
++static double s_step_t0;          /* host ms of the last logic step, 0 = none yet */
++static double s_dt;               /* smoothed frame time */
++static double s_prev_ms;
++static int    s_hold;             /* the coming tick is an in-between frame */
++static int    s_prev_s = -1, s_prev_d;
++static unsigned long long s_steps, s_frames;   /* logic steps / frames while on */
++static u32    s_stock_div = 2;    /* divisor in stock units while the route is off */
++static double s_last_m;           /* M written this frame */
++
++/* Logic steps so far (every flip while off counts as one): the PAD_CLOCK=flips
++ * clock under HSG_FPS, so a flip-timed pad script presses at the same game
++ * moment at any frame rate. */
++static u32 s_between;         /* in-between frames so far: flips that were no logic step */
++u32 hsg_fps_logic_flips(void)
++{
++    extern u32 cellGcm_flip_request_count(void);
++    return cellGcm_flip_request_count() - s_between;
++}
++
++/* Main_Tick's three per-frame UI updates (chlib message queue, widget tree,
++ * layout animation; vcalls returning to these addresses) advance one step per
++ * call. On in-between frames ps3_indirect_call skips them, so UI animation keeps
++ * the logic rate. Callers ignore the return value; registers stay as they were.
++ *
++ * Input_Update (0x77CF90) hands each input device (vcall +0x10 in 0x9D5840,
++ * returning to 0x9D58BC) the number of 60 Hz ticks since the last call, 2 at
++ * the 30 FPS setting. Its hold/repeat counters count those ticks, so on an
++ * in-between frame the device gets 0 ticks (*r4): 60 ticks per second of game
++ * time at any frame rate. The decision for this frame is made here first
++ * (hsg_fps_poll is idempotent per flip), in case the pad poll comes later. */
++void hsg_fps_poll(u32 port_no);
++int hsg_fps_skip_icall(u32 lr, u64* r4)
++{
++    if (!s_on) return 0;
++    if (lr == 0x009D58BCu) {
++        hsg_fps_poll(0);
++        if (s_on && s_hold && !s_ui_frames && r4) *r4 = 0;
++        return 0;
++    }
++    if (!s_hold || s_ui_frames) return 0;
++    return lr == 0x0001AFF0u || lr == 0x0001B078u || lr == 0x0001B0A4u;
++}
++
++static void set_guard(int on)
++{
++    if (on == s_on) return;
++    u32 d = vm_read32(HSG_DIV_ADDR);
++    const int slow = vm_read8(HSG_GAMEMAIN + 4) != 0;
++    if (on) {
++        /* stock units -> sub-steps: D = K * n (n = 1 outside slow motion) */
++        s_stock_div = d;
++        d = slow ? d * (u32)s_k : (u32)s_k;
++        vm_write32(HSG_DIV_ADDR, d);
++        vm_write32(HSG_GAMEMAIN + 8, 0);
++        s_step_t0 = 0; s_prev_s = -1;
++    } else {
++        d = slow ? (d / (u32)s_k ? d / (u32)s_k : 1u) : s_stock_div;
++        vm_write32(HSG_DIV_ADDR, d);
++        if (slow) vm_write32(HSG_GAMEMAIN + 8, 0);
++    }
++    g_hsg_fps = on;
++    s_on = on;
++    {   /* HSG_FPS_DEBUG=1: the per-tick virtual calls Main_Tick makes on every frame. */
++        static int dbg = -1;
++        if (dbg < 0) { const char* e = getenv("HSG_FPS_DEBUG"); dbg = e && *e == '1'; }
++        if (dbg && on) {
++            static const u32 slot[][2] = { {0x18A414Cu, 0xC}, {0x18A4154u, 0xC}, {0x185EFE0u, 0x10},
++                                           {0x18A7104u, 0x40}, {0x18A7100u, 0x40}, {0x18A7128u, 0x40} };
++            for (int i = 0; i < 6; i++) {
++                u32 o = vm_read32(slot[i][0]), vt = o ? vm_read32(o) : 0;
++                u32 dsc = vt ? vm_read32(vt + slot[i][1]) : 0;
++                fprintf(stderr, "[fps] [0x%X] obj 0x%X vtable 0x%X +0x%X -> 0x%X\n", slot[i][0], o, vt,
++                        slot[i][1], dsc ? vm_read32(dsc) : 0);
++            }
++        }
++    }
++    fprintf(stderr, "[fps] seq=0x%X fps=%u: interpolation %s\n", seq_now(), renderer_fps(),
++            on ? "on" : "off");
++}
++
++/* Once per tick, before Main_Tick reads S: choose whether this tick is a logic
++ * step and, if not, how far into the step it draws. */
++static void pace(void)
++{
++    const double t = now_ms();
++    int d = (int)vm_read32(HSG_DIV_ADDR);
++    if (d < 1 || d > 100000) d = s_k;
++    int s_new;
++    if (s_pace_frames) {
++        s_new = ((int)vm_read32(HSG_GAMEMAIN + 8) + 1) % d;
++        if (s_new < 0) s_new = 0;
++    } else {
++        /* One logic step per 1/30 s of host time (n/30 s in slow motion). A
++         * frame takes the step once the frame after it would land past the
++         * middle of the next step, so a host near 30 FPS steps on nearly
++         * every frame instead of alternating long and short steps. A frame
++         * that comes late does not lose the time: the step clock advances by
++         * whole steps, so the following frames step until it has caught up.
++         * Only a backlog over 2 steps (a hitch, a load, a host below 30 FPS)
++         * is dropped, as the stock game would. */
++        const double step = 1000.0 / 30.0 * (double)d / (double)s_k;
++        if (s_prev_ms != 0) { const double f = t - s_prev_ms; s_dt = s_dt == 0 ? f : s_dt + (f - s_dt) * 0.25; }
++        /* A host at or below 30 FPS gets the stock cadence: every frame is one
++         * 30 Hz frame (a logic step, or 1/n of one in slow motion). Pacing by
++         * the clock there only adds in-between frames after hitches and runs
++         * the game slower than stock. Hysteresis: in above 35 ms, out below 31. */
++        static int slow_host;
++        if (s_dt > 35.0) slow_host = 1; else if (s_dt < 31.0) slow_host = 0;
++        if (slow_host && s_step_t0 != 0 && s_prev_d == d) {
++            const int sp = s_prev_s < 0 ? 0 : s_prev_s;
++            s_new = sp + s_k >= d ? 0 : sp + s_k;
++            s_step_t0 = t - (double)s_new / (double)d * step;
++        } else if (s_step_t0 == 0 || t + s_dt * 0.5 >= s_step_t0 + step) {
++            const double next = s_step_t0 + step;
++            s_step_t0 = (s_step_t0 == 0 || t - next > 2.0 * step) ? t : next;
++            s_new = 0;
++        } else {
++            s_new = (int)((t - s_step_t0) / step * (double)d);
++            if (s_prev_s > 0 && s_prev_d == d && s_new < s_prev_s) s_new = s_prev_s;   /* monotonic */
++            if (s_new < 1) s_new = 1;
++            if (s_new > d - 1) s_new = d - 1;
++        }
++        /* The tick adds one: store the value before it. */
++        vm_write32(HSG_GAMEMAIN + 8, (u32)((s_new + d - 1) % d));
++    }
++    s_prev_ms = t;
++    /* Steps this frame advances: a logic frame closes the previous step. */
++    double adv;
++    if (s_prev_s < 0 || s_prev_d != d) adv = 1.0 / (double)d;
++    else if (s_new == 0) adv = (double)(d - s_prev_s) / (double)d;
++    else adv = (double)(s_new - s_prev_s) / (double)d;
++    if (adv < 1.0 / 1024.0) adv = 1.0 / 1024.0;
++    vm_write_f32(HSG_FPS_M_ADDR, (float)(1.0 / adv));
++    s_prev_s = s_new; s_prev_d = d;
++    s_hold = s_new != 0;
++    s_frames++;
++    if (s_new == 0) s_steps++; else s_between++;
++
++    /* Rate report: frames, logic steps and renderer clock (+0x280, game
++     * seconds) per wall second over 10 s windows. */
++    static double rep_t, rep_rc; static unsigned long long rep_f, rep_s;
++    const u32 r = vm_read32(HSG_RENDERER_PTR);
++    const double rc = (r && r < 0xF0000000u) ? (double)vm_read_f32(r + 0x280) : 0;
++    if (rep_t == 0) { rep_t = t; rep_f = s_frames; rep_s = s_steps; rep_rc = rc; }
++    else if (t - rep_t >= 10000.0) {
++        const double w = (t - rep_t) / 1000.0;
++        fprintf(stderr, "[fps] %.1f frames/s, %.2f logic steps/s, renderer clock %.3f s/s (D=%d)\n",
++                (double)(s_frames - rep_f) / w, (double)(s_steps - rep_s) / w, (rc - rep_rc) / w, d);
++        rep_t = t; rep_f = s_frames; rep_s = s_steps; rep_rc = rc;
++    }
++    s_last_m = 1.0 / adv;
++}
++
++/* HSG_FPS_LOG: one line per frame (stock route too, with HSG_FPS=30). */
++static void log_frame(u32 fc)
++{
++    static unsigned lines;
++    const u32 r = vm_read32(HSG_RENDERER_PTR);
++    const double rc = (r && r < 0xF0000000u) ? (double)vm_read_f32(r + 0x280) : 0;
++    const double ph = (r && r < 0xF0000000u) ? (double)vm_read_f32(r + 0x59C) : 0;
++    fprintf(s_log, "%.3f,%u,%u,%d,%d,%.4f,%u,%.4f,%u,%u,%.4f\n", now_ms(), fc, hsg_fps_logic_flips(),
++            s_on ? s_prev_s : -1, s_on ? s_prev_d : 0, s_on ? s_last_m : 0.0, seq_now(), rc,
++            renderer_fps(), (unsigned)vm_read8(HSG_GAMEMAIN + 4), ph);
++    if (++lines % 32 == 0) fflush(s_log);
++}
++
++/* cellPadGetData, before the report is built. */
++void hsg_fps_poll(u32 port_no)
++{
++    if ((!s_n && !s_log) || port_no != 0) return;
++    extern u32 cellGcm_flip_request_count(void);
++    const u32 fc = cellGcm_flip_request_count();
++    /* One decision per Main_Tick: GameMain+0 counts ticks and is bumped at the
++     * top of the tick, before the flip and the pad poll. (The flip count is
++     * kept by the RSX thread and can lag or skip a tick.) */
++    const u32 tick = vm_read32(HSG_GAMEMAIN);
++    if (tick == s_last_flip) return;
++    s_last_flip = tick;
++    if (s_n) {
++        const int want = (s_menus || seq_now() == HSG_SEQ_GAME) && renderer_fps() == 30;
++        set_guard(want);
++        if (want) pace(); else s_hold = 0;
++    }
++    if (s_log) log_frame(fc);
++}
++
++/* cellPadGetData, after the report is written to guest memory at ea. */
++void hsg_fps_pad_filter(u32 port_no, u32 ea)
++{
++    enum { PADLEN = 4 + 2 * 64 };
++    static u8 saved[8][PADLEN]; static int have[8];
++    if (!s_n || port_no >= 8 || !ea) return;
++    if (s_on && s_hold && have[port_no]) {
++        for (int i = 0; i < PADLEN; i++) vm_write8(ea + (u32)i, saved[port_no][i]);
++    } else {
++        for (int i = 0; i < PADLEN; i++) saved[port_no][i] = vm_read8(ea + (u32)i);
++        have[port_no] = 1;
++    }
++}
++
++/* Present thread: the vblank period it should add ticks at, or 0 for none
++ * (the stock 60 Hz ticker is enough). Above 60 FPS while the route is on. */
++double hsg_fps_vblank_ms(void)
++{
++    if (s_n <= 2 || !s_on) return 0.0;
++    return 1000.0 / (30.0 * (double)s_n);
++}
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index b1575a3..7446e6e 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1069,7 +1069,12 @@ void ppu_gcm_pump(void)
+ 
+ /* Back-compat: the old direct entry points now just mark a tick pending (so any
+  * caller other than the ticker still works) -- delivery stays on the main thread. */
+-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
++static LONGLONG s_vblank_qpc;   /* host time of the last tick (HSG_FPS extra vblanks) */
++void cellGcmTickVBlank(void)
++{
++    LARGE_INTEGER c; QueryPerformanceCounter(&c); s_vblank_qpc = c.QuadPart;
++    s_vblank_count++; GCM_PENDING_SET(1);
++}
+ /* Only deliver a flip completion when a flip is actually outstanding.
+  *
+  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
+@@ -2077,6 +2082,29 @@ void cellGcm_fifo_kick_wait(unsigned ms)
+     static int on = -1;
+     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
+     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
++    /* HSG_FPS=90|120 (libs/system/hsg_fps.c): vblanks at 30*N Hz while the
++     * title flips on every vblank. The host ticker keeps its own 16 ms ticks;
++     * this adds one whenever a period has passed since the last tick of
++     * either source, so the guest can flip up to 30*N times a second. */
++    {   extern double hsg_fps_vblank_ms(void);
++        const double per = hsg_fps_vblank_ms();
++        if (per > 0.0) {
++            static LARGE_INTEGER f;
++            LARGE_INTEGER c;
++            if (!f.QuadPart) QueryPerformanceFrequency(&f);
++            QueryPerformanceCounter(&c);
++            double left = per - (double)(c.QuadPart - s_vblank_qpc) * 1000.0 / (double)f.QuadPart;
++            if (left > 0.0) {
++                DWORD w = (DWORD)left;
++                if (w > ms) w = ms;
++                if (ev) WaitForSingleObject(ev, w); else Sleep(w);
++                QueryPerformanceCounter(&c);
++                left = per - (double)(c.QuadPart - s_vblank_qpc) * 1000.0 / (double)f.QuadPart;
++            }
++            if (left <= 0.5) { cellGcmTickVBlank(); cellGcmTickFlip(); }
++            return;
++        }
++    }
+     if (ev) WaitForSingleObject(ev, ms);
+     else    Sleep(ms);
+ }
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 6ef6356..9d7fa27 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2705,8 +2705,13 @@ extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
+     ps3_indirect_call(ctx);
+ }
+ 
++extern "C" int g_hsg_fps;                     /* libs/system/hsg_fps.c */
++extern "C" int hsg_fps_skip_icall(uint32_t lr, uint64_t* r4);
+ extern "C" void ps3_indirect_call(ppu_context* ctx)
+ {
++    /* HSG_FPS: per-frame UI updates run once per logic step, not per frame;
++     * input devices get 0 ticks on in-between frames (libs/system/hsg_fps.c). */
++    if (g_hsg_fps && hsg_fps_skip_icall((uint32_t)ctx->lr, &ctx->gpr[4])) { g_icall_target_set = 0; return; }
+     static int on = -1;
+     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
+     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
+@@ -3687,6 +3692,7 @@ static int32_t g_ppu_primary_priority = 1001;
+ 
+ extern "C" void hsg_tweaks_boot(void);   /* libs/system/hsg_tweaks.c */
+ extern "C" void hsg_widecull_boot(void);  /* libs/system/hsg_widecull.c */
++extern "C" void hsg_fps_boot(void);       /* libs/system/hsg_fps.c */
+ extern "C" uint32_t ppu_load_elf(const char* path)
+ {
+     g_ppu_primary_priority = 1001;
+@@ -3878,6 +3884,9 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+     hsg_tweaks_boot();
+     /* RSX_ASPECT=expand: widen the guest culling aspect (patch 0062). */
+     hsg_widecull_boot();
++    /* HSG_FPS=60|90|120: interpolated frames (libs/system/hsg_fps.c; after
++     * widecull, whose padding check it shares). */
++    hsg_fps_boot();
+     return entry;
+ }
+ 
