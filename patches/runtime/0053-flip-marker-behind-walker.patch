@@ -1,0 +1,36 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index aa6997d..8800c94 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -3630,10 +3630,29 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+      * full segment is closed first instead. */
+     if (!gcm_ctx_room(ctx, 8)) return 0;
+     const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
+-    if (gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
++    const u32 marker_io = gcm_ea2io(cur), io_end = gcm_ea2io(end);
++    if (marker_io == 0xFFFFFFFFu) return 0;
++    /* If the walker already passed this address, a queued marker would not run
++     * until the next lap while the game waits for it now. Everything before it
++     * has already executed, so use the immediate-flip path instead. */
++    if (s_fifo_getoff > marker_io && s_fifo_getoff <= io_end) {
++        fprintf(stderr, "[marker] flip marker is behind the walker: io=0x%X get=0x%X; using immediate flip%c",
++                marker_io, s_fifo_getoff, 10);
++        return 0;
++    }
+     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
+     s_fifo_flips_queued++;
+-    s_dbg_marker_io = gcm_ea2io(cur); s_dbg_marker_ctx = ctx;
++    s_dbg_marker_io = marker_io; s_dbg_marker_ctx = ctx;
++    /* Close the write race too: the walker may have read the old NOP at cur
++     * just before the marker store. Only cancel it if no drain consumed it. */
++    if (s_fifo_getoff > marker_io && s_fifo_getoff <= io_end &&
++        s_fifo_flips_reached < s_fifo_flips_queued) {
++        vm_write32(cur, 0);
++        s_fifo_flips_queued--;
++        fprintf(stderr, "[marker] flip marker write raced the walker: io=0x%X get=0x%X; using immediate flip%c",
++                marker_io, s_fifo_getoff, 10);
++        return 0;
++    }
+     if (gcm_marker_dbg()) fprintf(stderr, "[marker] write io=0x%X fq=%u getoff=0x%X put=0x%X end_room=0x%X%c",
+                                   s_dbg_marker_io, s_fifo_flips_queued, s_fifo_getoff,
+                                   vm_read32(GCM_CONTROL_GUEST_ADDR), end - (cur + 4), 10);
