@@ -39,6 +39,7 @@
 #include "win32_compat.h"
 #include "cli_options.h"
 
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -229,15 +230,30 @@ static DWORD WINAPI frame_clock(LPVOID)
 
     bool window_open = rsx_ok;
     unsigned  last_flip = 0;
-    ULONGLONG next_tick = GetTickCount64();
+    /* Vblank period from steady_clock (QueryPerformanceCounter on Windows):
+     * 59.94 Hz like the PS3's NTSC-rate output. The old GetTickCount64 tick
+     * stepped `+= 16` ms in 15.6 ms units, so it ran at 62.5 Hz and the game
+     * logic (paced on the vblank count) ran about 4% fast and in bursts.
+     * RT_VBLANK_HZ=<hz> overrides (for example 60, or 62.5 for the old rate). */
+    double vblank_hz = 59.94;
+    if (const char* e = getenv("RT_VBLANK_HZ")) {
+        double v = atof(e);
+        if (v >= 10.0 && v <= 1000.0) vblank_hz = v;
+    }
+    fprintf(stderr, "[rsx] vblank ticker %.3f Hz\n", vblank_hz);
+    typedef std::chrono::steady_clock vclock;
+    const vclock::time_point t0 = vclock::now();
+    const double period_s = 1.0 / vblank_hz;
+    unsigned long long tick_index = 0;     /* ticks fired since t0 */
 
     for (;;) {
         /* Wake when a guest thread needs the FIFO walker. */
         cellGcm_fifo_kick_wait(4);
-        ULONGLONG now = GetTickCount64();
+        const double now_s =
+            std::chrono::duration<double>(vclock::now() - t0).count();
 
         int fired = 0;
-        while ((long long)(now - next_tick) >= 0 && fired < 240) {
+        while ((double)tick_index * period_s <= now_s && fired < 240) {
             cellGcmTickVBlank();
             cellGcmTickFlip();
             /* Present a pending flip BEFORE draining any further. The flip
@@ -253,10 +269,11 @@ static DWORD WINAPI frame_clock(LPVOID)
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
             if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;             /* ~60 Hz */
+            tick_index++;
             fired++;
         }
-        if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
+        /* Fell too far behind -- resync to now. */
+        if (fired >= 240) tick_index = (unsigned long long)(now_s / period_s) + 1;
 
         /* Drain at the outer cadence too, not only on the 16 ms tick: titles
          * fence every render pass on a label the drain writes, and one wave of
