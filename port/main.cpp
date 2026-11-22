@@ -220,9 +220,119 @@ static void present_guest_frame(void)
     InterlockedIncrement(&g_frames_presented);
 }
 
+/* FRAME_WD=<ms>: watch the frame clock thread (FIFO walker, present and the
+ * Win32 message pump). When one pass of its loop takes longer than <ms>, the
+ * window stops answering (Windows shows "Not Responding" after 5 s): log the
+ * stall and its host call stack (image RVAs; symbolize with llvm-nm), again
+ * every <ms> while it lasts, and its length when it ends. Off by default. */
+static volatile LONG g_fc_beat = 0;
+#ifdef _WIN32
+static HANDLE g_fc_thread = NULL;
+static void fc_wd_sample(unsigned long long stuck_ms)
+{
+    DWORD64 pcs[32];
+    int n = 0;
+    if (SuspendThread(g_fc_thread) == (DWORD)-1) return;
+    CONTEXT c;
+    memset(&c, 0, sizeof c);
+    c.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(g_fc_thread, &c)) {
+        /* No CRT, heap or stdio call while the thread is suspended: it may
+         * hold their locks. */
+        for (; n < 32 && c.Rip; n++) {
+            pcs[n] = c.Rip;
+            DWORD64 base = 0;
+            PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, NULL);
+            if (f) {
+                PVOID hd; DWORD64 ef;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &ef, NULL);
+            } else {
+                c.Rip = *(DWORD64*)c.Rsp;   /* leaf function */
+                c.Rsp += 8;
+            }
+        }
+    }
+    ResumeThread(g_fc_thread);
+    const DWORD64 img = (DWORD64)GetModuleHandleA(NULL);
+    char line[2048];
+    int len = snprintf(line, sizeof line, "[FRAME-WD] frame thread stuck %llums:", stuck_ms);
+    for (int i = 0; i < n && len < (int)sizeof line - 80; i++) {
+        HMODULE m = NULL;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)pcs[i], &m) && m && (DWORD64)m != img) {
+            GetModuleFileNameA(m, name, sizeof name);
+            const char* b = strrchr(name, '\\');
+            len += snprintf(line + len, sizeof line - len, " %s+0x%llX", b ? b + 1 : name,
+                            (unsigned long long)(pcs[i] - (DWORD64)m));
+        } else {
+            len += snprintf(line + len, sizeof line - len, " 0x%llX",
+                            (unsigned long long)(pcs[i] - img));
+        }
+    }
+    fprintf(stderr, "%s\n", line);
+    fflush(stderr);
+}
+static DWORD WINAPI fc_wd(LPVOID p)
+{
+    const unsigned long long lim = (unsigned long long)(uintptr_t)p;
+    LONG last = g_fc_beat;
+    unsigned long long since = GetTickCount64(), next = lim, longest = 0;
+    int samples = 0;
+    for (;;) {
+        Sleep(lim >= 400 ? 100 : 25);
+        LONG b = g_fc_beat;
+        unsigned long long now = GetTickCount64();
+        if (b != last) {
+            if (next > lim) {
+                if (now - since > longest) longest = now - since;
+                fprintf(stderr, "[FRAME-WD] frame thread resumed after %llums (longest %llums)\n",
+                        now - since, longest);
+            }
+            last = b; since = now; next = lim;
+            continue;
+        }
+        if (now - since >= next) {
+            if (samples < 400) { samples++; fc_wd_sample(now - since); }
+            next += lim;
+        }
+    }
+    return 0;
+}
+static void fc_wd_start(void)
+{
+    const char* e = getenv("FRAME_WD");
+    int ms = e ? atoi(e) : 0;
+    if (ms <= 0) return;
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_fc_thread,
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                    FALSE, 0);
+    if (!g_fc_thread) return;
+    fprintf(stderr, "[FRAME-WD] frame thread watchdog armed: %dms\n", ms);
+    HANDLE h = CreateThread(NULL, 64u * 1024, fc_wd, (LPVOID)(uintptr_t)ms, 0, NULL);
+    if (h) CloseHandle(h);
+}
+#else
+static void fc_wd_start(void) {}
+#endif
+
 static DWORD WINAPI frame_clock(LPVOID)
 {
     const char* title = g_window_title.empty() ? "ps3recomp" : g_window_title.c_str();
+    fc_wd_start();
+#ifdef _WIN32
+    /* This thread owns the window and pumps its messages between FIFO drains.
+     * A drain that compiles shaders or loads HD textures can hold it for 5 to
+     * 20 s with a cold shader cache; after 5 s Windows swaps the game window
+     * for a "Not Responding" ghost and offers to close it, so a pause reads as
+     * a crash. Keep the real window (the game resumes by itself; FRAME_WD logs
+     * the stall). RT_WINDOW_GHOSTING=1 keeps the Windows default. */
+    {
+        const char* g = getenv("RT_WINDOW_GHOSTING");
+        if (!(g && g[0] == '1')) DisableProcessWindowsGhosting();
+    }
+#endif
 
     int rsx_ok = (rsx_backend_init(g_window_w, g_window_h, title) == 0);
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
@@ -249,6 +359,7 @@ static DWORD WINAPI frame_clock(LPVOID)
     for (;;) {
         /* Wake when a guest thread needs the FIFO walker. */
         cellGcm_fifo_kick_wait(4);
+        InterlockedIncrement(&g_fc_beat);   /* FRAME_WD */
         const double now_s =
             std::chrono::duration<double>(vclock::now() - t0).count();
 
