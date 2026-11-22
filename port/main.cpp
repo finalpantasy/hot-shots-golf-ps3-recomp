@@ -228,6 +228,21 @@ static void present_guest_frame(void)
 static volatile LONG g_fc_beat = 0;
 #ifdef _WIN32
 static HANDLE g_fc_thread = NULL;
+/* The game window, for IsHungAppWindow: whether Windows counts it as Not
+ * Responding (its thread has not read its message queue for 5 s). With
+ * RT_WINDOW_THREAD (default) the window has a thread of its own and this stays
+ * 0 through frame-thread stalls. */
+static int fc_wd_window_hung(void)
+{
+    HWND w = NULL;
+    while ((w = FindWindowExA(NULL, w, "ps3recomp_d3d12", NULL)) != NULL) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid == GetCurrentProcessId()) return IsHungAppWindow(w) ? 1 : 0;
+    }
+    return -1;   /* no window */
+}
+static int g_fc_hung_samples = 0;
 static void fc_wd_sample(unsigned long long stuck_ms)
 {
     DWORD64 pcs[32];
@@ -255,7 +270,9 @@ static void fc_wd_sample(unsigned long long stuck_ms)
     ResumeThread(g_fc_thread);
     const DWORD64 img = (DWORD64)GetModuleHandleA(NULL);
     char line[2048];
-    int len = snprintf(line, sizeof line, "[FRAME-WD] frame thread stuck %llums:", stuck_ms);
+    const int hung = fc_wd_window_hung();
+    if (hung > 0) g_fc_hung_samples++;
+    int len = snprintf(line, sizeof line, "[FRAME-WD] frame thread stuck %llums (window-hung=%d):", stuck_ms, hung);
     for (int i = 0; i < n && len < (int)sizeof line - 80; i++) {
         HMODULE m = NULL;
         char name[MAX_PATH] = "?";
@@ -287,8 +304,8 @@ static DWORD WINAPI fc_wd(LPVOID p)
         if (b != last) {
             if (next > lim) {
                 if (now - since > longest) longest = now - since;
-                fprintf(stderr, "[FRAME-WD] frame thread resumed after %llums (longest %llums)\n",
-                        now - since, longest);
+                fprintf(stderr, "[FRAME-WD] frame thread resumed after %llums (longest %llums; window Not Responding samples so far: %d)\n",
+                        now - since, longest, g_fc_hung_samples);
             }
             last = b; since = now; next = lim;
             continue;
