@@ -16,9 +16,8 @@ settings file (the newest 10 are kept), ending with the exit code.
 Where each setting comes from (checked against the sources, nothing invented):
   Command-line flags: port/cli_options.cpp (parser and --help text) and docs/CLI.md.
   HSG_TWEAKS:         patches/runtime/0059-guest-tweaks.patch (libs/system/hsg_tweaks.c).
-  HSG_FPS:            NOT found anywhere in the code or patches yet (see FPS below).
-  --aspect expand:    NOT in port/cli_options.cpp yet (it accepts only stretch and fit);
-                      planned for patch 0055.
+  HSG_FPS:            patches/runtime/0058 (30 = off, 60/90/120 on the course).
+  --aspect expand:    patches/runtime/0055 (Hor+ ultrawide).
 """
 import argparse
 import json
@@ -46,9 +45,9 @@ RESOLUTIONS = [
     ("Custom", 0, 0),
 ]
 # Source: --aspect, port/cli_options.cpp line "stretch (default) or fit"; env RSX_ASPECT.
-# "expand" is NOT accepted by current builds (patch 0055 pending). Experimental.
+# "expand" = Hor+ ultrawide (patch 0055).
 ASPECTS = ["stretch", "fit", "expand"]
-EXPERIMENTAL_ASPECTS = {"expand"}
+EXPERIMENTAL_ASPECTS = set()
 # Source: --windowed (default), --fullscreen, --hidden in port/cli_options.cpp.
 WINDOW_MODES = ["windowed", "fullscreen", "hidden"]
 # FPS: HSG_FPS is not read by any code in this repo yet. It is exported only when
@@ -65,7 +64,7 @@ DEFAULTS = {
     "tex_replace": "",        # --tex-replace <dir>   (port/cli_options.cpp, patch 0047)
     "tex_replace_mb": 768,    # --tex-replace-mb      (docs/CLI.md default 768)
     "tex_dump": "",           # --tex-dump <dir>      (port/cli_options.cpp, patch 0047)
-    "fps": "Default",         # HSG_FPS               (not implemented yet)
+    "fps": "Default",         # HSG_FPS               (patch 0058)
     "tweaks": "",             # HSG_TWEAKS=<json>     (patch 0059)
     "mute": False,            # --mute                (port/cli_options.cpp)
     # Paths. Blank means "use the exe's default" from docs/CLI.md and no flag is passed.
@@ -201,9 +200,8 @@ def validate(s, settings_file):
     if s["aspect"] in EXPERIMENTAL_ASPECTS:
         warns.append("Aspect 'expand' is experimental (patch 0055). Builds without it "
                      "reject the option and exit with code 2.")
-    if s["fps"] != "Default":
-        warns.append("Frame rate %s is experimental. HSG_FPS is not in the code yet, "
-                     "so current builds ignore it." % s["fps"])
+    if s["fps"] in ("60", "90", "120"):
+        warns.append("Frame rates above 30 are opt-in (patch 0058) and apply on the course only.")
     if s["tweaks"]:
         warns.append("Guest tweaks are experimental (patch 0059).")
     if s["extra_args"]:
@@ -240,7 +238,7 @@ def build_command(s, settings_file):
     if s["tweaks"]:
         env["HSG_TWEAKS"] = _abs(base, s["tweaks"])           # patch 0059
     if s["fps"] != "Default":
-        env["HSG_FPS"] = s["fps"]                             # not implemented yet
+        env["HSG_FPS"] = s["fps"]                             # patch 0058
     if s["extra_args"]:
         argv += shlex.split(s["extra_args"], posix=False)
     return argv, env, os.path.dirname(exe)
@@ -368,11 +366,11 @@ def run_gui(settings_file):
     ttk.Entry(cf, textvariable=var("height", tk.IntVar), width=7).pack(side="left")
     ttk.Label(d, text="Aspect mode").grid(row=2, column=0, sticky="w", pady=2)
     ttk.Combobox(d, textvariable=var("aspect"), state="readonly",
-                 values=["stretch", "fit", "expand (experimental)"]).grid(
+                 values=["stretch", "fit", "expand (ultrawide)"]).grid(
         row=2, column=1, sticky="w", padx=4)
-    V["aspect"].set("expand (experimental)" if s["aspect"] == "expand" else s["aspect"])
+    V["aspect"].set("expand (ultrawide)" if s["aspect"] == "expand" else s["aspect"])
     ttk.Label(d, text="stretch fills the window. fit keeps 16:9 with black bars. "
-                      "expand needs patch 0055 (not in current builds).",
+                      "expand widens the view on ultrawide screens.",
               foreground="#666", wraplength=520).grid(row=3, column=1, sticky="w", padx=4)
     ttk.Label(d, text="Window").grid(row=4, column=0, sticky="w", pady=2)
     mf = ttk.Frame(d)
@@ -391,11 +389,11 @@ def run_gui(settings_file):
 
     # Frame rate
     fr = tab("Frame rate")
-    ttk.Label(fr, text="Frame rate (EXPERIMENTAL)").grid(row=0, column=0, sticky="w", pady=2)
+    ttk.Label(fr, text="Frame rate").grid(row=0, column=0, sticky="w", pady=2)
     ttk.Combobox(fr, textvariable=var("fps"), state="readonly",
                  values=FPS_CHOICES).grid(row=0, column=1, sticky="w", padx=4)
-    ttk.Label(fr, text="Experimental, in progress. Sets HSG_FPS, which the code does not "
-                       "read yet, so current builds ignore it.",
+    ttk.Label(fr, text="Sets HSG_FPS. 60, 90 and 120 are opt-in and apply on the course; "
+                       "game logic stays at 30. Menus stay at 30.",
               foreground="#a60", wraplength=520).grid(row=1, column=1, sticky="w", padx=4)
 
     # Advanced
