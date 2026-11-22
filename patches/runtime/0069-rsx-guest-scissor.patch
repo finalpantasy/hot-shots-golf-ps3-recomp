@@ -1,0 +1,71 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -251,6 +251,7 @@
+     ID3D12PipelineState* pso_pre;   /* vp_get_fp_pso result from the pre-pass */
+     u32   pso_tag;      /* fp_tag() when pso_pre was taken; 0 = none */
+     int   expand_clip;  /* RSX_ASPECT=expand: 2D kept in the centered 16:9 area, scissored to it */
++    u32   sc_x, sc_y, sc_w, sc_h;   /* guest scissor (SET_SCISSOR_*) at record time */
+ } D3D12DrawRecord;
+ 
+ /* Capture-only: the guest draw call behind each record, for the rsxcap manifest. */
+@@ -6722,6 +6723,10 @@
+     dr->surf_raw = st ? st->surface_color_offset[st->color_target == 2 ? 1 : 0] : 0;
+     dr->surf_w = st ? st->surface_clip_w : 0;
+     dr->surf_h = st ? st->surface_clip_h : 0;
++    dr->sc_x = st ? st->scissor_x : 0;
++    dr->sc_y = st ? st->scissor_y : 0;
++    dr->sc_w = st ? st->scissor_w : 4096;
++    dr->sc_h = st ? st->scissor_h : 4096;
+     if (!st || !((st->surface_format >> 5) & 7u)) return;
+     dr->has_z = 1;
+     dr->zeta_off = st->surface_zeta_offset;
+@@ -9556,6 +9561,48 @@
+                         dsc.left  = (LONG)(((float)s_d3d.width - cw) * 0.5f + 0.5f);
+                         dsc.right = dsc.left + (LONG)(cw + 0.5f);
+                     }
++                    /* The guest scissor (SET_SCISSOR_HORIZONTAL/VERTICAL) was
++                     * ignored: the scissor always equalled the viewport. The menus
++                     * clip scrolling rows with it -- the club and ball rows on
++                     * the character select drew 1.5 icons past their panel, under
++                     * the arrow. Intersect a display draw's scissor with the guest
++                     * rect, mapped like the viewport (guest surface pixels to the
++                     * fit/stretch display rect). Expand-mode full-width draws keep
++                     * the old rect unless they are centered 2D (expand_clip).
++                     * RSX_SCISSOR=0 turns this off; RSX_SCISSOR_LOG=1 prints each
++                     * distinct guest scissor applied. */
++                    { static int gsc = -1;
++                      if (gsc < 0) { const char* e = getenv("RSX_SCISSOR"); gsc = (e && e[0] == '0') ? 0 : 1; }
++                      if (gsc && cur_rt < 0 && !cur_nc && (!xw || dr->expand_clip) &&
++                          dr->surf_w >= 16 && dr->surf_h >= 16 && dr->surf_w <= 4096 && dr->surf_h <= 4096 &&
++                          dr->sc_w && dr->sc_h &&
++                          (dr->sc_x || dr->sc_y || dr->sc_x + dr->sc_w < dr->surf_w ||
++                           dr->sc_y + dr->sc_h < dr->surf_h)) {
++                          float rx, ry, rw, rh;
++                          display_rect(&rx, &ry, &rw, &rh);
++                          const float sx = rw / (float)dr->surf_w, sy = rh / (float)dr->surf_h;
++                          const float shift = xw ? 0.0f : expand_inset_shift(dr);
++                          const LONG l = (LONG)(rx + shift + (float)dr->sc_x * sx + 0.5f);
++                          const LONG t = (LONG)(ry + (float)dr->sc_y * sy + 0.5f);
++                          const LONG r = (LONG)(rx + shift + (float)(dr->sc_x + dr->sc_w) * sx + 0.5f);
++                          const LONG b = (LONG)(ry + (float)(dr->sc_y + dr->sc_h) * sy + 0.5f);
++                          if (l > dsc.left)   dsc.left = l;
++                          if (t > dsc.top)    dsc.top = t;
++                          if (r < dsc.right)  dsc.right = r;
++                          if (b < dsc.bottom) dsc.bottom = b;
++                          if (dsc.right < dsc.left) dsc.right = dsc.left;
++                          if (dsc.bottom < dsc.top) dsc.bottom = dsc.top;
++                          static int slog = -1;
++                          if (slog < 0) { const char* e = getenv("RSX_SCISSOR_LOG"); slog = (e && e[0] == '1') ? 1 : 0; }
++                          if (slog) { static u32 seen[64]; static int ns = 0;
++                              const u32 key = (dr->sc_x * 31u + dr->sc_y) * 131u + dr->sc_w * 7u + dr->sc_h;
++                              int k = 0; while (k < ns && seen[k] != key) k++;
++                              if (k == ns && ns < 64) { seen[ns++] = key;
++                                  fprintf(stderr, "[scissor] guest %u,%u %ux%u surf %ux%u -> %ld,%ld..%ld,%ld frame %llu%c",
++                                          dr->sc_x, dr->sc_y, dr->sc_w, dr->sc_h, dr->surf_w, dr->surf_h,
++                                          (long)dsc.left, (long)dsc.top, (long)dsc.right, (long)dsc.bottom,
++                                          (unsigned long long)s_d3d.frame_count, 10); } }
++                      } }
+                     dvp_x = dvp.TopLeftX; dvp_y = dvp.TopLeftY;
+                     dvp_w = dvp.Width;    dvp_h = dvp.Height;
+                     if (wpos_dbg_on() && dr->fp_addr && fp_reads_wpos(dr->fp_addr)) {

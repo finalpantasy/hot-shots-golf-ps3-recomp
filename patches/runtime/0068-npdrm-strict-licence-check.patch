@@ -1,0 +1,96 @@
+diff --git a/libs/filesystem/edat.h b/libs/filesystem/edat.h
+--- a/libs/filesystem/edat.h
++++ b/libs/filesystem/edat.h
+@@ -57,6 +57,14 @@
+  * duplicate is ignored). */
+ void edat_add_klicensee(const uint8_t klic[16]);
+ 
++/* Guest-path existence for licence checks (sceNpDrmIsAvailable). The PPU file
++ * layer registers its guest-to-host path translator at start-up, so the answer
++ * follows the same mounts and fallbacks as cellFsOpen. Returns 1 if the file
++ * exists, 0 if not, -1 if no translator is registered. */
++typedef void (*edat_host_path_fn)(char* out, size_t cap, const char* guest);
++void edat_set_host_path_fn(edat_host_path_fn fn);
++int  edat_guest_file_exists(const char* guest_path);
++
+ /* Self-check of the AES-128 and AES-CMAC primitives against the FIPS-197 and
+  * RFC 4493 vectors. Returns 0 if both match. Run once on first use: silently
+  * wrong crypto here produces plausible-looking garbage, which is the single most
+diff --git a/libs/filesystem/edat.c b/libs/filesystem/edat.c
+--- a/libs/filesystem/edat.c
++++ b/libs/filesystem/edat.c
+@@ -323,6 +323,21 @@
+ #define EDAT_GUEST_KLIC_MAX 16
+ static uint8_t s_guest_klic[EDAT_GUEST_KLIC_MAX][16];
+ static int     s_guest_klic_n = 0;
++
++static edat_host_path_fn s_host_path_fn = NULL;
++
++void edat_set_host_path_fn(edat_host_path_fn fn) { s_host_path_fn = fn; }
++
++int edat_guest_file_exists(const char* guest_path)
++{
++    if (!s_host_path_fn || !guest_path) return -1;
++    char host[1024];
++    s_host_path_fn(host, sizeof host, guest_path);
++    FILE* f = fopen(host, "rb");
++    if (!f) return 0;
++    fclose(f);
++    return 1;
++}
+ 
+ void edat_add_klicensee(const uint8_t klic[16])
+ {
+diff --git a/libs/network/sceNp.c b/libs/network/sceNp.c
+--- a/libs/network/sceNp.c
++++ b/libs/network/sceNp.c
+@@ -9,6 +9,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdint.h>
++#include <stdlib.h>
+ #include <time.h>
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+ #include "np_psnr.h"
+@@ -502,12 +503,28 @@
+  * that do not apply here.
+  * -----------------------------------------------------------------------*/
+ 
++/* CELL_ENOENT. The game only tests the sign of the result. */
++#define NP_DRM_ERROR_NOT_INSTALLED 0x80010006u
++
+ static s32 np_drm_is_available(const u8* k_licensee, const char* drm_path)
+ {
+     const u8* k = GUEST_PTR(k_licensee, const u8*);
+     const char* path = GUEST_PTR(drm_path, const char*);
+     /* A NULL klicensee is legal for content that needs none; nothing to record. */
+     if (k) edat_add_klicensee(k);
++    /* This returned CELL_OK for every path, so a title that gates DLC on this
++     * call alone (Hot Shots Golf: Drm_IsContentAvailable 0x7E6BD4 tests only
++     * the sign of the result) saw every DLC item as owned even with no licence
++     * file installed. PS3_NPDRM_STRICT=1 reports a missing file as an error, as
++     * hardware does for content that is not installed. Default off: existing
++     * setups keep their current (all-owned) behaviour. */
++    static int strict = -1;
++    if (strict < 0) { const char* e = getenv("PS3_NPDRM_STRICT"); strict = (e && e[0] == '1') ? 1 : 0; }
++    if (strict && path && edat_guest_file_exists(path) == 0) {
++        fprintf(stderr, "[sceNp] DRM availability check: %s -> not installed (0x%08X)\n",
++                path, (unsigned)NP_DRM_ERROR_NOT_INSTALLED);
++        return (s32)NP_DRM_ERROR_NOT_INSTALLED;
++    }
+     fprintf(stderr, "[sceNp] DRM availability check: %s\n", path ? path : "(null)");
+     return CELL_OK;
+ }
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -1170,6 +1170,9 @@
+ 
+ extern "C" void ppu_fs_register(void)
+ {
++    /* sceNpDrmIsAvailable (PS3_NPDRM_STRICT) resolves licence paths with the
++     * same translator as cellFsOpen. */
++    edat_set_host_path_fn(host_path);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
+     /* Register by the literal import NID: LBP imports 0xB1840B53 for
+      * cellFsSdataOpen, which ps3_compute_nid("cellFsSdataOpen") does NOT match
