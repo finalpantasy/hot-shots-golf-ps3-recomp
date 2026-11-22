@@ -1,0 +1,244 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -693,6 +693,13 @@ static u32 s_prof_rf, s_prof_frames, s_prof_ndraw, s_prof_rdraws;
+ static u32 s_prof_full;   /* draws refused: the frame's record table (MAX_DRAWS) was full */
+ static u32 s_prof_ncompile = 0, s_prof_nmemhit = 0, s_prof_ndiskhit = 0, s_prof_npso = 0;
+ static double s_prof_compile = 0.0, s_prof_psotime = 0.0;
++/* RSX_HITCH_MS=<n> (default 100, 0 off): one stderr line for every presented
++ * frame that took n ms or more since the previous Present, splitting the time
++ * spent on the render thread inside it: HLSL compiles, CreateGraphicsPipelineState,
++ * HD texture loads (TEX_REPLACE). What is left is the guest or the GPU. Totals
++ * here are never reset (RSX_PROF resets its own). */
++static double s_hitch_compile = 0.0, s_hitch_pso = 0.0, s_hitch_hdtex = 0.0;
++static u32 s_hitch_ncompile = 0, s_hitch_npso = 0, s_hitch_nhdtex = 0;
+ static int rsx_prof_on(void)
+ {
+     static int v = -1;
+@@ -733,6 +740,27 @@ static int speed_chk_vtx(void)
+ }
+ static void ck(int k, int bad) { s_ck_n[k]++; if (bad) s_ck_bad[k]++; }
+ static void rsxperf_report(double frames);   /* RSX_VTX_CACHE / texture check stats */
++static void rsx_hitch_note(void)
++{
++    static int thr = -1;
++    static double last = 0.0, c0, p0, h0;
++    static u32 nc0, np0, nh0;
++    static u64 n = 0;
++    if (thr < 0) { const char* e = getenv("RSX_HITCH_MS"); thr = e ? atoi(e) : 100; if (thr < 0) thr = 0; }
++    if (!thr) return;
++    const double now = perf_now();
++    n++;
++    if (last != 0.0 && (now - last) * 1000.0 >= thr)
++        fprintf(stderr, "[hitch] frame %llu %.1f ms: shader compile %.1f ms (%u), PSO %.1f ms (%u), "
++                        "HD texture load %.1f ms (%u), other %.1f ms%c",
++                (unsigned long long)n, (now - last) * 1000.0,
++                (s_hitch_compile - c0) * 1000.0, s_hitch_ncompile - nc0,
++                (s_hitch_pso - p0) * 1000.0, s_hitch_npso - np0,
++                (s_hitch_hdtex - h0) * 1000.0, s_hitch_nhdtex - nh0,
++                ((now - last) - (s_hitch_compile - c0) - (s_hitch_pso - p0) - (s_hitch_hdtex - h0)) * 1000.0, 10);
++    last = now; c0 = s_hitch_compile; p0 = s_hitch_pso; h0 = s_hitch_hdtex;
++    nc0 = s_hitch_ncompile; np0 = s_hitch_npso; nh0 = s_hitch_nhdtex;
++}
+ static void rsx_prof_report(void)
+ {
+     static double t_last = 0.0;
+@@ -829,6 +857,31 @@ static const char* rsx_sbc_dir(void)
+     }
+     return dir[0] ? dir : NULL;
+ }
++/* RSX_SHADER_FAST (default 1; 0 off): a shader that is in neither cache is
++ * compiled with D3DCOMPILE_SKIP_OPTIMIZATION and that bytecode is what the disk
++ * cache keeps. fxc spent 1-2.3 s on each branching guest vertex program at the
++ * default level (0.9 s without optimization), all of it on the FIFO walker
++ * thread: a course load froze for 10-30 s on a cold cache. The driver optimizes
++ * the DXBC again when it builds the pipeline. Compiling the optimized version
++ * in the background instead was tried: the next run then fed the driver new
++ * bytecode and paid 100-600 ms per pipeline a second time. */
++static int rsx_shader_fast(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_SHADER_FAST"); v = e ? atoi(e) : 1; }
++    return v;
++}
++static void rsx_sbc_write(const char* path, ID3DBlob* blob)
++{
++    char tmp[MAX_PATH + 80];
++    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentThreadId());
++    FILE* f = fopen(tmp, "wb");
++    if (!f) return;
++    size_t bs = blob->lpVtbl->GetBufferSize(blob);
++    int ok = fwrite(blob->lpVtbl->GetBufferPointer(blob), 1, bs, f) == bs;
++    ok = (fclose(f) == 0) && ok;
++    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileA(tmp);
++}
+ static HRESULT rsx_compile_cached(const char* src, size_t len, const char* name,
+                                   const char* target, ID3DBlob** out)
+ {
+@@ -866,11 +919,31 @@ static HRESULT rsx_compile_cached(const char* src, size_t len, const char* name,
+             fclose(f);
+         }
+     }
++    if (!blob && rsx_shader_fast() > 0) {
++        const double t0 = perf_now();
++        ID3DBlob* err = NULL;
++        HRESULT hr = D3DCompile(src, len, name, NULL, NULL, "main", target, D3DCOMPILE_SKIP_OPTIMIZATION, 0, &blob, &err);
++        const double dt = perf_now() - t0;
++        s_prof_compile += dt; s_prof_ncompile++;
++        s_hitch_compile += dt; s_hitch_ncompile++;
++        if (err) err->lpVtbl->Release(err);
++        if (SUCCEEDED(hr) && blob) {
++            static int _n = 0;
++            if (PS3_LOG_FIRST(_n, 8))
++                fprintf(stderr, "[shader] %s compiled without optimization in %.1f ms (%u bytes HLSL)%c",
++                        name, dt * 1000.0, (unsigned)len, 10);
++            if (path[0]) rsx_sbc_write(path, blob);
++        } else {
++            if (blob) blob->lpVtbl->Release(blob);
++            blob = NULL;            /* fall through to the normal compile */
++        }
++    }
+     if (!blob) {
+         double t0 = perf_now();
+         ID3DBlob* err = NULL;
+         HRESULT hr = D3DCompile(src, len, name, NULL, NULL, "main", target, 0, 0, &blob, &err);
+         s_prof_compile += perf_now() - t0; s_prof_ncompile++;
++        s_hitch_compile += perf_now() - t0; s_hitch_ncompile++;
+         if (FAILED(hr) || !blob) {
+             static int _e = 0; if (PS3_LOG_FIRST(_e, 16))
+                 printf("[D3D12] %s compile FAIL: %s\n", name,
+@@ -880,17 +953,7 @@ static HRESULT rsx_compile_cached(const char* src, size_t len, const char* name,
+             return FAILED(hr) ? hr : E_FAIL;
+         }
+         if (err) err->lpVtbl->Release(err);
+-        if (path[0]) {
+-            char tmp[MAX_PATH + 80];
+-            snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentThreadId());
+-            FILE* f = fopen(tmp, "wb");
+-            if (f) {
+-                size_t bs = blob->lpVtbl->GetBufferSize(blob);
+-                int ok = fwrite(blob->lpVtbl->GetBufferPointer(blob), 1, bs, f) == bs;
+-                ok = (fclose(f) == 0) && ok;
+-                if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileA(tmp);
+-            }
+-        }
++        if (path[0]) rsx_sbc_write(path, blob);
+     }
+     if (s_sbc_n < RSX_SBC_MAX) {
+         blob->lpVtbl->AddRef(blob);
+@@ -4509,6 +4572,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+         s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+     s_prof_psotime += perf_now() - _pc0; s_prof_npso++;
++    s_hitch_pso += perf_now() - _pc0; s_hitch_npso++;
+     pb->lpVtbl->Release(pb);
+     if (FAILED(hr)) {
+         static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
+@@ -4732,9 +4796,60 @@ static void texrep_defer_tick(void)
+  * 1 when the slot now holds it; 0 leaves the guest path to upload as usual. The
+  * decoded file lives only inside this call; its upload buffer is released a few
+  * frames later. */
++/* TEX_REPLACE_RAM_MB=<n> (default 768, 0 off): decoded replacements (after
++ * trp_fit_levels) are kept in memory, least recently used dropped first, so a
++ * texture the guest uploads again (every camera cut re-uploads 40-70 of them)
++ * is copied to the GPU without reading and parsing the file again. */
++typedef struct { TrpEntry* e; u32 w, h, gl; u64 last; TrpImage im; } TrpRam;
++static TrpRam* s_trpram; static u32 s_trpram_n, s_trpram_cap; static u64 s_trpram_bytes, s_trpram_tick;
++static u32 s_trpram_hit, s_trpram_miss;
++static u64 trp_ram_budget(void)
++{
++    static long long v = -1;
++    if (v < 0) { const char* e = getenv("TEX_REPLACE_RAM_MB"); v = e ? atoll(e) : 768; if (v < 0) v = 0; }
++    return (u64)v << 20;
++}
++static TrpRam* trp_ram_find(TrpEntry* e, u32 w, u32 h, u32 gl)
++{
++    for (u32 i = 0; i < s_trpram_n; i++)
++        if (s_trpram[i].e == e && s_trpram[i].w == w && s_trpram[i].h == h && s_trpram[i].gl == gl) {
++            s_trpram[i].last = ++s_trpram_tick; return &s_trpram[i];
++        }
++    return NULL;
++}
++/* Takes ownership of *im when it returns 1. */
++static int trp_ram_put(TrpEntry* e, u32 w, u32 h, u32 gl, const TrpImage* im)
++{
++    const u64 cap = trp_ram_budget();
++    if (!cap || im->bytes > cap / 4) return 0;
++    while (s_trpram_n && s_trpram_bytes + im->bytes > cap) {
++        u32 o = 0;
++        for (u32 i = 1; i < s_trpram_n; i++) if (s_trpram[i].last < s_trpram[o].last) o = i;
++        s_trpram_bytes -= s_trpram[o].im.bytes; trp_img_free(&s_trpram[o].im);
++        s_trpram[o] = s_trpram[--s_trpram_n];
++    }
++    if (s_trpram_n == s_trpram_cap) {
++        u32 nc = s_trpram_cap ? s_trpram_cap * 2 : 256;
++        TrpRam* n = (TrpRam*)realloc(s_trpram, sizeof(TrpRam) * nc);
++        if (!n) return 0;
++        s_trpram = n; s_trpram_cap = nc;
++    }
++    TrpRam* r = &s_trpram[s_trpram_n++];
++    r->e = e; r->w = w; r->h = h; r->gl = gl; r->last = ++s_trpram_tick; r->im = *im;
++    s_trpram_bytes += im->bytes;
++    return 1;
++}
+ static int texrep_apply(VPTexSlot* t, TrpEntry* e, u32 w, u32 h, u32 glevels)
+ {
+     TrpImage im; memset(&im, 0, sizeof im);
++    int in_ram = 0;
++    { TrpRam* r = trp_ram_budget() ? trp_ram_find(e, w, h, glevels) : NULL;
++      if (r) { im = r->im; in_ram = 1; s_trpram_hit++;
++               if (s_trpram_hit <= 4 || !(s_trpram_hit % 200))
++                   fprintf(stderr, "[texrep] RAM cache: %u hits, %u loads from disk, %u images %llu MB held%c",
++                           s_trpram_hit, s_trpram_miss, s_trpram_n, (unsigned long long)(s_trpram_bytes >> 20), 10);
++               goto have_image; } }
++    s_trpram_miss++;
+     if (!(e->dds ? trp_dds_load(e->path, &im) : trp_png_load(e->path, &im))) {
+         e->failed = 1; trp_repl_fail++;
+         fprintf(stderr, "[texrep] cannot load %s (unsupported or corrupt), keeping the original\n", e->path);
+@@ -4750,13 +4865,16 @@ static int texrep_apply(VPTexSlot* t, TrpEntry* e, u32 w, u32 h, u32 glevels)
+         fprintf(stderr, "[texrep] out of memory making mips for %s, keeping the original\n", e->path);
+         trp_img_free(&im); return 0;
+     }
++have_image:;
+     u64 held = 0;
+     for (int i = 0; i < VP_TEX_SLOTS; i++) if (&s_d3d.vp_tex[i] != t && s_d3d.vp_tex[i].res) held += s_d3d.vp_tex[i].rep_bytes;
+     if (held + im.bytes > trp_cap_bytes) {
+         e->failed = 1; trp_over_cap++;
+         fprintf(stderr, "[texrep] cache cap reached (%llu MB held), %s not loaded\n", (unsigned long long)(held >> 20), e->path);
+-        trp_img_free(&im); return 0;
++        if (!in_ram) trp_img_free(&im);
++        return 0;
+     }
++    if (!in_ram) in_ram = trp_ram_put(e, w, h, glevels, &im);
+     ID3D12Device* dev = s_d3d.device;
+     int fresh = 0, ok = 0;
+     ID3D12Resource* up = NULL;
+@@ -4824,7 +4942,7 @@ out:
+     if (!ok && fresh && t->res) { t->res->lpVtbl->Release(t->res); t->res = NULL; }
+     if (!t->res) { t->rep_w = t->rep_h = t->rep_mips = 0; t->rep_dxgi = 0; t->rep_bytes = 0; }
+     if (!ok) { e->failed = 1; trp_repl_fail++; fprintf(stderr, "[texrep] D3D upload of %s failed, keeping the original\n", e->path); }
+-    trp_img_free(&im);
++    if (!in_ram) trp_img_free(&im);
+     return ok;
+ }
+ 
+@@ -5059,7 +5177,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+                  * RSX_GUEST_MIPS says: it is what the guest asked for. */
+                 rsx_tex_level rlv[RSX_MAX_TEXTURE_LEVELS];
+                 const u32 rgl = rsx_texture_mip_chain(fmt, w, h, mips, pitch_arg, rlv);
+-                if (te && !te->failed && texrep_apply(t, te, w, h, rgl)) {
++                const double hd_t0 = (te && !te->failed) ? perf_now() : 0.0;
++                const int hd_ok = te && !te->failed && texrep_apply(t, te, w, h, rgl);
++                if (hd_t0 != 0.0) { s_hitch_hdtex += perf_now() - hd_t0; s_hitch_nhdtex++; }
++                if (hd_ok) {
+                     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
+                     t->cube = cube; t->used = 1; t->nlv = 0; t->tail_off = t->tail_n = 0;
+                     { u32 nb2 = dxt ? (blkrow * blkrows) : (w * h * bpp);
+@@ -9238,6 +9359,7 @@ skip_dump_consider: ;
+                                s_present_fail);
+         }
+         if (_pf0) s_prof_frames++;
++        rsx_hitch_note();
+     }
+     rdoc_frame_end();
+ 

@@ -10,6 +10,9 @@ and starts HotShotsGolfRecomp.exe with the matching flags and environment.
     --settings <file or folder>                   use another settings file or folder
     --exe <file>                                  override the saved exe path for this run
 
+Every launch writes the game's stdout/stderr to logs/run-<date-time>.log beside the
+settings file (the newest 10 are kept), ending with the exit code.
+
 Where each setting comes from (checked against the sources, nothing invented):
   Command-line flags: port/cli_options.cpp (parser and --help text) and docs/CLI.md.
   HSG_TWEAKS:         patches/runtime/0059-guest-tweaks.patch (libs/system/hsg_tweaks.c).
@@ -23,6 +26,8 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
+import time
 
 SETTINGS_NAME = "hsg_settings.json"
 EXE_NAME = "HotShotsGolfRecomp.exe"
@@ -247,14 +252,65 @@ def format_command(argv, env):
     return "\n".join(lines)
 
 
+LOG_KEEP = 10
+
+
+def open_run_log(settings_file):
+    """Open logs/run-<date-time>.log beside the settings file, keeping the newest LOG_KEEP runs.
+    Returns (file, path), or (None, None) when the folder cannot be written."""
+    d = os.path.join(os.path.dirname(os.path.abspath(settings_file)), "logs")
+    try:
+        os.makedirs(d, exist_ok=True)
+        old = sorted(f for f in os.listdir(d) if f.startswith("run-") and f.endswith(".log"))
+        for f in old[:max(0, len(old) - (LOG_KEEP - 1))]:
+            try:
+                os.remove(os.path.join(d, f))
+            except OSError:
+                pass
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        path = os.path.join(d, "run-%s.log" % stamp)
+        n = 1
+        while os.path.exists(path):
+            n += 1
+            path = os.path.join(d, "run-%s_%d.log" % (stamp, n))
+        return open(path, "ab", buffering=0), path
+    except OSError:
+        return None, None
+
+
 def launch(s, settings_file, wait=False):
+    """Start the game with its stdout/stderr in logs/run-<date-time>.log beside the
+    settings file (newest LOG_KEEP kept). A watcher thread appends the exit code."""
     errs, _ = validate(s, settings_file)
     if errs:
         raise RuntimeError("\n".join(errs))
     argv, env, cwd = build_command(s, settings_file)
     full_env = dict(os.environ)
     full_env.update(env)
-    proc = subprocess.Popen(argv, cwd=cwd, env=full_env)
+    log, log_path = open_run_log(settings_file)
+    if log is None:
+        proc = subprocess.Popen(argv, cwd=cwd, env=full_env)
+    else:
+        head = format_command(argv, env).replace("\n", "\n[launcher] ")
+        log.write(("[launcher] %s\n[launcher] %s\n\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), head)).encode("utf-8"))
+        t0 = time.time()
+        try:
+            proc = subprocess.Popen(argv, cwd=cwd, env=full_env, stdin=subprocess.DEVNULL,
+                                    stdout=log, stderr=subprocess.STDOUT)
+        except Exception:
+            log.close()
+            raise
+
+        def watch():
+            rc = proc.wait()
+            try:
+                log.write(("\n[launcher] game exited with code %d (0x%08X) after %.0f s\n"
+                           % (rc, rc & 0xFFFFFFFF, time.time() - t0)).encode("utf-8"))
+            finally:
+                log.close()
+        # Not a daemon thread: closing the launcher window still records the exit code.
+        threading.Thread(target=watch, name="hsg-log-watch").start()
+        proc.log_path = log_path
     if wait:
         proc.wait()
     return proc
