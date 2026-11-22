@@ -1,0 +1,392 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -365,6 +365,8 @@ typedef struct {
+     int uses_c03;
+     u32 in_mask;            /* attributes the program reads (0xFFFF if not exact) */
+     int pos_rx, pos_rw;     /* o0.x / o0.w = dot4(v0, vp_c[row]), else -1 (RSX_ASPECT=expand) */
++    struct VsJob* vjob;     /* RSX_VS_PAR: bytecode still owned by a worker job (vs NULL until vs_finish) */
++    u32 an_mask;            /* ucode input analysis (0xFFFF if not exact), for vs_finish */
+ } VPVSEntry;
+ #define VP_VS_CACHE 128 /* wave uses 5+ distinct VPs; at 4 the cache
+                          * thrashed every frame and eviction shifted slots
+@@ -994,6 +996,30 @@ static HRESULT rsx_compile_cached_ex(const char* src, size_t len, const char* na
+     *out = blob;
+     return S_OK;
+ }
++/* RSX_VS_PAR: is this text already compiled, in memory or on disk? Same
++ * key and path as rsx_compile_cached_ex. */
++static int rsx_sbc_has(const char* src, size_t len, const char* target)
++{
++    u64 h1 = 14695981039346656037ull, h2 = 0x9E3779B97F4A7C15ull;
++    for (size_t i = 0; i < len; i++) {
++        h1 = (h1 ^ (u8)src[i]) * 1099511628211ull;
++        h2 = (h2 + (u8)src[i]) * 0xFF51AFD7ED558CCDull; h2 ^= h2 >> 29;
++    }
++    for (const char* t = target; *t; t++) { h1 = (h1 ^ (u8)*t) * 1099511628211ull; h2 ^= (u8)*t; h2 *= 0xC4CEB9FE1A85EC53ull; }
++    int hit = 0;
++    sbc_lock();
++    for (int i = 0; i < s_sbc_n && !hit; i++)
++        hit = s_sbc[i].h1 == h1 && s_sbc[i].h2 == h2 && s_sbc[i].len == (u32)len;
++    sbc_unlock();
++    const char* dir = hit ? NULL : rsx_sbc_dir();
++    if (dir) {
++        char path[MAX_PATH + 64];
++        snprintf(path, sizeof path, "%s\\%016llx%016llx_%u_%s.dxbc", dir,
++                 (unsigned long long)h1, (unsigned long long)h2, (unsigned)len, target);
++        hit = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
++    }
++    return hit;
++}
+ /* Debug switches read on every draw, quad or bind go through this: getenv
+  * takes the CRT environment lock and scans every variable, and a dozen of
+  * them per draw was a quarter of God of War HD's drain-thread time (ucrtbase
+@@ -2941,6 +2967,258 @@ static int vs_memo_on(void)
+     return v;
+ }
+ static int s_vs_memo_bypass = 0;
++/* RSX_VS_PAR (default 1; 0 off; needs RSX_SHADER_PAR workers): a vertex
++ * program the shader cache does not hold is compiled by a worker thread
++ * instead of the FIFO walker. The draw that met it is recorded straight away
++ * (its slot gets the facts read from the HLSL text at once, and its draws copy
++ * all 16 attributes, the RSX_VB_PACK fallback, until the shader's own input
++ * signature is known); vs_finish waits for the bytecode where the pipeline is
++ * built, at the start of render_frame, so nothing is drawn without its own
++ * vertex program. A course load meets several new programs per frame: they
++ * now compile side by side, and alongside the rest of the frame's recording,
++ * instead of one after another. */
++typedef struct VsJob {
++    char* hlsl; size_t len; u32 hash;
++    ID3DBlob* blob; HRESULT hr; double t_compile;
++    volatile LONG state;        /* 0 queued, 1 running, 2 done */
++    HANDLE done_ev;
++    struct VsJob* qnext;
++} VsJob;
++static VsJob *s_vj_qh, *s_vj_qt;            /* under s_pj_cs */
++static int pso_par_on(void);
++static CRITICAL_SECTION s_pj_cs; static HANDLE s_pj_sem;
++static int rsx_vs_par_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_VS_PAR"); v = e ? atoi(e) : 1; }
++    return v > 0 && pso_par_on();
++}
++static void vs_job_run(VsJob* j)
++{
++    const double t0 = perf_now();
++    j->hr = rsx_compile_cached_ex(j->hlsl, j->len, "guest_vp2", "vs_5_0", &j->blob, 1);
++    j->t_compile = perf_now() - t0;
++    free(j->hlsl); j->hlsl = NULL;
++    MemoryBarrier();
++    InterlockedExchange(&j->state, 2);
++    SetEvent(j->done_ev);
++}
++/* The oldest queued VS job, or NULL. Caller holds s_pj_cs. */
++static VsJob* vs_job_pop_locked(void)
++{
++    VsJob* j = s_vj_qh;
++    if (j) { s_vj_qh = j->qnext; if (!s_vj_qh) s_vj_qt = NULL; InterlockedExchange(&j->state, 1); }
++    return j;
++}
++static VsJob* vs_job_queue(const char* hlsl, size_t len, u32 hash)
++{
++    VsJob* j = (VsJob*)calloc(1, sizeof *j);
++    if (!j) return NULL;
++    j->hlsl = (char*)malloc(len + 1);
++    j->done_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
++    if (!j->hlsl || !j->done_ev) {
++        free(j->hlsl); if (j->done_ev) CloseHandle(j->done_ev); free(j); return NULL;
++    }
++    memcpy(j->hlsl, hlsl, len); j->hlsl[len] = 0; j->len = len; j->hash = hash;
++    EnterCriticalSection(&s_pj_cs);
++    if (s_vj_qt) s_vj_qt->qnext = j; else s_vj_qh = j;
++    s_vj_qt = j;
++    LeaveCriticalSection(&s_pj_cs);
++    ReleaseSemaphore(s_pj_sem, 1, NULL);
++    return j;
++}
++static double s_vs_wait_tot = 0.0, s_vs_worker_tot = 0.0;
++static u32 dxbc_attr_mask(const void* p, size_t n);
++/* Frame thread: make slot i's bytecode current. A job no worker has started
++ * runs here; while a worker runs it, other queued VS jobs run here. */
++static void vs_finish(int i)
++{
++    if (i < 0 || i >= s_d3d.vp_vs_n || !s_d3d.vp_vs[i].vjob) return;
++    VsJob* j = s_d3d.vp_vs[i].vjob;
++    const double t0 = perf_now();
++    int mine = 0;
++    EnterCriticalSection(&s_pj_cs);
++    if (j->state == 0) {
++        VsJob** pp = &s_vj_qh; VsJob* prev = NULL;
++        while (*pp && *pp != j) { prev = *pp; pp = &(*pp)->qnext; }
++        if (*pp) { *pp = j->qnext; if (s_vj_qt == j) s_vj_qt = prev; mine = 1; InterlockedExchange(&j->state, 1); }
++    }
++    LeaveCriticalSection(&s_pj_cs);
++    if (mine) vs_job_run(j);
++    else while (WaitForSingleObject(j->done_ev, 0) != WAIT_OBJECT_0) {
++        EnterCriticalSection(&s_pj_cs);
++        VsJob* o = vs_job_pop_locked();
++        LeaveCriticalSection(&s_pj_cs);
++        if (!o) { WaitForSingleObject(j->done_ev, INFINITE); break; }
++        vs_job_run(o);
++    }
++    MemoryBarrier();
++    const double dt = perf_now() - t0;
++    s_vs_wait_tot += dt; s_vs_worker_tot += j->t_compile;
++    s_hitch_compile += dt; s_hitch_ncompile++;   /* RSX_HITCH_MS: what the frame thread waited */
++    { static int _n = 0; if (PS3_LOG_FIRST(_n, 256))
++        fprintf(stderr, "[vscompile] VS 0x%08X %.1f ms on %s, frame thread waited %.1f ms; "
++                "totals: compile %.2f s, frame-thread wait %.2f s%c", j->hash, j->t_compile * 1000.0,
++                mine ? "the frame thread" : "a worker", dt * 1000.0, s_vs_worker_tot, s_vs_wait_tot, 10); }
++    VPVSEntry* e = &s_d3d.vp_vs[i];
++    e->vjob = NULL;
++    if (SUCCEEDED(j->hr) && j->blob) {
++        e->vs = j->blob;
++        const u32 sm = dxbc_attr_mask(j->blob->lpVtbl->GetBufferPointer(j->blob), j->blob->lpVtbl->GetBufferSize(j->blob));
++        e->in_mask = (sm != 0xFFFFFFFFu) ? sm : e->an_mask;
++    } else {
++        static int _e = 0; if (PS3_LOG_FIRST(_e, 4)) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", j->hash);
++        if (j->blob) j->blob->lpVtbl->Release(j->blob);
++    }
++    CloseHandle(j->done_ev); free(j);
++}
++/* RSX_VS_SLIM (default 1; 0 off): rewrite the decompiled vertex program
++ * before fxc sees it, without changing what it computes. fxc spent 0.5-2.3 s
++ * on each large branching guest program (~37 KB of HLSL) even without
++ * optimization, on the FIFO walker thread: the cold-cache course load froze.
++ * Two rewrites, measured on this title's course programs:
++ *  - no dispatch loop: a branching program is emitted as "if (_pc == N)"
++ *    blocks inside a [loop]. The blocks are tested in order inside one pass,
++ *    so a program whose every _pc target lies after the block that sets it
++ *    (or is -1) and that never calls or returns already finishes in the first
++ *    pass; for those the loop header becomes a plain block (0.56 -> 0.32 s);
++ *  - no register arrays: r[32], o[16] and v[16] are only ever indexed by
++ *    literals, so each element becomes its own variable (r[3] -> r_3) and
++ *    fxc no longer tracks whole arrays through every block (0.32 -> 0.15 s).
++ * A rewrite whose precondition does not hold (another form of _pc update,
++ * any non-literal index) is skipped; with neither, the original is compiled.
++ * The shader cache key is the compiled text, so old entries are not reused. */
++static int rsx_vs_slim_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_VS_SLIM"); v = e ? atoi(e) : 1; }
++    return v;
++}
++static int vs_slim_idc(char c)
++{
++    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
++}
++typedef struct { char* p; size_t cap, n; int ovf; } VsSlimBuf;
++static void vs_slim_put(VsSlimBuf* b, const char* s, size_t n)
++{
++    if (b->ovf || b->n + n + 1 > b->cap) { b->ovf = 1; return; }
++    memcpy(b->p + b->n, s, n); b->n += n; b->p[b->n] = 0;
++}
++static void vs_slim_puts(VsSlimBuf* b, const char* s) { vs_slim_put(b, s, strlen(s)); }
++static const char s_vs_slim_loop[] = "    [loop] for (int _it = 0; _it < 16384 && _pc >= 0; _it++) {\n";
++/* Every _pc use after the loop header is a block test or a forward jump. */
++static int vs_slim_forward_only(const char* body)
++{
++    if (strstr(body, "_cs[") || strstr(body, "_csp")) return 0;     /* CAL / RET */
++    long cur = -1;
++    for (const char* q = body; (q = strstr(q, "_pc")) != NULL; ) {
++        if ((q > body && vs_slim_idc(q[-1])) || vs_slim_idc(q[3])) { q += 3; continue; }
++        char* e;
++        if (!strncmp(q, "_pc == ", 7)) {
++            cur = strtol(q + 7, &e, 10);
++            if (e == q + 7 || strncmp(e, ") {", 3)) return 0;
++            q = e; continue;
++        }
++        if (strncmp(q, "_pc = ", 6)) return 0;
++        const char* r = q + 6;
++        if ((*r >= '0' && *r <= '9') || *r == '-') {            /* _pc = T; */
++            const long t = strtol(r, &e, 10);
++            if (e == r || *e != ';' || (t != -1 && t <= cur)) return 0;
++            q = e; continue;
++        }
++        /* _pc = <cond> ? T : F;  -- <cond> holds no "?" or ";" of its own */
++        const char* qm = strstr(r, " ? ");
++        const char* sc = strchr(r, ';');
++        if (!qm || !sc || qm > sc || memchr(r, '?', (size_t)(qm - r))) return 0;
++        long t = strtol(qm + 3, &e, 10);
++        if (e == qm + 3 || strncmp(e, " : ", 3) || (t != -1 && t <= cur)) return 0;
++        const char* f = e + 3;
++        t = strtol(f, &e, 10);
++        if (e == f || *e != ';' || (t != -1 && t <= cur)) return 0;
++        q = e;
++    }
++    return 1;
++}
++/* Returns `in` unchanged or `out` holding the rewritten program; *what gets
++ * 1 (loop dropped) | 2 (arrays split). */
++static const char* vs_slim(const char* in, char* out, size_t cap, int* what)
++{
++    static const struct { const char* from; char reg; int n; const char* init; } decl[] = {
++        { "    float4 v[16];\n", 'v', 16, NULL },
++        { "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n", 'v', 16, "float4(0,0,0,1)" },
++        { "    float4 r[32]; float4 o[16];\n", 'r', 32, NULL },      /* and o_0..o_15 */
++        { "    [unroll] for (int _i=0;_i<32;_i++) r[_i]=(float4)0;\n", 'r', 32, "(float4)0" },
++        { "    [unroll] for (int _j=0;_j<16;_j++) o[_j]=float4(0,0,0,1);\n", 'o', 16, "float4(0,0,0,1)" },
++    };
++    const int nd = (int)(sizeof decl / sizeof decl[0]);
++    *what = 0;
++    const char* lh = strstr(in, s_vs_slim_loop);
++    const int noloop = lh && vs_slim_forward_only(lh + sizeof s_vs_slim_loop - 1);
++    /* Pass 1 (scal = 1) checks, pass 2 writes. A declaration line is skipped
++     * whole in both; any other r[ / o[ / v[ must be followed by digits and ']'. */
++    int scal = 1;
++    VsSlimBuf b = { out, cap, 0, 0 };
++    for (int pass = 0; pass < 2; pass++) {
++        if (pass == 1) {
++            if (!noloop && !scal) return in;
++            out[0] = 0;
++        }
++        for (const char* q = in; *q && !b.ovf; ) {
++            if (pass == 1 && noloop && q == lh) {
++                vs_slim_puts(&b, "    {\n"); q += sizeof s_vs_slim_loop - 1; continue;
++            }
++            int d = 0;
++            if (scal && (q == in || q[-1] == '\n'))
++                for (; d < nd; d++) if (!strncmp(q, decl[d].from, strlen(decl[d].from))) break;
++            if (scal && d < nd && (q == in || q[-1] == '\n')) {
++                if (pass == 1) {
++                    char tmp[48];
++                    vs_slim_puts(&b, "    ");
++                    if (!decl[d].init) {
++                        vs_slim_puts(&b, "float4 ");
++                        for (int i = 0; i < decl[d].n; i++) {
++                            snprintf(tmp, sizeof tmp, "%s%c_%d", i ? ", " : "", decl[d].reg, i);
++                            vs_slim_puts(&b, tmp);
++                        }
++                        vs_slim_puts(&b, ";");
++                        if (decl[d].reg == 'r') {
++                            vs_slim_puts(&b, " float4 ");
++                            for (int i = 0; i < 16; i++) {
++                                snprintf(tmp, sizeof tmp, "%so_%d", i ? ", " : "", i);
++                                vs_slim_puts(&b, tmp);
++                            }
++                            vs_slim_puts(&b, ";");
++                        }
++                    } else {
++                        for (int i = 0; i < decl[d].n; i++) {
++                            snprintf(tmp, sizeof tmp, " %c_%d=%s;", decl[d].reg, i, decl[d].init);
++                            vs_slim_puts(&b, tmp);
++                        }
++                    }
++                    vs_slim_puts(&b, "\n");
++                }
++                q += strlen(decl[d].from); continue;
++            }
++            if (scal && (*q == 'r' || *q == 'o' || *q == 'v') && q[1] == '[' && !(q > in && vs_slim_idc(q[-1]))) {
++                const char* e = q + 2;
++                while (*e >= '0' && *e <= '9') e++;
++                if (e == q + 2 || *e != ']') { scal = 0; if (pass == 0) break; }
++                else {
++                    if (pass == 1) {
++                        const char t2[3] = { *q, '_', 0 };
++                        vs_slim_puts(&b, t2); vs_slim_put(&b, q + 2, (size_t)(e - (q + 2)));
++                    }
++                    q = e + 1; continue;
++                }
++            }
++            if (pass == 1) vs_slim_put(&b, q, 1);
++            q++;
++        }
++    }
++    if (b.ovf) return in;
++    *what = (noloop ? 1 : 0) | (scal ? 2 : 0);
++    return out;
++}
+ static int vp_get_vs_impl(const rsx_state* st);
+ static int vs_memo_get(u32 start, const u8* p, u32 avail)
+ {
+@@ -3067,8 +3345,30 @@ static int vp_get_vs_impl(const rsx_state* st)
+         }
+     }
+     ID3DBlob* vb = NULL;
+-    HRESULT hr = rsx_compile_cached(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", &vb);
+-    if (FAILED(hr) || !vb) {
++    const char* src = hlsl;
++    if (rsx_vs_slim_on() > 0) {     /* RSX_VS_SLIM: same program, far less for fxc to chew on */
++        static char slim[sizeof hlsl + 16384]; int what = 0;
++        src = vs_slim(hlsl, slim, sizeof slim, &what);
++        { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
++            fprintf(stderr, "[shader] VS 0x%08X slimmed: loop %s, arrays %s (%u -> %u bytes HLSL)%c", hash,
++                    (what & 1) ? "dropped" : "kept", (what & 2) ? "split" : "kept",
++                    (unsigned)strlen(hlsl), (unsigned)strlen(src), 10); }
++    }
++    /* RSX_VS_PAR: a program the shader cache already holds (memory or disk)
++     * is loaded here as before; only a real compile goes to a worker. */
++    VsJob* vjob = NULL;
++    if (rsx_vs_par_on() && !rsx_sbc_has(src, strlen(src), "vs_5_0"))
++        vjob = vs_job_queue(src, strlen(src), hash);
++    const u32 nc0 = (u32)s_prof_ncompile; const double tc0 = perf_now();
++    HRESULT hr = vjob ? S_OK : rsx_compile_cached(src, strlen(src), "guest_vp2", "vs_5_0", &vb);
++    if ((u32)s_prof_ncompile != nc0) {   /* a real fxc compile, not a cache hit */
++        static double vs_tot = 0.0; static int _n = 0;
++        const double dt = perf_now() - tc0; vs_tot += dt;
++        if (PS3_LOG_FIRST(_n, 256))
++            fprintf(stderr, "[vscompile] VS 0x%08X %.1f ms (%u bytes HLSL), frame-thread VS compile total %.2f s%c",
++                    hash, dt * 1000.0, (unsigned)strlen(src), vs_tot, 10);
++    }
++    if (!vjob && (FAILED(hr) || !vb)) {
+         static int _e=0; if (PS3_LOG_FIRST(_e, 4)) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
+         return -1;
+     }
+@@ -3097,12 +3397,14 @@ static int vp_get_vs_impl(const rsx_state* st)
+     else {  /* evict slot 0 */
+         { static int _ev = 0; if (PS3_LOG_FIRST(_ev, 4))
+             fprintf(stderr, "[VPEVICT] VS cache full (%d): evicting slot 0%c", VP_VS_CACHE, 10); }
++        vs_finish(0);   /* RSX_VS_PAR: no job outlives its slot */
+         if (s_d3d.vp_vs[0].vs) s_d3d.vp_vs[0].vs->lpVtbl->Release(s_d3d.vp_vs[0].vs);
+         memmove(&s_d3d.vp_vs[0], &s_d3d.vp_vs[1], sizeof(VPVSEntry)*(VP_VS_CACHE-1));
+         slot = VP_VS_CACHE - 1;
+     }
+     s_d3d.vp_vs[slot].hash = hash;
+     s_d3d.vp_vs[slot].vs   = vb;
++    s_d3d.vp_vs[slot].vjob = vjob;
+     s_d3d.vp_vs[slot].uses_c03 =
+         (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
+          strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
+@@ -3114,7 +3416,9 @@ static int vp_get_vs_impl(const rsx_state* st)
+     { rsx_vp_input_analysis an;
+       const int r = rsx_vp_analyze_inputs(vuc, vlen, &an);
+       const u32 am = (r > 0 && an.exact) ? (an.input_mask & 0xFFFFu) : 0xFFFFu;
+-      const u32 sm = dxbc_attr_mask(vb->lpVtbl->GetBufferPointer(vb), vb->lpVtbl->GetBufferSize(vb));
++      /* RSX_VS_PAR: no bytecode yet -- all 16 until vs_finish reads its signature */
++      const u32 sm = vjob ? 0xFFFFu : dxbc_attr_mask(vb->lpVtbl->GetBufferPointer(vb), vb->lpVtbl->GetBufferSize(vb));
++      s_d3d.vp_vs[slot].an_mask = am;
+       s_d3d.vp_vs[slot].in_mask = (sm != 0xFFFFFFFFu) ? sm : am;
+       if (sm != 0xFFFFFFFFu && (sm & ~am)) {
+           static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+@@ -4158,8 +4462,7 @@ typedef struct PsoJob {
+ #define PSO_JOB_MAX 256
+ static int s_pj_on = -1, s_pj_threads = 0;
+ static PsoJob* s_pj[PSO_JOB_MAX]; static int s_pj_n;   /* frame thread only */
+-static CRITICAL_SECTION s_pj_cs; static HANDLE s_pj_sem;
+-static PsoJob *s_pj_qh, *s_pj_qt;                      /* under s_pj_cs */
++static PsoJob *s_pj_qh, *s_pj_qt;    /* s_pj_cs, s_pj_sem: declared with RSX_VS_PAR */                      /* under s_pj_cs */
+ static int s_fp_prefetch = 0;                          /* vp_get_fp_pso: queue a job, build nothing */
+ static u64 s_pj_batch = 0;
+ static u32 s_pj_queued, s_pj_used, s_pj_inline, s_pj_dropped;
+@@ -4195,9 +4498,11 @@ static DWORD WINAPI pso_job_worker(LPVOID arg)
+     for (;;) {
+         WaitForSingleObject(s_pj_sem, INFINITE);
+         EnterCriticalSection(&s_pj_cs);
+-        PsoJob* j = s_pj_qh;
++        VsJob* vj = vs_job_pop_locked();   /* RSX_VS_PAR: vertex programs first, pipelines need them */
++        PsoJob* j = vj ? NULL : s_pj_qh;
+         if (j) { s_pj_qh = j->qnext; if (!s_pj_qh) s_pj_qt = NULL; InterlockedExchange(&j->state, 1); }
+         LeaveCriticalSection(&s_pj_cs);
++        if (vj) vs_job_run(vj);
+         if (j) pso_job_run(j);
+     }
+     return 0;
+@@ -4372,6 +4677,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+     /* Resolve the VS: the draw's cached per-VP blob, else the primary. */
+     ID3DBlob* vsb = NULL; u32 vs_hash = 0;
+     if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) {
++        vs_finish(vs_idx);   /* RSX_VS_PAR */
+         vsb = s_d3d.vp_vs[vs_idx].vs; vs_hash = s_d3d.vp_vs[vs_idx].hash;
+     }
+     if (!vsb) { vsb = s_d3d.vp_vs_blob; vs_idx = -1; }
