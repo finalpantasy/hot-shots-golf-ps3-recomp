@@ -1,0 +1,439 @@
+diff --git a/libs/system/hsg_dlc_earn.c b/libs/system/hsg_dlc_earn.c
+new file mode 100644
+--- /dev/null
++++ b/libs/system/hsg_dlc_earn.c
+@@ -0,0 +1,404 @@
++/*
++ * ps3recomp - earnable DLC gear for Hot Shots Golf: World Invitational
++ * (on by default; HSG_DLC_EARN=0 turns it off)
++ *
++ * Each club brand (01-07, 12) and ball brand (01-05, 07) has six power
++ * classes. Classes 0-2 are sold in the in-game shop; classes 3-4 are PSN DLC
++ * (licences clubBBC / ballBBC, checked with sceNpDrmIsAvailable) and class 5
++ * is disabled in this data version (Patch_PS3 = -1). The shop reads its stock
++ * from the FB archive xbdata/challenge/challenge_param.US_01.xb (entries
++ * data/param/challenge/Item_Club.txt and Item_Ball.txt, tab-separated) and
++ * shows each item's model from xbdata/menu/phase/shop/shop_model.US_0N.xb
++ * (data/menu/phase/shop/model/<Label>.rem), which has no models for classes
++ * 3-4.
++ *
++ * With HSG_DLC_EARN on, the file layer opens a rebuilt copy of those archives
++ * (written under PS3_HDD1_ROOT/hsg_dlc_earn/, else TEMP) in which:
++ *   - Item_Club.txt / Item_Ball.txt gain a row for each class 3 and class 4
++ *     item whose licence is NOT owned. A licence counts as owned when the
++ *     runtime would report it available: PS3_NPDRM_STRICT=0 (every licence
++ *     reads as owned) or its EDAT exists under the title's PSN folder. Owned
++ *     DLC items keep today's behaviour (owned from the start, no shop row).
++ *     The row is the brand's class 2 row with:
++ *       ReleaseItem = the class below,
++ *       Price  (r = P2 / P1)  P3 = P2 * r, P4 = P3 * r,
++ *       Points (q = T2 / T1)  T3 = T2 * q, T4 = T3 * q,
++ *     rounded to 1000 / 5000, never below the class below and capped at the
++ *     highest Price_PS3 / ReleasePoint_PS3 of the same table's base rows.
++ *     Trophy = Trophy_PS3 = 0 (the game keeps DLC gear out of trophies).
++ *   - shop_model gains <Label>.rem entries for the new rows, copies of the
++ *     brand's class 2 model.
++ * No base row is changed or removed; the archives on disk are not touched.
++ * HSG_DLC_EARN=0, or any other file: nothing changes.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <sys/stat.h>
++#ifdef _WIN32
++#include <direct.h>
++#define HSG_MKDIR(p) _mkdir(p)
++#else
++#define HSG_MKDIR(p) mkdir(p, 0755)
++#endif
++#include "../filesystem/edat.h"
++
++/* stb (compiled in libs/codec/cellPngDec.c and cellPngEnc.c) */
++char* stbi_zlib_decode_malloc_guesssize_headerflag(const char* buffer, int len, int initial_size,
++                                                   int* outlen, int parse_header);
++unsigned char* stbi_zlib_compress(unsigned char* data, int data_len, int* out_len, int quality);
++
++#define HSG_TITLE "NPUA80864"
++
++static const int k_club_brands[] = {1, 2, 3, 4, 5, 6, 7, 12};
++static const int k_ball_brands[] = {1, 2, 3, 4, 5, 7};
++
++static int earn_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("HSG_DLC_EARN"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++
++static uint32_t fb_hash(const char* s)
++{
++    uint32_t h = 0;
++    for (; *s; s++) {
++        unsigned char c = (unsigned char)*s;
++        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
++        h = h * 31u + c;
++    }
++    return h;
++}
++
++static uint32_t rd32(const unsigned char* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
++static void wr32(unsigned char* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
++
++/* ---- FB archive in memory ---------------------------------------------- */
++typedef struct { uint32_t hash, ord; } FbRow;
++typedef struct { unsigned char* data; uint32_t stored, raw; } FbPay;
++typedef struct {
++    unsigned char extra[64]; uint32_t n_extra;
++    FbRow* rows; FbPay* pays; uint32_t n, cap;
++} Fb;
++
++static void fb_free(Fb* f)
++{
++    for (uint32_t i = 0; i < f->n; i++) free(f->pays[i].data);
++    free(f->rows); free(f->pays); memset(f, 0, sizeof *f);
++}
++
++static int fb_load(Fb* f, const char* path)
++{
++    memset(f, 0, sizeof *f);
++    FILE* fp = fopen(path, "rb");
++    if (!fp) return -1;
++    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
++    unsigned char* d = (unsigned char*)malloc(sz > 0 ? (size_t)sz : 1);
++    if (!d || fread(d, 1, (size_t)sz, fp) != (size_t)sz) { fclose(fp); free(d); return -1; }
++    fclose(fp);
++    if (sz < 12 || d[0] != 'F' || d[1] != 'B') { free(d); return -1; }
++    uint32_t n = rd32(d + 4), e = rd32(d + 8);
++    if (e > sizeof f->extra || 12u + e + 20ull * n > (uint64_t)sz) { free(d); return -1; }
++    f->n_extra = e; memcpy(f->extra, d + 12, e);
++    f->cap = n + 64; f->n = n;
++    f->rows = (FbRow*)calloc(f->cap, sizeof(FbRow));
++    f->pays = (FbPay*)calloc(f->cap, sizeof(FbPay));
++    uint64_t off = 12u + e + 20ull * n;
++    for (uint32_t i = 0; i < n; i++) {
++        const unsigned char* r = d + 12 + e + 20 * i;
++        f->rows[i].hash = rd32(r); f->rows[i].ord = rd32(r + 8);
++        f->pays[i].stored = rd32(r + 12); f->pays[i].raw = rd32(r + 16);
++        off = (off + 3) & ~3ull;
++        if (off + f->pays[i].stored > (uint64_t)sz) { f->n = i; fb_free(f); free(d); return -1; }
++        f->pays[i].data = (unsigned char*)malloc(f->pays[i].stored ? f->pays[i].stored : 1);
++        memcpy(f->pays[i].data, d + off, f->pays[i].stored);
++        off += f->pays[i].stored;
++    }
++    free(d);
++    return 0;
++}
++
++/* payload index for a name, or -1 */
++static int fb_find(const Fb* f, const char* name)
++{
++    uint32_t h = fb_hash(name);
++    for (uint32_t i = 0; i < f->n; i++)
++        if (f->rows[i].hash == h) return (int)f->rows[i].ord;
++    return -1;
++}
++
++static int fb_add(Fb* f, const char* name, unsigned char* data, uint32_t stored, uint32_t raw)
++{
++    if (f->n >= f->cap) return -1;
++    f->rows[f->n].hash = fb_hash(name); f->rows[f->n].ord = f->n;
++    f->pays[f->n].data = data; f->pays[f->n].stored = stored; f->pays[f->n].raw = raw;
++    f->n++;
++    return 0;
++}
++
++static int row_cmp(const void* a, const void* b)
++{
++    uint32_t x = ((const FbRow*)a)->hash, y = ((const FbRow*)b)->hash;
++    return x < y ? -1 : x > y ? 1 : 0;
++}
++
++static int fb_save(Fb* f, const char* path)
++{
++    qsort(f->rows, f->n, sizeof(FbRow), row_cmp);
++    FILE* fp = fopen(path, "wb");
++    if (!fp) return -1;
++    unsigned char h[12] = {'F', 'B', 0, 0};
++    wr32(h + 4, f->n); wr32(h + 8, f->n_extra);
++    fwrite(h, 1, 12, fp); fwrite(f->extra, 1, f->n_extra, fp);
++    for (uint32_t i = 0; i < f->n; i++) {
++        unsigned char r[20];
++        wr32(r, f->rows[i].hash); wr32(r + 4, 0); wr32(r + 8, f->rows[i].ord);
++        wr32(r + 12, f->pays[i].stored); wr32(r + 16, f->pays[i].raw);
++        fwrite(r, 1, 20, fp);
++    }
++    long pos = 12 + (long)f->n_extra + 20L * f->n;
++    static const unsigned char z[4] = {0, 0, 0, 0};
++    for (uint32_t i = 0; i < f->n; i++) {
++        if (pos & 3) { fwrite(z, 1, 4 - (pos & 3), fp); pos = (pos + 3) & ~3L; }
++        fwrite(f->pays[i].data, 1, f->pays[i].stored, fp);
++        pos += f->pays[i].stored;
++    }
++    if (pos & 3) fwrite(z, 1, 4 - (pos & 3), fp);
++    int bad = ferror(fp);
++    fclose(fp);
++    return bad ? -1 : 0;
++}
++
++/* ---- licence state -------------------------------------------------------- */
++static int licence_owned(int is_club, int brand, int cls)
++{
++    const char* e = getenv("PS3_NPDRM_STRICT");
++    if (!e || e[0] != '1') return 1;              /* strict off: the runtime reports every licence owned */
++    char g[256];
++    int num = brand * 10 + cls;
++    snprintf(g, sizeof g, "/dev_hdd0/game/" HSG_TITLE "/USRDIR/PSN/55550000000%d%04d/%s%04d.edat",
++             is_club ? 2 : 3, num, is_club ? "club" : "ball", num);
++    return edat_guest_file_exists(g) == 1;
++}
++
++/* ---- item table ------------------------------------------------------------ */
++enum { C_LABEL = 0, C_PRICE = 1, C_RITEM = 2, C_RPOINT = 3, C_TROPHY = 7, C_HIDDEN = 8,
++       C_PRICE_PS3 = 12, C_RITEM_PS3 = 13, C_RPOINT_PS3 = 14, C_TROPHY_PS3 = 17, C_HIDDEN_PS3 = 18,
++       C_GET_PS3 = 20, N_COLS = 22 };
++
++typedef struct { char f[N_COLS][48]; int nf; } Row;
++
++static int split_row(const char* line, size_t len, Row* r)
++{
++    memset(r, 0, sizeof *r);
++    size_t a = 0;
++    for (size_t i = 0; i <= len && r->nf < N_COLS; i++) {
++        if (i == len || line[i] == '\t') {
++            size_t n = i - a; if (n >= sizeof r->f[0]) n = sizeof r->f[0] - 1;
++            memcpy(r->f[r->nf], line + a, n); r->f[r->nf][n] = 0;
++            r->nf++; a = i + 1;
++        }
++    }
++    return r->nf;
++}
++
++static long round_to(double v, long step) { return (long)((v + step / 2.0) / step) * step; }
++
++/* Return the rebuilt table (malloc) or NULL. labels[] receives the added labels. */
++static char* extend_table(const char* txt, int len, int is_club, char labels[][16], int* n_labels,
++                          int* out_len)
++{
++    const char* pfx = is_club ? "Club" : "Ball";
++    const int* brands = is_club ? k_club_brands : k_ball_brands;
++    int nb = is_club ? (int)(sizeof k_club_brands / sizeof *k_club_brands)
++                     : (int)(sizeof k_ball_brands / sizeof *k_ball_brands);
++    /* pass 1: caps and the class 0-2 rows of each brand */
++    static Row base[16][3];
++    int have[16][3]; memset(have, 0, sizeof have);
++    long cap_p = 0, cap_t = 0;
++    int i = 0;
++    while (i < len) {
++        int j = i; while (j < len && txt[j] != '\n') j++;
++        int l = j - i; if (l && txt[i + l - 1] == '\r') l--;
++        Row r;
++        if (split_row(txt + i, (size_t)l, &r) >= N_COLS && strncmp(r.f[0], pfx, 4) == 0 && r.f[0][4] == '_') {
++            if (atoi(r.f[C_HIDDEN_PS3]) == 0 && atoi(r.f[C_GET_PS3]) >= 0) {
++                long p = atol(r.f[C_PRICE_PS3]), t = atol(r.f[C_RPOINT_PS3]);
++                if (p > cap_p) cap_p = p;
++                if (t > cap_t) cap_t = t;
++            }
++            int num = atoi(r.f[0] + 5), b = num / 10, c = num % 10;
++            for (int k = 0; k < nb; k++)
++                if (brands[k] == b && c <= 2) { base[k][c] = r; have[k][c] = 1; }
++        }
++        i = j + 1;
++    }
++    size_t cap = (size_t)len + 4096;
++    char* out = (char*)malloc(cap);
++    memcpy(out, txt, (size_t)len);
++    int n = len;
++    if (n && out[n - 1] != '\n') { out[n++] = '\r'; out[n++] = '\n'; }
++    *n_labels = 0;
++    for (int k = 0; k < nb; k++) {
++        if (!have[k][1] || !have[k][2]) continue;
++        double p1 = atof(base[k][1].f[C_PRICE_PS3]), p2 = atof(base[k][2].f[C_PRICE_PS3]);
++        double t1 = atof(base[k][1].f[C_RPOINT_PS3]), t2 = atof(base[k][2].f[C_RPOINT_PS3]);
++        double rp = p1 > 0 ? p2 / p1 : 1.0, rt = t1 > 0 ? t2 / t1 : 1.0;
++        long prev_p = (long)p2, prev_t = (long)t2;
++        for (int c = 3; c <= 4; c++) {
++            long p = round_to(prev_p * rp, 1000), t = round_to(prev_t * rt, 5000);
++            if (p < prev_p) p = prev_p;
++            if (t < prev_t) t = prev_t;
++            if (p > cap_p) p = cap_p;
++            if (t > cap_t) t = cap_t;
++            if (p < prev_p) p = prev_p;               /* class 2 already at the cap */
++            if (t < prev_t) t = prev_t;
++            char lab[16], below[16];
++            snprintf(lab, sizeof lab, "%s_%03d", pfx, brands[k] * 10 + c);
++            snprintf(below, sizeof below, "%s_%03d", pfx, brands[k] * 10 + c - 1);
++            prev_p = p; prev_t = t;
++            if (licence_owned(is_club, brands[k], c)) {
++                fprintf(stderr, "[dlc_earn] %s: licence owned, no shop row%c", lab, 10);
++                continue;
++            }
++            Row r = base[k][2];
++            snprintf(r.f[C_LABEL], sizeof r.f[0], "%s", lab);
++            snprintf(r.f[C_PRICE], sizeof r.f[0], "%ld", p);
++            snprintf(r.f[C_PRICE_PS3], sizeof r.f[0], "%ld", p);
++            snprintf(r.f[C_RITEM], sizeof r.f[0], "%s", below);
++            snprintf(r.f[C_RITEM_PS3], sizeof r.f[0], "%s", below);
++            snprintf(r.f[C_RPOINT], sizeof r.f[0], "%ld", t);
++            snprintf(r.f[C_RPOINT_PS3], sizeof r.f[0], "%ld", t);
++            snprintf(r.f[C_TROPHY], sizeof r.f[0], "0");
++            snprintf(r.f[C_TROPHY_PS3], sizeof r.f[0], "0");
++            if ((size_t)n + N_COLS * 50 + 4 > cap) { cap *= 2; out = (char*)realloc(out, cap); }
++            for (int f = 0; f < N_COLS; f++)
++                n += snprintf(out + n, cap - (size_t)n, "%s%s", f ? "\t" : "", r.f[f]);
++            out[n++] = '\r'; out[n++] = '\n';
++            snprintf(labels[*n_labels], 16, "%s", lab);
++            (*n_labels)++;
++            fprintf(stderr, "[dlc_earn] %s: price %ld, points %ld, after %s%c", lab, p, t, below, 10);
++        }
++    }
++    *out_len = n;
++    return out;
++}
++
++/* ---- the two archives ------------------------------------------------------ */
++static char s_added[64][16];
++static int  s_n_added = -1;          /* -1: item tables not built yet */
++
++static int replace_table(Fb* fb, const char* name, int is_club)
++{
++    int p = fb_find(fb, name);
++    if (p < 0) { fprintf(stderr, "[dlc_earn] %s not in archive%c", name, 10); return -1; }
++    int raw_len = 0;
++    char* raw = stbi_zlib_decode_malloc_guesssize_headerflag((const char*)fb->pays[p].data,
++                    (int)fb->pays[p].stored, (int)fb->pays[p].raw + 16, &raw_len, 1);
++    if (!raw || raw_len != (int)fb->pays[p].raw) { free(raw); fprintf(stderr, "[dlc_earn] inflate %s failed%c", name, 10); return -1; }
++    int nl = 0, out_len = 0;
++    char* tab = extend_table(raw, raw_len, is_club, s_added + s_n_added, &nl, &out_len);
++    free(raw);
++    int clen = 0;
++    unsigned char* z = stbi_zlib_compress((unsigned char*)tab, out_len, &clen, 8);
++    free(tab);
++    if (!z) return -1;
++    free(fb->pays[p].data);
++    fb->pays[p].data = z; fb->pays[p].stored = (uint32_t)clen; fb->pays[p].raw = (uint32_t)out_len;
++    s_n_added += nl;
++    return 0;
++}
++
++static void out_path(char* out, size_t cap, const char* host_path)
++{
++    const char* root = getenv("PS3_HDD1_ROOT");
++    if (!root || !*root) root = getenv("TEMP");
++    if (!root || !*root) root = ".";
++    char dir[1024];
++    snprintf(dir, sizeof dir, "%s/hsg_dlc_earn", root);
++    HSG_MKDIR(dir);
++    const char* b = strrchr(host_path, '/');
++    const char* b2 = strrchr(host_path, '\\');
++    if (b2 && (!b || b2 > b)) b = b2;
++    snprintf(out, cap, "%s/%s", dir, b ? b + 1 : host_path);
++}
++
++static int build_items(const char* host_path, const char* dst)
++{
++    Fb fb;
++    if (fb_load(&fb, host_path) != 0) return -1;
++    s_n_added = 0;
++    int ok = replace_table(&fb, "data/param/challenge/Item_Club.txt", 1) == 0 &&
++             replace_table(&fb, "data/param/challenge/Item_Ball.txt", 0) == 0 &&
++             fb_save(&fb, dst) == 0;
++    fb_free(&fb);
++    return ok ? 0 : -1;
++}
++
++static int build_models(const char* host_path, const char* dst)
++{
++    Fb fb;
++    if (fb_load(&fb, host_path) != 0) return -1;
++    int added = 0;
++    for (int i = 0; i < s_n_added; i++) {
++        char name[128], src[128];
++        snprintf(name, sizeof name, "data/menu/phase/shop/model/%s.rem", s_added[i]);
++        if (fb_find(&fb, name) >= 0) continue;
++        char lab2[16]; snprintf(lab2, sizeof lab2, "%s", s_added[i]);
++        lab2[strlen(lab2) - 1] = '2';                     /* the brand's class 2 model */
++        snprintf(src, sizeof src, "data/menu/phase/shop/model/%s.rem", lab2);
++        int p = fb_find(&fb, src);
++        if (p < 0) { fprintf(stderr, "[dlc_earn] no model %s%c", src, 10); continue; }
++        unsigned char* d = (unsigned char*)malloc(fb.pays[p].stored ? fb.pays[p].stored : 1);
++        memcpy(d, fb.pays[p].data, fb.pays[p].stored);
++        if (fb_add(&fb, name, d, fb.pays[p].stored, fb.pays[p].raw) == 0) added++; else free(d);
++    }
++    int ok = fb_save(&fb, dst) == 0;
++    fb_free(&fb);
++    fprintf(stderr, "[dlc_earn] %s: %d model copies added%c", dst, added, 10);
++    return ok ? 0 : -1;
++}
++
++static int ends_with(const char* s, const char* suf)
++{
++    size_t a = strlen(s), b = strlen(suf);
++    return a >= b && strcmp(s + a - b, suf) == 0;
++}
++
++/* Called by cellFsOpen / cellFsStat with the resolved host path. Returns 1 and
++ * fills out with the rebuilt copy for the shop item and shop model archives
++ * unless HSG_DLC_EARN=0; 0 otherwise (open host_path as usual). */
++int hsg_dlc_earn_resolve(const char* host_path, char* out, size_t cap)
++{
++    if (!earn_on() || !host_path) return 0;
++    char p[1100];
++    snprintf(p, sizeof p, "%s", host_path);
++    for (char* c = p; *c; c++) if (*c == '\\') *c = '/';
++    int items = strstr(p, "/xbdata/challenge/challenge_param.") && ends_with(p, ".xb");
++    int models = strstr(p, "/xbdata/menu/phase/shop/shop_model.") && ends_with(p, ".xb");
++    if (!items && !models) return 0;
++    struct stat st;
++    if (stat(p, &st) != 0) return 0;
++    char dst[1200];
++    out_path(dst, sizeof dst, p);
++    /* Built once per run (licence state can change between runs). */
++    static char done[8][1200]; static int n_done = 0;
++    for (int i = 0; i < n_done; i++)
++        if (strcmp(done[i], dst) == 0) { snprintf(out, cap, "%s", dst); return 1; }
++    if (models && s_n_added < 0) {
++        /* The shop models need the list of added rows: build the item table first. */
++        char ip[1100], idst[1200];
++        snprintf(ip, sizeof ip, "%.*s/xbdata/challenge/challenge_param.US_01.xb",
++                 (int)(strstr(p, "/xbdata/") - p), p);
++        out_path(idst, sizeof idst, ip);
++        if (build_items(ip, idst) == 0 && n_done < 8) snprintf(done[n_done++], sizeof done[0], "%s", idst);
++    }
++    int rc = items ? build_items(p, dst) : build_models(p, dst);
++    if (rc != 0) { fprintf(stderr, "[dlc_earn] could not rebuild %s; using the original%c", p, 10); return 0; }
++    if (n_done < 8) snprintf(done[n_done++], sizeof done[0], "%s", dst);
++    fprintf(stderr, "[dlc_earn] %s -> %s%c", p, dst, 10);
++    snprintf(out, cap, "%s", dst);
++    return 1;
++}
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -135,6 +135,7 @@
+  * translators. (extern "C" is ill-formed at block scope.) */
+ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
+ extern "C" const char* cellGame_get_hdd_title_id(void);   /* cellGame.c: NULL unless an HDD title */
++extern "C" int hsg_dlc_earn_resolve(const char* host_path, char* out, size_t cap);   /* libs/system/hsg_dlc_earn.c */
+ 
+ /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
+  * prefixes are stripped; the rest is appended to the root. */
+@@ -313,6 +314,9 @@
+     uint32_t flags  = (uint32_t)ctx->gpr[4];
+     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
+     host_path(hpath, sizeof hpath, gpath);
++    /* HSG_DLC_EARN (default on): the shop item and shop model archives open as rebuilt copies. */
++    { char earn[1200];
++      if (hsg_dlc_earn_resolve(hpath, earn, sizeof earn)) snprintf(hpath, sizeof hpath, "%s", earn); }
+ 
+     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
+      * file and that is opened in its place. */
+@@ -782,6 +786,8 @@
+     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+     uint32_t sb = (uint32_t)ctx->gpr[4];
+     host_path(hpath, sizeof hpath, gpath);
++    { char earn[1200];   /* HSG_DLC_EARN: report the rebuilt copy's size */
++      if (hsg_dlc_earn_resolve(hpath, earn, sizeof earn)) snprintf(hpath, sizeof hpath, "%s", earn); }
+     fs_stat64_t st;
+     if (FS_STAT64(hpath, &st) != 0) {
+         if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);

@@ -902,6 +902,10 @@ int main(int argc, char** argv)
     cli_setenv("PS3_DEV_FLASH", firmware.c_str());
     cli_setenv("PS3_CAMERA", "0");
     cli_setenv("PS3_HTTP_OFFLINE", "1");
+    /* HSG_MOVIES=0: skip the movies, as builds without a decoder did. The
+     * runtime's cellSail then reports each one as played to its end at once. */
+    if (const char* movies = getenv("HSG_MOVIES"); movies && movies[0] == '0')
+        cli_setenv("PS3_SAIL_MOVIES", "0");
     cli_setenv("PS3_VERBOSE", std::to_string(rp.verbose).c_str());
     cli_apply_tuning(opt, rp);
     if (rp.verbose > 0)

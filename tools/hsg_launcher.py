@@ -17,6 +17,9 @@ Where each setting comes from (checked against the sources, nothing invented):
   Command-line flags: port/cli_options.cpp (parser and --help text) and docs/CLI.md.
   HSG_TWEAKS:         patches/runtime/0059-guest-tweaks.patch (libs/system/hsg_tweaks.c).
   HSG_FPS:            patches/runtime/0058 (30 = off, 60/90/120 on the course).
+  HSG_DLC_EARN:       patches/runtime/0070 (DLC club/ball classes 3-4 sold in the shop;
+                      on by default but only acts with PS3_NPDRM_STRICT=1;
+                      "dlc_earn": false passes =0).
   --aspect expand:    patches/runtime/0055 (Hor+ ultrawide).
 """
 import argparse
@@ -67,6 +70,7 @@ DEFAULTS = {
     "fps": "Default",         # HSG_FPS               (patch 0058)
     "tweaks": "",             # HSG_TWEAKS=<json>     (patch 0059)
     "mute": False,            # --mute                (port/cli_options.cpp)
+    "dlc_earn": True,         # HSG_DLC_EARN=0 when off (patch 0070)
     # Paths. Blank means "use the exe's default" from docs/CLI.md and no flag is passed.
     "elf": "",                # --elf        default <game-dir>/USRDIR/EBOOT.elf
     "game_dir": "",           # --game-dir   default <build dir>/game or <build dir>
@@ -239,6 +243,8 @@ def build_command(s, settings_file):
         env["HSG_TWEAKS"] = _abs(base, s["tweaks"])           # patch 0059
     if s["fps"] != "Default":
         env["HSG_FPS"] = s["fps"]                             # patch 0058
+    if not s["dlc_earn"]:
+        env["HSG_DLC_EARN"] = "0"                             # patch 0070 (default on)
     if s["extra_args"]:
         argv += shlex.split(s["extra_args"], posix=False)
     return argv, env, os.path.dirname(exe)
@@ -411,6 +417,8 @@ def run_gui(settings_file):
     row_path(a, 15, "dev_flash", "dev_flash folder", hint=PATH_DEFAULT_HINT["dev_flash"])
     ttk.Label(a, text="Extra arguments").grid(row=17, column=0, sticky="w", pady=2)
     ttk.Entry(a, textvariable=var("extra_args"), width=52).grid(row=17, column=1, sticky="we", padx=4)
+    ttk.Checkbutton(a, text="Sell DLC clubs and balls (classes 3-4) in the shop when not owned",
+                    variable=var("dlc_earn", tk.BooleanVar)).grid(row=18, column=1, sticky="w", padx=4, pady=2)
 
     status = tk.Text(root, height=7, width=84, wrap="word", state="disabled")
     status.pack(fill="x", padx=8)

@@ -1,0 +1,1733 @@
+diff --git a/libs/codec/cellSail.c b/libs/codec/cellSail.c
+--- a/libs/codec/cellSail.c
++++ b/libs/codec/cellSail.c
+@@ -3,9 +3,13 @@
+  *
+  * The player state machine and its callback events are implemented (boot,
+  * open, start, stop, close, with the SDK's event majors, call ids and
+- * states). There is no decoder: a started stream is logged as skipped and
+- * reported as having played to its end, and the frame getters answer
+- * CELL_SAIL_ERROR_EMPTY.
++ * states). A PAMF stream is decoded on the host (sail_movie.c: H.264 through
++ * Windows Media Foundation, ATRAC3plus through the decoder cellAtrac uses)
++ * and handed to the title through its graphics and sound adapters
++ * (GetFrame2 / SoundAdapterGetFrame). When a movie cannot be decoded -- no
++ * decoder on this host, an unsupported format, PS3_SAIL_MOVIES=0 -- the
++ * stream is logged as skipped and reported as having played to its end, and
++ * the frame getters answer CELL_SAIL_ERROR_EMPTY.
+  */
+ 
+ #include "ps3emu/guest_call.h"
+@@ -15,6 +19,22 @@
+ #include <string.h>
+ #include <stdlib.h>   /* getenv -- Clang errors on the implicit declaration MSVC allows */
+ #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
++#include "sail_movie.h"
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#else
++#include <pthread.h>
++#include <time.h>
++#endif
++
++extern uint8_t* vm_base;
++/* runtime/ppu/ppu_fs.cpp: resolves a guest path the way sys_fs open() does,
++ * so an HDD title's movies are found in its base install. */
++void ppu_fs_host_path(char* out, size_t cap, const char* guest);
++extern uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2,
++                               uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
++                               uint64_t a7);
+ 
+ /* Internal state */
+ 
+@@ -39,6 +59,11 @@ static struct {
+     u32 desc;         /* descriptor handle added to this player (0 = none) */
+     u32 open_desc;    /* descriptor whose stream is open (0 = none) */
+     u32 paused;
++    /* The CellSailMemAllocator given to Initialize2. The title builds it on
++     * its stack (Hot Shots Golf: 0x0FEFF32C), so it is copied, not kept. */
++    u32 alloc_opd, free_opd, alloc_arg;
++    u32 gadapter, sadapter;   /* adapters set with Set{Graphics,Sound}Adapter */
++    struct SailSession* sess; /* the movie being played, NULL = none */
+ } s_sail_players[CELL_SAIL_PLAYER_MAX];
+ 
+ /* A CellSailPlayer is a GUEST POINTER, not a small integer handle.
+@@ -55,6 +80,10 @@ static struct {
+  * and then blocks forever joining an audio thread that will not exit.
+  *
+  * One lookup, used by all of them, so the disagreement cannot come back. */
++struct SailSession;
++static struct SailSession* sail_session_detach(int sp);
++static void sail_session_free(int sp, struct SailSession* m);
++
+ static int sail_player_slot(u32 self_ea)
+ {
+     for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
+@@ -116,6 +145,7 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
+     const int _sp = sail_player_slot((u32)handle);
+     if (_sp < 0)
+         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
++    sail_session_free(_sp, sail_session_detach(_sp));
+     memset(&s_sail_players[_sp], 0, sizeof(s_sail_players[_sp]));
+     return CELL_OK;
+ }
+@@ -208,6 +238,377 @@ static void sail_completed(int slot, u32 call, u64 userParam)
+     sail_notify(slot, CELL_SAIL_EVENT_PLAYER_CALL_COMPLETED, call, 0, userParam);
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Movie playback.
++ *
++ * OpenStream opens the descriptor's file with sail_movie_open; Start hands
++ * the title's adapters their format and buffers and starts the decoder; the
++ * title then pulls pictures with GraphicsAdapterGetFrame2 (once per frame,
++ * main thread) and PCM with SoundAdapterGetFrame (its audio thread). The
++ * clock is the host's, started when the first picture is handed out; sound
++ * is held back until then so the two start together. When the last picture
++ * has been shown GetFrame2 reports the end of the stream the way the skip
++ * did (STOP_TRANSITION, then OPENED), and the title closes the stream.
++ *
++ * What Hot Shots Golf does with them (lifted code, official 1.03):
++ *   - graphics adapter at player+0x500, callbacks {NULL, NULL, FormatChanged
++ *     0x00D68AF0, Alloc 0x00D68AF8, Free 0x00D68B00}, all forwarding to the
++ *     owner's vtable; preferred format {coding from its config, alpha 0xFF,
++ *     everything else -1};
++ *   - per frame (0x00877E34): GetFrame2(adapter, &info, NULL, &flip, flags);
++ *     a result <= 0xFF is "no picture". On a new info.sessionId it calls
++ *     GraphicsAdapterGetFormat and binds info.pBuffer as a texture of that
++ *     coding / width / height / pitch, then PtsToTimePosition(info.pts);
++ *   - sound (0x008763F0): SoundAdapterGetFrame(adapter, n <= 256, &info);
++ *     on a new sessionId SoundAdapterGetFormat picks the channel layout, then
++ *     n frames of chNum big-endian floats are read from info.pBuffer.
++ *
++ * PS3_SAIL_MOVIES=0 turns all of this off and keeps the skip.
++ * -----------------------------------------------------------------------*/
++
++#define SAIL_SYNC_ON_TIME   (1u << 2)
++#define SAIL_SYNC_REPEATED  (1u << 8)
++#define SAIL_SYNC_NEXT      (2u << 8)
++#define SAIL_GFX_FRAMES     3          /* pictures in flight: shown, queued, being written */
++#define SAIL_PCM_MAX        2048       /* frames per SoundAdapterGetFrame we can serve */
++#define SAIL_ADAPTER_MAX    4
++
++/* Adapters, keyed by the guest struct EA the title initialised. The callback
++ * tables the title passes live on its stack, so they are copied. */
++static struct {
++    u32 self_ea, arg;
++    u32 cb[5];                 /* makeup, cleanup, formatChanged, alloc, free */
++    u8  pref[32];              /* CellSailVideoFormat, guest byte order */
++} s_gadapters[SAIL_ADAPTER_MAX];
++static struct {
++    u32 self_ea, arg;
++    u32 cb[3];                 /* makeup, cleanup, formatChanged */
++    u8  pref[24];              /* CellSailAudioFormat, guest byte order */
++} s_sadapters[SAIL_ADAPTER_MAX];
++
++typedef struct SailSession {
++    SailMovie* mv;
++    SailMovieInfo info;
++    int started;               /* decoder running and buffers handed out */
++    int ended;                 /* end of stream reported */
++    u32 session_id;
++    /* graphics */
++    int coding;                /* 0 ARGB, 1 RGBA interleaved, 3 YUV420 planar */
++    u8  alpha;
++    u32 fmt_ea;                /* CellSailVideoFormat handed to FormatChanged */
++    u32 frames_ea;             /* the u32[] Alloc filled */
++    u32 frame[SAIL_GFX_FRAMES];
++    int frame_num, frame_from_title;
++    u32 frame_size, pitch;
++    int cur;                   /* frame[] shown last, -1 = none yet */
++    u32 tag;
++    int64_t cur_pts;
++    u64 frames_shown;
++    /* clock (host ticks) */
++    int64_t t0, pause_at;
++    /* sound */
++    int ach;                   /* channels handed to the title, 0 = no sound */
++    u32 pcm[2];
++    int pcm_idx;
++    u32 sound_tag;
++    int64_t sound_frames;
++} SailSession;
++
++/* GetFrame2 runs on the title's main thread, SoundAdapterGetFrame on its
++ * audio thread, Stop/Close on whichever thread drives the player: one lock. */
++#ifdef _WIN32
++static SRWLOCK s_sess_lock = SRWLOCK_INIT;
++static void sess_lock(void)   { AcquireSRWLockExclusive(&s_sess_lock); }
++static void sess_unlock(void) { ReleaseSRWLockExclusive(&s_sess_lock); }
++static int64_t host_ticks(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
++static int64_t host_freq(void)  { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }
++#else
++static pthread_mutex_t s_sess_lock = PTHREAD_MUTEX_INITIALIZER;
++static void sess_lock(void)   { pthread_mutex_lock(&s_sess_lock); }
++static void sess_unlock(void) { pthread_mutex_unlock(&s_sess_lock); }
++static int64_t host_ticks(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec; }
++static int64_t host_freq(void)  { return 1000000000; }
++#endif
++
++static int sail_movies_enabled(void)
++{
++    const char* e = getenv("PS3_SAIL_MOVIES");
++    return !(e && e[0] == '0');
++}
++
++static int sail_gadapter(u32 ea)
++{
++    for (int i = 0; ea && i < SAIL_ADAPTER_MAX; i++)
++        if (s_gadapters[i].self_ea == ea) return i;
++    return -1;
++}
++
++static int sail_sadapter(u32 ea)
++{
++    for (int i = 0; ea && i < SAIL_ADAPTER_MAX; i++)
++        if (s_sadapters[i].self_ea == ea) return i;
++    return -1;
++}
++
++/* The player an adapter was set on. */
++static int sail_player_of_gadapter(u32 ea)
++{
++    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
++        if (s_sail_players[i].in_use && s_sail_players[i].gadapter == ea) return i;
++    return -1;
++}
++
++static int sail_player_of_sadapter(u32 ea)
++{
++    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
++        if (s_sail_players[i].in_use && s_sail_players[i].sadapter == ea) return i;
++    return -1;
++}
++
++/* Guest memory from the player's CellSailMemAllocator:
++ * alloc(pArg, boundary, size) -> pointer, free(pArg, boundary, pointer). */
++static u32 sail_guest_alloc(int sp, u32 boundary, u32 size)
++{
++    const u32 opd = s_sail_players[sp].alloc_opd;
++    if (!opd) return 0;
++    return (u32)ppu_guest_call(opd, s_sail_players[sp].alloc_arg, boundary, size, 0, 0, 0, 0, 0);
++}
++
++static void sail_guest_free(int sp, u32 boundary, u32 ea)
++{
++    const u32 opd = s_sail_players[sp].free_opd;
++    if (opd && ea) ppu_guest_call(opd, s_sail_players[sp].alloc_arg, boundary, ea, 0, 0, 0, 0, 0);
++}
++
++static u8 sail_frame_rate_code(const SailMovieInfo* in)
++{
++    static const int rates[8][2] = {{24000, 1001}, {24, 1}, {25, 1}, {30000, 1001},
++                                    {30, 1}, {50, 1}, {60000, 1001}, {60, 1}};
++    for (int i = 0; i < 8; i++)
++        if (rates[i][0] == in->fps_num && rates[i][1] == in->fps_den) return (u8)i;
++    return 0xFF;   /* UNSPECIFIED */
++}
++
++static void sail_write_video_format(const SailSession* m, u32 ea)
++{
++    vm_write8(ea + 0, (u8)m->coding);
++    vm_write8(ea + 1, 0);                         /* SCAN_PROGRESSIVE */
++    vm_write8(ea + 2, 8);                         /* bits per colour */
++    vm_write8(ea + 3, sail_frame_rate_code(&m->info));
++    vm_write16(ea + 4, (u16)m->info.width);
++    vm_write16(ea + 6, (u16)m->info.height);
++    vm_write32(ea + 8, m->pitch);
++    vm_write32(ea + 12, m->alpha);
++    vm_write8(ea + 16, 1);                        /* COLOR_MATRIX_BT709 (applied already for RGB) */
++    vm_write8(ea + 17, 1);                        /* ASPECT_RATIO_1_1 */
++    vm_write8(ea + 18, m->coding == 3 ? 1 : 0);   /* RGB out is full range; YUV kept limited
++                                                     (value 1 assumed; the title reads only the matrix) */
++    vm_write8(ea + 19, 0xFF);
++    vm_write32(ea + 20, 0xFFFFFFFFu);
++    vm_write64(ea + 24, ~0ull);
++}
++
++/* CellSailAudioFormat: float PCM, 48 kHz, 5.1 as L C R Ls Rs LFE or stereo. */
++static void sail_write_audio_format(const SailSession* m, u32 ea)
++{
++    vm_write8(ea + 0, 1);                         /* LPCM_FLOAT32 */
++    vm_write8(ea + 1, (u8)m->ach);
++    vm_write16(ea + 2, 0xFFFF);                   /* sampleNum unspecified */
++    vm_write32(ea + 4, (u32)(m->info.audio_rate ? m->info.audio_rate : 48000));
++    vm_write32(ea + 8, m->ach == 6 ? 8u : 2u);    /* CH_LAYOUT_6CH_LCRlrE / 2CH_LR */
++    vm_write32(ea + 12, 0xFFFFFFFFu);
++    vm_write64(ea + 16, ~0ull);
++}
++
++/* Takes the session off the player, so the adapters stop seeing it. */
++static SailSession* sail_session_detach(int sp)
++{
++    sess_lock();
++    SailSession* m = s_sail_players[sp].sess;
++    s_sail_players[sp].sess = NULL;
++    sess_unlock();
++    return m;
++}
++
++/* Stops the decoder and frees what Start allocated. Runs without the lock:
++ * it calls back into the title. */
++static void sail_session_free(int sp, SailSession* m)
++{
++    if (!m) return;
++    sail_movie_close(m->mv);
++    const int g = sail_gadapter(s_sail_players[sp].gadapter);
++    if (m->frame_from_title) {
++        if (g >= 0 && s_gadapters[g].cb[4])
++            ppu_guest_call(s_gadapters[g].cb[4], s_gadapters[g].arg, (u64)m->frame_num,
++                           m->frames_ea, 0, 0, 0, 0, 0);
++    } else {
++        for (int i = 0; i < SAIL_GFX_FRAMES; i++) sail_guest_free(sp, 128, m->frame[i]);
++    }
++    sail_guest_free(sp, 16, m->frames_ea);
++    sail_guest_free(sp, 16, m->fmt_ea);
++    sail_guest_free(sp, 128, m->pcm[0]);
++    sail_guest_free(sp, 128, m->pcm[1]);
++    if (m->started)
++        printf("[cellSail] movie closed after %llu pictures\n", (unsigned long long)m->frames_shown);
++    free(m);
++}
++
++/* OpenStream: probe the descriptor's file. Leaves sess NULL (skip) when the
++ * movie cannot be played, and says why. */
++static void sail_session_open(int sp, const char* uri)
++{
++    if (!sail_movies_enabled()) {
++        printf("[cellSail] movies off (PS3_SAIL_MOVIES=0)\n");
++        return;
++    }
++    const char* path = uri;
++    if (strncmp(path, "x-cell-fs://", 12) == 0) path += 12;
++    char host[1024];
++    char why[160] = "";
++    SailMovieInfo info;
++    SailMovie* mv = NULL;
++    host[0] = '\0';
++    ppu_fs_host_path(host, sizeof host, path);
++    if (!host[0])
++        snprintf(why, sizeof why, "no host path for %s", path);
++    else
++        mv = sail_movie_open(host, &info, why, sizeof why);
++    if (!mv) {
++        printf("[cellSail] cannot play %s: %s\n", uri, why);
++        return;
++    }
++    SailSession* m = (SailSession*)calloc(1, sizeof *m);
++    if (!m) { sail_movie_close(mv); return; }
++    m->mv = mv;
++    m->info = info;
++    m->cur = -1;
++    static u32 s_session;
++    m->session_id = ++s_session;
++    sail_session_free(sp, sail_session_detach(sp));
++    sess_lock();
++    s_sail_players[sp].sess = m;
++    sess_unlock();
++    printf("[cellSail] movie %s: %dx%d %d/%d fps, %d audio channels\n", uri, info.width,
++           info.height, info.fps_num, info.fps_den, info.audio_channels);
++}
++
++/* Start: give the adapters their format and buffers and start decoding.
++ * Returns 0, or -1 when the movie has to be skipped after all (logged). */
++static int sail_session_start(int sp)
++{
++    SailSession* m = s_sail_players[sp].sess;
++    if (!m) return -1;
++    const int g = sail_gadapter(s_sail_players[sp].gadapter);
++    if (g < 0) { printf("[cellSail] no graphics adapter set; movie skipped\n"); return -1; }
++    const s8 want = (s8)s_gadapters[g].pref[0];
++    if (want != 0 && want != 1 && want != 3 && want != -1) {
++        printf("[cellSail] graphics adapter wants coding %d, only ARGB, RGBA and YUV420 "
++               "planar are produced; movie skipped\n", want);
++        return -1;
++    }
++    m->coding = want == -1 ? 0 : want;
++    const u8* pa = &s_gadapters[g].pref[12];
++    const s32 pref_alpha = (s32)(((u32)pa[0] << 24) | ((u32)pa[1] << 16) | ((u32)pa[2] << 8) | pa[3]);
++    m->alpha = pref_alpha >= 0 && pref_alpha <= 255 ? (u8)pref_alpha : 0xFF;
++    if (m->coding == 3) {   /* Y, then U and V at half the pitch (func_00BCF514) */
++        m->pitch = (u32)m->info.width;
++        m->frame_size = m->pitch * (u32)m->info.height * 3u / 2u;
++    } else {
++        m->pitch = (u32)m->info.width * 4;
++        m->frame_size = m->pitch * (u32)m->info.height;
++    }
++
++    /* The format, then the picture buffers, from the title's own callbacks
++     * the way libsail asks for them; the player's allocator if it has none. */
++    m->fmt_ea = sail_guest_alloc(sp, 16, 32);
++    m->frames_ea = sail_guest_alloc(sp, 16, 4 * SAIL_GFX_FRAMES);
++    if (!m->fmt_ea || !m->frames_ea) {
++        printf("[cellSail] player allocator gave no memory; movie skipped\n");
++        return -1;
++    }
++    sail_write_video_format(m, m->fmt_ea);
++    if (s_gadapters[g].cb[2])
++        ppu_guest_call(s_gadapters[g].cb[2], s_gadapters[g].arg, m->fmt_ea, m->session_id,
++                       0, 0, 0, 0, 0);
++    m->frame_num = SAIL_GFX_FRAMES;
++    for (int i = 0; i < SAIL_GFX_FRAMES; i++) vm_write32(m->frames_ea + 4u * i, 0);
++    if (s_gadapters[g].cb[3]) {
++        const s32 rc = (s32)ppu_guest_call(s_gadapters[g].cb[3], s_gadapters[g].arg, m->frame_size,
++                                           (u64)SAIL_GFX_FRAMES, m->frames_ea, 0, 0, 0, 0);
++        /* The result is how many pictures the title could give. Hot Shots
++         * Golf's movie pool (0x600000 bytes at 0x17600000) holds two 1080p
++         * YUV420 pictures: it returns 2 and still writes a third pointer,
++         * past the pool's end and into the next block. Use only the first rc. */
++        int ok = rc >= 1;
++        if (ok && rc < SAIL_GFX_FRAMES) m->frame_num = rc;
++        for (int i = 0; i < m->frame_num; i++) {
++            m->frame[i] = vm_read32(m->frames_ea + 4u * i);
++            if (!m->frame[i]) ok = 0;
++        }
++        printf("[cellSail] graphics adapter Alloc(%u bytes x %d) -> %d [0x%08X 0x%08X 0x%08X]\n",
++               m->frame_size, SAIL_GFX_FRAMES, rc, m->frame[0], m->frame[1], m->frame[2]);
++        m->frame_from_title = ok;
++        if (!ok) {
++            if (rc >= 1 && s_gadapters[g].cb[4])
++                ppu_guest_call(s_gadapters[g].cb[4], s_gadapters[g].arg, (u64)m->frame_num,
++                               m->frames_ea, 0, 0, 0, 0, 0);
++            memset(m->frame, 0, sizeof m->frame);
++            m->frame_num = SAIL_GFX_FRAMES;
++        }
++    }
++    if (!m->frame_from_title) {
++        for (int i = 0; i < SAIL_GFX_FRAMES; i++)
++            if (!(m->frame[i] = sail_guest_alloc(sp, 128, m->frame_size))) {
++                printf("[cellSail] no memory for %u-byte pictures; movie skipped\n", m->frame_size);
++                return -1;
++            }
++        printf("[cellSail] pictures from the player allocator: 0x%08X 0x%08X 0x%08X\n",
++               m->frame[0], m->frame[1], m->frame[2]);
++    }
++
++    /* Sound: float PCM in the layout the title prefers (5.1 or stereo). */
++    const int sa = sail_sadapter(s_sail_players[sp].sadapter);
++    if (sa >= 0 && m->info.audio_channels > 0) {
++        const s8 pch = (s8)s_sadapters[sa].pref[1];
++        m->ach = (pch == 1 || pch == 2 || m->info.audio_channels < 6) ? 2 : 6;
++        const u32 bytes = SAIL_PCM_MAX * (u32)m->ach * 4u;
++        m->pcm[0] = sail_guest_alloc(sp, 128, bytes);
++        m->pcm[1] = sail_guest_alloc(sp, 128, bytes);
++        if (!m->pcm[0] || !m->pcm[1]) {
++            printf("[cellSail] no memory for movie sound; playing without it\n");
++            m->ach = 0;
++        }
++    }
++    const int layout = m->coding == 3 ? SAIL_MOVIE_YUV420
++                     : m->coding == 1 ? SAIL_MOVIE_RGBA : SAIL_MOVIE_ARGB;
++    if (sail_movie_start(m->mv, layout, m->alpha,
++                         m->ach) < 0) {
++        printf("[cellSail] decoder did not start; movie skipped\n");
++        return -1;
++    }
++    m->started = 1;
++    printf("[cellSail] playing: coding %d, %u-byte pictures, sound %d ch\n", m->coding,
++           m->frame_size, m->ach);
++    fflush(stdout);
++    return 0;
++}
++
++static int64_t sail_clock_90k(const SailSession* m)
++{
++    if (!m->t0) return 0;
++    const int64_t now = m->pause_at ? m->pause_at : host_ticks();
++    return (now - m->t0) * 90000 / host_freq();
++}
++
++static void sail_write_frame_info(u32 ea, u32 buffer, u32 session, u32 tag, int64_t pts)
++{
++    vm_write32(ea + 0, buffer);
++    vm_write32(ea + 4, session);
++    vm_write32(ea + 8, tag);
++    vm_write32(ea + 12, 0);
++    vm_write64(ea + 16, (u64)pts);
++}
++
+ s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
+ {
+     printf("[cellSail] PlayerBoot(%u)\n", handle);
+@@ -234,6 +635,7 @@ s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, u64 userParam)
+         return (s32)CELL_SAIL_ERROR_INVALID_STATE;
+     sail_set_state(_sp, CELL_SAIL_SDK_STATE_OPEN_TRANSITION);
+     s_sail_players[_sp].open_desc = desc;
++    sail_session_open(_sp, sail_desc_uri(desc));
+     sail_notify(_sp, CELL_SAIL_EVENT_STREAM_OPENED, 0, desc, 0);
+     sail_completed(_sp, CELL_SAIL_PLAYER_CALL_OPEN_STREAM, userParam);
+     sail_set_state(_sp, CELL_SAIL_SDK_STATE_OPENED);
+@@ -247,6 +649,7 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle, u64 userParam)
+         return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+     const u32 desc = s_sail_players[_sp].open_desc;
+     printf("[cellSail] PlayerCloseStream(desc=%u)\n", desc);
++    sail_session_free(_sp, sail_session_detach(_sp));
+     sail_set_state(_sp, CELL_SAIL_SDK_STATE_CLOSE_TRANSITION);
+     if (desc) {
+         /* The title answers this by destroying the descriptor and freeing
+@@ -262,14 +665,16 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle, u64 userParam)
+ 
+ /* cellSailPlayerStart(pSelf, CellSailStartCommand* pCommand, userParam).
+  *
+- * There is no video decoder in this port, so the stream cannot be played.
+- * Rather than claim it is running forever (the title then draws an empty
+- * movie frame for good), report it as started and then as ended: the player
+- * leaves RUNNING and is back in OPENED, which is what the title waits for
+- * before it closes the stream (func_0087789C, STATE_CHANGED with arg0 4 at
+- * step 4). Passing through STOP_TRANSITION on the way, and not posting
+- * SOURCE_EOS, are this file's choices; no title here reads either. The skip
+- * is logged, never silent. */
++ * A movie OpenStream could open plays: the player stays RUNNING and
++ * GraphicsAdapterGetFrame2 reports the end once the last picture is shown.
++ *
++ * One that cannot be decoded is skipped. Rather than claim it is running
++ * forever (the title then draws an empty movie frame for good), report it as
++ * started and then as ended: the player leaves RUNNING and is back in
++ * OPENED, which is what the title waits for before it closes the stream
++ * (func_0087789C, STATE_CHANGED with arg0 4 at step 4). Passing through
++ * STOP_TRANSITION on the way, and not posting SOURCE_EOS, are this file's
++ * choices; no title here reads either. The skip is logged, never silent. */
+ s32 cellSailPlayerStart(CellSailPlayerHandle handle, u32 pCommand, u64 userParam)
+ {
+     (void)pCommand;
+@@ -283,7 +688,10 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle, u32 pCommand, u64 userParam
+     sail_completed(_sp, CELL_SAIL_PLAYER_CALL_START, userParam);
+     sail_set_state(_sp, CELL_SAIL_SDK_STATE_RUNNING);
+ 
+-    printf("[cellSail] no decoder: movie %s skipped\n",
++    if (sail_session_start(_sp) == 0)
++        return CELL_OK;
++    sail_session_free(_sp, sail_session_detach(_sp));
++    printf("[cellSail] movie %s skipped\n",
+            sail_desc_uri(s_sail_players[_sp].open_desc));
+     fflush(stdout);
+     sail_set_state(_sp, CELL_SAIL_SDK_STATE_STOP_TRANSITION);
+@@ -300,14 +708,15 @@ s32 cellSailPlayerStop(CellSailPlayerHandle handle, u64 userParam)
+     const int _sp = sail_player_slot((u32)handle);
+     if (_sp < 0)
+         return (s32)CELL_SAIL_ERROR_INVALID_ARG;
++    sail_session_free(_sp, sail_session_detach(_sp));
+     sail_set_state(_sp, CELL_SAIL_SDK_STATE_STOP_TRANSITION);
+     sail_completed(_sp, CELL_SAIL_PLAYER_CALL_STOP, userParam);
+     sail_set_state(_sp, CELL_SAIL_SDK_STATE_OPENED);
+     return CELL_OK;
+ }
+ 
+-/* cellSailPlayerSetPaused(pSelf, paused). No stream is ever running here, so
+- * this only records the flag. Whether hardware also posts
++/* cellSailPlayerSetPaused(pSelf, paused). Records the flag and holds the
++ * movie clock while it is set. Whether hardware also posts
+  * PAUSE_STATE_CHANGED is not established, so no event is invented. */
+ s32 cellSailPlayerSetPaused(CellSailPlayerHandle handle, u32 paused)
+ {
+@@ -316,6 +725,13 @@ s32 cellSailPlayerSetPaused(CellSailPlayerHandle handle, u32 paused)
+         return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+     printf("[cellSail] PlayerSetPaused(%u, %u)\n", handle, paused);
+     s_sail_players[_sp].paused = paused ? 1u : 0u;
++    sess_lock();
++    SailSession* m = s_sail_players[_sp].sess;
++    if (m && m->t0) {
++        if (paused && !m->pause_at) m->pause_at = host_ticks();
++        else if (!paused && m->pause_at) { m->t0 += host_ticks() - m->pause_at; m->pause_at = 0; }
++    }
++    sess_unlock();
+     return CELL_OK;
+ }
+ 
+@@ -327,6 +743,7 @@ s32 cellSailPlayerFinalize(CellSailPlayerHandle handle)
+     const int _sp = sail_player_slot((u32)handle);
+     if (_sp < 0)
+         return (s32)CELL_SAIL_ERROR_INVALID_ARG;
++    sail_session_free(_sp, sail_session_detach(_sp));
+     memset(&s_sail_players[_sp], 0, sizeof(s_sail_players[_sp]));
+     return CELL_OK;
+ }
+@@ -401,11 +818,13 @@ s32 cellSailPlayerGetStreamInfo(CellSailPlayerHandle handle, u32 streamIndex,
+  * going to exit. Look the player up the way Initialize2 stored it. */
+ s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
+ {
+-    (void)index; (void)adapter;
++    (void)index;
+     u32 self_ea = (u32)handle;
+     for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
+-        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
++        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea) {
++            s_sail_players[i].sadapter = (u32)(uintptr_t)adapter;
+             return CELL_OK;
++        }
+     return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+ }
+ 
+@@ -421,11 +840,13 @@ s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void*
+  * going to exit. Look the player up the way Initialize2 stored it. */
+ s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
+ {
+-    (void)index; (void)adapter;
++    (void)index;
+     u32 self_ea = (u32)handle;
+     for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
+-        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
++        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea) {
++            s_sail_players[i].gadapter = (u32)(uintptr_t)adapter;
+             return CELL_OK;
++        }
+     return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+ }
+ 
+@@ -641,12 +1062,18 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
+         if (!s_sail_players[i].in_use) slot = i;
+     if (slot < 0)
+         return (s32)CELL_SAIL_ERROR_MEMORY;
++    sail_session_free(slot, sail_session_detach(slot));
+     memset(&s_sail_players[slot], 0, sizeof(s_sail_players[slot]));
+     s_sail_players[slot].in_use       = 1;
+     s_sail_players[slot].self_ea      = pSelf;
+     s_sail_players[slot].allocator_ea = pAllocator;
+     s_sail_players[slot].callback_ea  = pCallback;
+     s_sail_players[slot].arg_ea       = pUserParam;
++    if (pAllocator) {   /* the record cellSailMemAllocatorInitialize built */
++        s_sail_players[slot].alloc_opd = vm_read32(pAllocator);
++        s_sail_players[slot].free_opd  = vm_read32(pAllocator + 4);
++        s_sail_players[slot].alloc_arg = vm_read32(pAllocator + 8);
++    }
+ 
+     /* The player reports its first state from inside Initialize2
+      * (RPCS3 cellSail.cpp, cellSailPlayerInitialize2). */
+@@ -662,6 +1089,16 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
+            pSelf, pCallbacks);
+     if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+     sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
++    int a = sail_sadapter(pSelf);
++    for (int i = 0; a < 0 && i < SAIL_ADAPTER_MAX; i++)
++        if (!s_sadapters[i].self_ea) a = i;
++    if (a >= 0) {
++        memset(&s_sadapters[a], 0, sizeof s_sadapters[a]);
++        s_sadapters[a].self_ea = pSelf;
++        s_sadapters[a].arg = pArg;
++        for (int i = 0; pCallbacks && i < 3; i++) s_sadapters[a].cb[i] = vm_read32(pCallbacks + 4u * i);
++        memset(s_sadapters[a].pref, 0xFF, sizeof s_sadapters[a].pref);
++    }
+     return CELL_OK;
+ }
+ 
+@@ -674,55 +1111,82 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
+  * rather than a stale address that faults or is silently followed. */
+ s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
+ {
+-    (void)pArg;
+     printf("[cellSail] GraphicsAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
+            pSelf, pCallbacks);
+     if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+     sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
++    int a = sail_gadapter(pSelf);
++    for (int i = 0; a < 0 && i < SAIL_ADAPTER_MAX; i++)
++        if (!s_gadapters[i].self_ea) a = i;
++    if (a >= 0) {
++        memset(&s_gadapters[a], 0, sizeof s_gadapters[a]);
++        s_gadapters[a].self_ea = pSelf;
++        s_gadapters[a].arg = pArg;
++        for (int i = 0; pCallbacks && i < 5; i++) s_gadapters[a].cb[i] = vm_read32(pCallbacks + 4u * i);
++        memset(s_gadapters[a].pref, 0xFF, sizeof s_gadapters[a].pref);
++    }
+     return CELL_OK;
+ }
+ 
+ /* cellSailGraphicsAdapterSetPreferredFormat(pSelf, pFormat)
+  *
+- * Records nothing: we do not decode video, so there is no format to honour.
+- * It must still answer CELL_OK for a valid adapter, because a title that reads
+- * an error here concludes its graphics adapter is unusable. */
++ * Kept for the next movie: its coding picks the pixel layout the decoder
++ * writes (ARGB, RGBA or YUV420 planar; other codings are not produced, and such
++ * a movie is skipped with a log line) and its alpha the alpha byte. */
+ s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
+ {
+-    printf("[cellSail] GraphicsAdapterSetPreferredFormat(self=0x%08X fmt=0x%08X)\n",
+-           pSelf, pFormat);
+     if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
++    const int a = sail_gadapter(pSelf);
++    if (a >= 0 && pFormat)
++        for (u32 i = 0; i < sizeof s_gadapters[a].pref; i++) s_gadapters[a].pref[i] = vm_read8(pFormat + i);
++    printf("[cellSail] GraphicsAdapterSetPreferredFormat(self=0x%08X fmt=0x%08X): coding %d "
++           "%dx%d pitch %d alpha %d\n", pSelf, pFormat,
++           a >= 0 ? (s8)s_gadapters[a].pref[0] : 0, pFormat ? (s16)vm_read16(pFormat + 4) : 0,
++           pFormat ? (s16)vm_read16(pFormat + 6) : 0, pFormat ? (s32)vm_read32(pFormat + 8) : 0,
++           pFormat ? (s32)vm_read32(pFormat + 12) : 0);
+     return CELL_OK;
+ }
+ 
+ s32 cellSailGraphicsAdapterFinalize(u32 pSelf)
+ {
+     printf("[cellSail] GraphicsAdapterFinalize(self=0x%08X)\n", pSelf);
++    const int a = sail_gadapter(pSelf);
++    if (a >= 0) memset(&s_gadapters[a], 0, sizeof s_gadapters[a]);
+     return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARG;
+ }
+ 
+ s32 cellSailSoundAdapterFinalize(u32 pSelf)
+ {
+     printf("[cellSail] SoundAdapterFinalize(self=0x%08X)\n", pSelf);
++    const int a = sail_sadapter(pSelf);
++    if (a >= 0) memset(&s_sadapters[a], 0, sizeof s_sadapters[a]);
+     return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARG;
+ }
+ 
+-/* Same contract as the graphics side: nothing decodes audio, so there is no
+- * format to honour, and the adapter is still usable. Hot Shots Golf calls it
+- * right after SoundAdapterInitialize (0x008748C0) and does not check it. */
++/* Kept for the next movie: a chNum of 1 or 2 gets a stereo downmix, anything
++ * else the stream's own 5.1. Hot Shots Golf calls it right after
++ * SoundAdapterInitialize (0x008748C0) and does not check it. */
+ s32 cellSailSoundAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
+ {
+-    printf("[cellSail] SoundAdapterSetPreferredFormat(self=0x%08X fmt=0x%08X)\n",
+-           pSelf, pFormat);
++    const int a = sail_sadapter(pSelf);
++    if (a >= 0 && pFormat)
++        for (u32 i = 0; i < sizeof s_sadapters[a].pref; i++) s_sadapters[a].pref[i] = vm_read8(pFormat + i);
++    printf("[cellSail] SoundAdapterSetPreferredFormat(self=0x%08X fmt=0x%08X): coding %d ch %d "
++           "fs %d layout %d\n", pSelf, pFormat, pFormat ? (s8)vm_read8(pFormat) : 0,
++           pFormat ? (s8)vm_read8(pFormat + 1) : 0, pFormat ? (s32)vm_read32(pFormat + 4) : 0,
++           pFormat ? (s32)vm_read32(pFormat + 8) : 0);
+     return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARG;
+ }
+ 
+-/* The frame getters return the next decoded frame; with no decoder there never
+- * is one. CELL_SAIL_ERROR_EMPTY is the SDK's "nothing yet" answer, and it is
+- * what the title's own code is built for: Hot Shots Golf treats any result
+- * <= 0xFF from GetFrame2 (0x0087747C) and from SoundAdapterGetFrame
+- * (0x00875A24) as "no frame" and skips drawing / mixing it. The info structs
+- * are left untouched, as they are for any failed call. */
++/* cellSailGraphicsAdapterGetFrame2(pSelf, CellSailGraphicsFrameInfo* pInfo,
++ *                                  pPrevInfo, u64* pFlipTime, flags)
++ *
++ * The picture due now. A result above 0xFF is a picture (CELL_SAIL_SYNC_*:
++ * NEXT for a new one, REPEATED for the one already shown) and fills pInfo
++ * {pBuffer, sessionId, tag, status, pts}; CELL_SAIL_ERROR_EMPTY is the SDK's
++ * "nothing yet", which Hot Shots Golf (0x00877E64) and its sound side
++ * (0x0087640C) treat as "no frame" and skip. pPrevInfo and pFlipTime are not
++ * used: the clock is the host's. */
+ s32 cellSailGraphicsAdapterGetFrame2(u32 pSelf, u32 pInfo, u32 pPrevInfo,
+                                      u32 pFlipTime, u64 flags)
+ {
+@@ -730,23 +1194,146 @@ s32 cellSailGraphicsAdapterGetFrame2(u32 pSelf, u32 pInfo, u32 pPrevInfo,
+     if (s_n < 3) {
+         s_n++;
+         printf("[cellSail] GraphicsAdapterGetFrame2(self=0x%08X info=0x%08X prev=0x%08X "
+-               "flip=0x%08X flags=0x%llX) -> EMPTY (no decoder)\n",
++               "flip=0x%08X flags=0x%llX)\n",
+                pSelf, pInfo, pPrevInfo, pFlipTime, (unsigned long long)flags);
+     }
+     if (!pSelf || !pInfo) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+-    return (s32)CELL_SAIL_ERROR_EMPTY;
++    const int sp = sail_player_of_gadapter(pSelf);
++    if (sp < 0) return (s32)CELL_SAIL_ERROR_EMPTY;
++    s32 rc = (s32)CELL_SAIL_ERROR_EMPTY;
++    int ended = 0;
++    u64 shown = 0;
++    sess_lock();
++    SailSession* m = s_sail_players[sp].sess;
++    if (m && m->started) {
++        int r = 0;
++        if (!m->ended && !m->pause_at) {
++            const int next = (m->cur + 1) % m->frame_num;
++            int64_t pts = 0;
++            r = sail_movie_take_frame(m->mv, sail_clock_90k(m), vm_base + m->frame[next],
++                                      (int)m->pitch, &pts);
++            if (r == 1) {
++                if (!m->t0) m->t0 = host_ticks();
++                m->cur = next;
++                m->cur_pts = pts;
++                m->tag++;
++                m->frames_shown++;
++            } else if (r < 0) {
++                m->ended = ended = 1;
++                shown = m->frames_shown;
++            }
++        }
++        if (m->cur >= 0) {
++            sail_write_frame_info(pInfo, m->frame[m->cur], m->session_id, m->tag, m->cur_pts);
++            rc = (s32)((r == 1 ? SAIL_SYNC_NEXT : SAIL_SYNC_REPEATED) | SAIL_SYNC_ON_TIME);
++        }
++    }
++    sess_unlock();
++    if (ended) {
++        /* Same end-of-stream report as a skipped movie: back to OPENED. */
++        printf("[cellSail] movie %s ended after %llu pictures\n",
++               sail_desc_uri(s_sail_players[sp].open_desc), (unsigned long long)shown);
++        fflush(stdout);
++        sail_set_state(sp, CELL_SAIL_SDK_STATE_STOP_TRANSITION);
++        sail_set_state(sp, CELL_SAIL_SDK_STATE_OPENED);
++    }
++    return rc;
+ }
+ 
++/* cellSailSoundAdapterGetFrame(pSelf, samples, CellSailSoundFrameInfo* pInfo)
++ *
++ * `samples` frames of float PCM, big-endian, interleaved in the layout
++ * SoundAdapterGetFormat reports. Nothing is handed out before the first
++ * picture (so sound and picture start together) or while paused. A short
++ * read (decoder behind) is padded with silence. */
+ s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo)
+ {
+     static int s_n;
+     if (s_n < 3) {
+         s_n++;
+-        printf("[cellSail] SoundAdapterGetFrame(self=0x%08X samples=%u info=0x%08X)"
+-               " -> EMPTY (no decoder)\n", pSelf, samples, pInfo);
++        printf("[cellSail] SoundAdapterGetFrame(self=0x%08X samples=%u info=0x%08X)\n",
++               pSelf, samples, pInfo);
+     }
+     if (!pSelf || !pInfo) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+-    return (s32)CELL_SAIL_ERROR_EMPTY;
++    const int sp = sail_player_of_sadapter(pSelf);
++    if (sp < 0) return (s32)CELL_SAIL_ERROR_EMPTY;
++    static float pcm[SAIL_PCM_MAX * 6];   /* used under the lock only */
++    s32 rc = (s32)CELL_SAIL_ERROR_EMPTY;
++    sess_lock();
++    SailSession* m = s_sail_players[sp].sess;
++    if (m && m->started && !m->ended && m->ach > 0 && m->t0 && !m->pause_at && samples) {
++        const int n = samples > SAIL_PCM_MAX ? SAIL_PCM_MAX : (int)samples;
++        const int got = sail_movie_read_audio(m->mv, pcm, n);
++        if (got > 0) {
++            const u32 buf = m->pcm[m->pcm_idx];
++            m->pcm_idx ^= 1;
++            const int nf = n * m->ach;
++            for (int i = 0; i < nf; i++) {
++                u32 bits = 0;
++                if (i < got * m->ach) memcpy(&bits, &pcm[i], 4);
++                vm_write32(buf + 4u * (u32)i, bits);
++            }
++            const int rate = m->info.audio_rate ? m->info.audio_rate : 48000;
++            sail_write_frame_info(pInfo, buf, m->session_id, ++m->sound_tag,
++                                  m->sound_frames * 90000 / rate);
++            m->sound_frames += n;
++            rc = (s32)(SAIL_SYNC_NEXT | SAIL_SYNC_ON_TIME);
++        }
++    }
++    sess_unlock();
++    return rc;
++}
++
++/* cellSailGraphicsAdapterGetFormat(pSelf, CellSailVideoFormat* pFormat): the
++ * format of the pictures GetFrame2 hands out. Hot Shots Golf asks on every
++ * new sessionId (0x00877E98) and binds the picture as a texture with it. */
++s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 pFormat)
++{
++    if (!pSelf || !pFormat) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
++    const int sp = sail_player_of_gadapter(pSelf);
++    s32 rc = (s32)CELL_SAIL_ERROR_INVALID_STATE;
++    sess_lock();
++    SailSession* m = sp >= 0 ? s_sail_players[sp].sess : NULL;
++    if (m && m->started) { sail_write_video_format(m, pFormat); rc = CELL_OK; }
++    sess_unlock();
++    return rc;
++}
++
++/* cellSailSoundAdapterGetFormat(pSelf, CellSailAudioFormat* pFormat). Hot
++ * Shots Golf (0x00876478) maps the channels by chLayout. */
++s32 cellSailSoundAdapterGetFormat(u32 pSelf, u32 pFormat)
++{
++    if (!pSelf || !pFormat) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
++    const int sp = sail_player_of_sadapter(pSelf);
++    s32 rc = (s32)CELL_SAIL_ERROR_INVALID_STATE;
++    sess_lock();
++    SailSession* m = sp >= 0 ? s_sail_players[sp].sess : NULL;
++    if (m && m->started && m->ach > 0) { sail_write_audio_format(m, pFormat); rc = CELL_OK; }
++    sess_unlock();
++    return rc;
++}
++
++/* cellSail{Graphics,Sound}AdapterPtsToTimePosition(pSelf, u64 pts, u64* pTime).
++ * The pts handed out here count from the first picture in 90 kHz ticks; the
++ * time position is the same instant in microseconds. Neither RPCS3 nor the
++ * SDK headers available here document the unit, so microseconds is this
++ * file's reading of libsail's other time arguments, not a confirmed fact.
++ * Hot Shots Golf keeps the value beside the movie (0x00877EC4, 0x008765D0). */
++static s32 sail_pts_to_time(u32 pSelf, u64 pts, u32 pTime)
++{
++    if (!pSelf || !pTime) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
++    vm_write64(pTime, pts * 100u / 9u);
++    return CELL_OK;
++}
++
++s32 cellSailGraphicsAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTime)
++{
++    return sail_pts_to_time(pSelf, pts, pTime);
++}
++
++s32 cellSailSoundAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTime)
++{
++    return sail_pts_to_time(pSelf, pts, pTime);
+ }
+ 
+ /* UpdateAvSync tells the player when the title presented a frame / played a
+diff --git a/libs/codec/cellSail.h b/libs/codec/cellSail.h
+--- a/libs/codec/cellSail.h
++++ b/libs/codec/cellSail.h
+@@ -203,6 +203,10 @@ s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat);
+ s32 cellSailGraphicsAdapterGetFrame2(u32 pSelf, u32 pInfo, u32 pPrevInfo,
+                                      u32 pFlipTime, u64 flags);
+ s32 cellSailGraphicsAdapterUpdateAvSync(u32 pSelf, u64 arg1, u64 arg2);
++s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 pFormat);
++s32 cellSailSoundAdapterGetFormat(u32 pSelf, u32 pFormat);
++s32 cellSailGraphicsAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTime);
++s32 cellSailSoundAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTime);
+ s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
+                                      CellSailMemAllocatorFuncs* pFuncs, void* pArg);
+ 
+diff --git a/third_party/at3_standalone/at3_bridge.cpp b/third_party/at3_standalone/at3_bridge.cpp
+--- a/third_party/at3_standalone/at3_bridge.cpp
++++ b/third_party/at3_standalone/at3_bridge.cpp
+@@ -11,3 +11,8 @@ extern "C" int   at3p_decode(void* dec, float* left, float* right, int* samples,
+     float* out[2] = { left, right };
+     return atrac3p_decode_frame((ATRAC3PContext*)dec, out, samples, frame, frame_bytes);
+ }
++extern "C" int   at3p_decode_multi(void* dec, float** out, int* samples,
++                                   const uint8_t* frame, int frame_bytes)
++{
++    return atrac3p_decode_frame((ATRAC3PContext*)dec, out, samples, frame, frame_bytes);
++}
+diff --git a/third_party/at3_standalone/at3_bridge.h b/third_party/at3_standalone/at3_bridge.h
+--- a/third_party/at3_standalone/at3_bridge.h
++++ b/third_party/at3_standalone/at3_bridge.h
+@@ -12,6 +12,10 @@ void  at3p_flush(void* dec);
+  * consumed or < 0 on error; *samples gets the per-channel count. */
+ int   at3p_decode(void* dec, float* left, float* right, int* samples,
+                   const uint8_t* frame, int frame_bytes);
++/* The same for any channel count at3p_open accepts (1-4, 6-8): out[] holds
++ * one plane per channel, in the frame's channel-unit order. */
++int   at3p_decode_multi(void* dec, float** out, int* samples,
++                        const uint8_t* frame, int frame_bytes);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/third_party/at3_stub/at3_stub.c b/third_party/at3_stub/at3_stub.c
+--- a/third_party/at3_stub/at3_stub.c
++++ b/third_party/at3_stub/at3_stub.c
+@@ -12,3 +12,8 @@ int   at3p_decode(void* dec, float* left, float* right, int* samples, const uint
+     (void)dec; (void)left; (void)right; (void)samples; (void)frame; (void)frame_bytes;
+     return -1;
+ }
++int   at3p_decode_multi(void* dec, float** out, int* samples, const uint8_t* frame, int frame_bytes)
++{
++    (void)dec; (void)out; (void)samples; (void)frame; (void)frame_bytes;
++    return -1;
++}
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -249,6 +249,14 @@ static void host_path(char* out, size_t cap, const char* guest)
+     ps3_vfs_ps3game_fallback(out, cap);
+ }
+ 
++/* The host file a guest path opens, the same way sys_fs open() resolves it
++ * (HDD0 overlay and the HDD title's base-install fallback included). For
++ * modules that read guest files themselves, such as cellSail's movies. */
++extern "C" void ppu_fs_host_path(char* out, size_t cap, const char* guest)
++{
++    host_path(out, cap, guest);
++}
++
+ /* ---- fd / dir handle tables ---- */
+ #define FS_MAX 256
+ static FILE* g_files[FS_MAX];
+diff --git a/libs/codec/sail_movie.c b/libs/codec/sail_movie.c
+new file mode 100644
+--- /dev/null
++++ b/libs/codec/sail_movie.c
+@@ -0,0 +1,705 @@
++/*
++ * ps3recomp - host-side movie decoder behind cellSail (see sail_movie.h)
++ */
++
++#include "sail_movie.h"
++#include "../../third_party/at3_standalone/at3_bridge.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define SM_PACK          2048u          /* PAMF packs are one sector each */
++#define SM_VQ            4              /* converted frames kept ahead */
++#define SM_AT3_SAMPLES   2048           /* PCM per ATRAC3plus frame */
++#define SM_ARING_SECONDS 3
++
++static void sm_why(char* why, size_t n, const char* msg)
++{
++    if (why && n) snprintf(why, n, "%s", msg);
++}
++
++#ifndef _WIN32
++
++SailMovie* sail_movie_open(const char* host_path, SailMovieInfo* info, char* why, size_t why_n)
++{
++    (void)host_path; (void)info;
++    sm_why(why, why_n, "no H.264 decoder on this host (Windows Media Foundation only)");
++    return NULL;
++}
++int  sail_movie_start(SailMovie* m, int layout, uint8_t alpha, int ch) { (void)m; (void)layout; (void)alpha; (void)ch; return -1; }
++int  sail_movie_take_frame(SailMovie* m, int64_t t, uint8_t* d, int p, int64_t* pts) { (void)m; (void)t; (void)d; (void)p; (void)pts; return -1; }
++int  sail_movie_read_audio(SailMovie* m, float* out, int frames) { (void)m; (void)out; (void)frames; return 0; }
++int  sail_movie_failed(SailMovie* m) { (void)m; return 1; }
++void sail_movie_close(SailMovie* m) { (void)m; }
++
++#else /* _WIN32 */
++
++#define COBJMACROS
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <objbase.h>
++#include <mfapi.h>
++#include <mfidl.h>
++#include <mftransform.h>
++#include <mferror.h>
++
++/* Local copies of the GUIDs, so nothing pulls in mfuuid / wmcodecdspuuid and
++ * the link line stays as it is. Values from the Windows SDK headers. */
++static const GUID SM_MF_MT_MAJOR_TYPE  = {0x48eba18e, 0xf8c9, 0x4687, {0xbf, 0x11, 0x0a, 0x74, 0xc9, 0xf9, 0x6a, 0x8f}};
++static const GUID SM_MF_MT_SUBTYPE     = {0xf7e34c9a, 0x42e8, 0x4714, {0xb7, 0x4b, 0xcb, 0x29, 0xd7, 0x2c, 0x35, 0xe5}};
++static const GUID SM_MF_MT_FRAME_SIZE  = {0x1652c33d, 0xd6b2, 0x4012, {0xb8, 0x34, 0x72, 0x03, 0x08, 0x49, 0xa3, 0x7d}};
++static const GUID SM_MF_MT_FRAME_RATE  = {0xc459a2e8, 0x3d2c, 0x4e44, {0xb1, 0x32, 0xfe, 0xe5, 0x15, 0x6c, 0x7b, 0xb0}};
++static const GUID SM_MF_MT_DEFAULT_STRIDE = {0x644b4e48, 0x1e02, 0x4516, {0xb0, 0xeb, 0xc0, 0x1c, 0xa9, 0xd4, 0x9a, 0xc6}};
++static const GUID SM_MFMediaType_Video = {0x73646976, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID SM_MFVideoFormat_H264 = {0x34363248, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID SM_MFVideoFormat_NV12 = {0x3231564E, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID SM_CLSID_MSH264Dec   = {0x62ce7e72, 0x4c71, 0x4d20, {0xb1, 0x5d, 0x45, 0x28, 0x31, 0xa8, 0x7d, 0x9d}};
++static const GUID SM_IID_IMFTransform  = {0xbf94c121, 0x5b05, 0x4e6f, {0x80, 0x00, 0xba, 0x59, 0x89, 0x61, 0x41, 0x4d}};
++static const GUID SM_IID_IMF2DBuffer   = {0x7dc9d5f9, 0x9ed9, 0x44ec, {0x9b, 0xbf, 0x06, 0x00, 0xbb, 0x58, 0x9f, 0xbb}};
++
++/* mfplat.dll, opened once. */
++typedef HRESULT (WINAPI *pfnMFStartup)(ULONG, DWORD);
++typedef HRESULT (WINAPI *pfnMFCreateMediaType)(IMFMediaType**);
++typedef HRESULT (WINAPI *pfnMFCreateSample)(IMFSample**);
++typedef HRESULT (WINAPI *pfnMFCreateMemoryBuffer)(DWORD, IMFMediaBuffer**);
++static struct {
++    int state;    /* 0 not tried, 1 ok, -1 unavailable */
++    pfnMFStartup Startup;
++    pfnMFCreateMediaType CreateMediaType;
++    pfnMFCreateSample CreateSample;
++    pfnMFCreateMemoryBuffer CreateMemoryBuffer;
++} s_mf;
++static INIT_ONCE s_mf_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK sm_mf_load(PINIT_ONCE o, PVOID p, PVOID* c)
++{
++    (void)o; (void)p; (void)c;
++    HMODULE h = LoadLibraryExW(L"mfplat.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++    if (h) {
++        s_mf.Startup = (pfnMFStartup)(void*)GetProcAddress(h, "MFStartup");
++        s_mf.CreateMediaType = (pfnMFCreateMediaType)(void*)GetProcAddress(h, "MFCreateMediaType");
++        s_mf.CreateSample = (pfnMFCreateSample)(void*)GetProcAddress(h, "MFCreateSample");
++        s_mf.CreateMemoryBuffer = (pfnMFCreateMemoryBuffer)(void*)GetProcAddress(h, "MFCreateMemoryBuffer");
++    }
++    s_mf.state = (h && s_mf.Startup && s_mf.CreateMediaType && s_mf.CreateSample &&
++                  s_mf.CreateMemoryBuffer && SUCCEEDED(s_mf.Startup(MF_VERSION, MFSTARTUP_LITE)))
++                 ? 1 : -1;
++    return TRUE;
++}
++
++static int sm_mf_ready(void)
++{
++    InitOnceExecuteOnce(&s_mf_once, sm_mf_load, NULL, NULL);
++    return s_mf.state > 0;
++}
++
++typedef struct {
++    uint8_t* px;
++    int64_t pts;
++} SmFrame;
++
++struct SailMovie {
++    char path[1024];
++    FILE* f;
++    uint64_t data_off, data_end;
++    SailMovieInfo info;
++
++    int layout;
++    uint8_t alpha;
++    int out_ch;
++
++    HANDLE thread;
++    SRWLOCK lock;
++    CONDITION_VARIABLE cv;     /* signalled when a frame slot frees, or on stop */
++    volatile LONG stop;
++    int failed;
++    int done;                  /* decoder finished, everything it made is queued */
++
++    /* video frame queue (ring) */
++    SmFrame vq[SM_VQ];
++    int vq_head, vq_n;
++    int64_t last_taken;        /* pts of the last frame handed out, -1 = none */
++    int64_t frames_out;        /* frames decoded so far, in display order */
++    int64_t frame_dur;         /* 90 kHz ticks per frame */
++
++    /* audio ring of out_ch-interleaved floats */
++    float* ar;
++    int ar_cap, ar_head, ar_n; /* in frames */
++
++    /* decoder state (decode thread only) */
++    IMFTransform* mft;
++    int provides_samples;
++    DWORD out_cb;
++    UINT32 nv_w, nv_h;         /* decoder output buffer size (may be 1088 high) */
++    LONG nv_stride;
++    void* at3;
++    int at3_ch, at3_fs;
++    uint8_t* ves; size_t ves_n, ves_cap;   /* video elementary stream */
++    size_t ves_scan;                       /* where the AUD search resumes */
++    uint8_t* aes; size_t aes_n, aes_cap;   /* audio AU stream */
++    int64_t in_count;
++};
++
++static uint32_t rd32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
++
++static int sm_fail(SailMovie* m, const char* what, HRESULT hr)
++{
++    fprintf(stderr, "[sail_movie] %s failed (0x%08lX): %s\n", what, (unsigned long)hr, m->path);
++    m->failed = 1;
++    return -1;
++}
++
++/* ---------------------------------------------------------------- probing */
++
++SailMovie* sail_movie_open(const char* host_path, SailMovieInfo* info, char* why, size_t why_n)
++{
++    FILE* f = fopen(host_path, "rb");
++    if (!f) { sm_why(why, why_n, "cannot open the file"); return NULL; }
++    uint8_t h[SM_PACK];
++    if (fread(h, 1, sizeof h, f) != sizeof h || memcmp(h, "PAMF", 4) != 0) {
++        fclose(f); sm_why(why, why_n, "not a PAMF file"); return NULL;
++    }
++    SailMovieInfo in;
++    memset(&in, 0, sizeof in);
++    in.fps_num = 30000; in.fps_den = 1001;
++    int have_video = 0;
++    /* Stream entries are 48 bytes: coding type, 3 reserved, stream id,
++     * private id, ... then 32 bytes of codec info (RPCS3 cellPamf.h,
++     * PamfStreamHeader). Scan for them rather than walk the sequence info. */
++    for (int o = 0x50; o + 48 <= (int)sizeof h; o += 4) {
++        const uint8_t* e = h + o;
++        if (e[0] == 0x1B && e[4] == 0xE0 && !have_video) {          /* AVC */
++            const uint8_t* a = e + 16;
++            static const int fr[][2] = {{0, 0}, {24000, 1001}, {24, 1}, {25, 1}, {30000, 1001},
++                                        {30, 1}, {50, 1}, {60000, 1001}, {60, 1}};
++            const int fri = a[2] & 0x0F;
++            if (fri >= 1 && fri <= 8) { in.fps_num = fr[fri][0]; in.fps_den = fr[fri][1]; }
++            const int crop_b = (a[18] << 8) | a[19], crop_r = (a[14] << 8) | a[15];
++            in.width = a[9] * 16 - crop_r * 2;
++            in.height = a[11] * 16 - crop_b * 2;
++            have_video = 1;
++        } else if (e[0] == 0xDC && e[4] == 0xBD && !in.audio_channels) {   /* ATRAC3plus */
++            const uint8_t* a = e + 16;
++            in.audio_channels = a[2];
++            in.audio_rate = 48000;
++        }
++    }
++    if (!have_video || in.width <= 0 || in.height <= 0 || in.width > 4096 || in.height > 4096) {
++        fclose(f); sm_why(why, why_n, "no H.264 stream in the PAMF header"); return NULL;
++    }
++    if (!sm_mf_ready()) {
++        fclose(f); sm_why(why, why_n, "Media Foundation (mfplat.dll) is not available"); return NULL;
++    }
++
++    SailMovie* m = (SailMovie*)calloc(1, sizeof *m);
++    if (!m) { fclose(f); sm_why(why, why_n, "out of memory"); return NULL; }
++    snprintf(m->path, sizeof m->path, "%s", host_path);
++    m->f = f;
++    m->data_off = (uint64_t)rd32(h + 8) * SM_PACK;
++    m->data_end = m->data_off + (uint64_t)rd32(h + 12) * SM_PACK;
++    m->info = in;
++    m->frame_dur = (int64_t)90000 * in.fps_den / in.fps_num;
++    m->last_taken = -1;
++    InitializeSRWLock(&m->lock);
++    InitializeConditionVariable(&m->cv);
++    if (info) *info = in;
++    return m;
++}
++
++/* ----------------------------------------------------------- H.264 decode */
++
++static int sm_set_output_type(SailMovie* m)
++{
++    for (DWORD i = 0;; i++) {
++        IMFMediaType* t = NULL;
++        HRESULT hr = IMFTransform_GetOutputAvailableType(m->mft, 0, i, &t);
++        if (FAILED(hr)) return sm_fail(m, "H.264 decoder: no NV12 output", hr);
++        GUID sub;
++        if (SUCCEEDED(IMFMediaType_GetGUID(t, &SM_MF_MT_SUBTYPE, &sub)) &&
++            IsEqualGUID(&sub, &SM_MFVideoFormat_NV12)) {
++            hr = IMFTransform_SetOutputType(m->mft, 0, t, 0);
++            UINT64 fs = 0;
++            IMFMediaType_GetUINT64(t, &SM_MF_MT_FRAME_SIZE, &fs);
++            m->nv_w = (UINT32)(fs >> 32); m->nv_h = (UINT32)fs;
++            UINT32 st = 0;
++            m->nv_stride = SUCCEEDED(IMFMediaType_GetUINT32(t, &SM_MF_MT_DEFAULT_STRIDE, &st))
++                           ? (LONG)st : (LONG)m->nv_w;
++            IMFMediaType_Release(t);
++            if (FAILED(hr)) return sm_fail(m, "H.264 decoder SetOutputType", hr);
++            MFT_OUTPUT_STREAM_INFO si;
++            memset(&si, 0, sizeof si);
++            IMFTransform_GetOutputStreamInfo(m->mft, 0, &si);
++            m->provides_samples = (si.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
++                                                 MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
++            m->out_cb = si.cbSize;
++            return 0;
++        }
++        IMFMediaType_Release(t);
++    }
++}
++
++static int sm_mft_open(SailMovie* m)
++{
++    HRESULT hr = CoCreateInstance(&SM_CLSID_MSH264Dec, NULL, CLSCTX_INPROC_SERVER,
++                                  &SM_IID_IMFTransform, (void**)&m->mft);
++    if (FAILED(hr)) return sm_fail(m, "creating the Windows H.264 decoder", hr);
++    IMFMediaType* t = NULL;
++    hr = s_mf.CreateMediaType(&t);
++    if (FAILED(hr)) return sm_fail(m, "MFCreateMediaType", hr);
++    IMFMediaType_SetGUID(t, &SM_MF_MT_MAJOR_TYPE, &SM_MFMediaType_Video);
++    IMFMediaType_SetGUID(t, &SM_MF_MT_SUBTYPE, &SM_MFVideoFormat_H264);
++    IMFMediaType_SetUINT64(t, &SM_MF_MT_FRAME_SIZE, ((UINT64)m->info.width << 32) | (UINT32)m->info.height);
++    IMFMediaType_SetUINT64(t, &SM_MF_MT_FRAME_RATE, ((UINT64)m->info.fps_num << 32) | (UINT32)m->info.fps_den);
++    hr = IMFTransform_SetInputType(m->mft, 0, t, 0);
++    IMFMediaType_Release(t);
++    if (FAILED(hr)) return sm_fail(m, "H.264 decoder SetInputType", hr);
++    if (sm_set_output_type(m) < 0) return -1;
++    IMFTransform_ProcessMessage(m->mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
++    IMFTransform_ProcessMessage(m->mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
++    return 0;
++}
++
++static inline uint8_t sm_clamp(int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
++
++/* NV12 (BT.709, limited range, as the PAMF headers here declare) to 4-byte
++ * pixels. Chroma is shared by 2x2 pixels. */
++static void sm_nv12_to_rgb(const SailMovie* m, const uint8_t* y, const uint8_t* uv, int pitch,
++                           uint8_t* dst)
++{
++    const int w = m->info.width, h = m->info.height;
++    const int ri = m->layout == SAIL_MOVIE_RGBA ? 0 : 1;
++    const int ai = m->layout == SAIL_MOVIE_RGBA ? 3 : 0;
++    for (int r = 0; r < h; r++) {
++        const uint8_t* yr = y + (size_t)r * pitch;
++        const uint8_t* cr = uv + (size_t)(r >> 1) * pitch;
++        uint8_t* o = dst + (size_t)r * w * 4;
++        for (int c = 0; c < w; c++) {
++            const int Y = 298 * (yr[c] - 16) + 128;
++            const int U = cr[c & ~1] - 128, V = cr[(c & ~1) + 1] - 128;
++            o[ai] = m->alpha;
++            o[ri]     = sm_clamp((Y + 459 * V) >> 8);
++            o[ri + 1] = sm_clamp((Y - 55 * U - 136 * V) >> 8);
++            o[ri + 2] = sm_clamp((Y + 541 * U) >> 8);
++            o += 4;
++        }
++    }
++}
++
++/* NV12 to planar Y, U, V with tightly packed rows (pitch = width). */
++static void sm_nv12_to_i420(const SailMovie* m, const uint8_t* y, const uint8_t* uv, int pitch,
++                            uint8_t* dst)
++{
++    const int w = m->info.width, h = m->info.height, cw = w / 2, ch = h / 2;
++    for (int r = 0; r < h; r++) memcpy(dst + (size_t)r * w, y + (size_t)r * pitch, (size_t)w);
++    uint8_t* u = dst + (size_t)w * h;
++    uint8_t* v = u + (size_t)cw * ch;
++    for (int r = 0; r < ch; r++) {
++        const uint8_t* s = uv + (size_t)r * pitch;
++        uint8_t* uo = u + (size_t)r * cw;
++        uint8_t* vo = v + (size_t)r * cw;
++        for (int c = 0; c < cw; c++) { uo[c] = s[2 * c]; vo[c] = s[2 * c + 1]; }
++    }
++}
++
++/* Waits for a free slot and converts one decoded picture into it. */
++static int sm_emit_frame(SailMovie* m, IMFSample* s)
++{
++    IMFMediaBuffer* b = NULL;
++    if (FAILED(IMFSample_ConvertToContiguousBuffer(s, &b))) return sm_fail(m, "decoded sample", E_FAIL);
++    IMF2DBuffer* b2 = NULL;
++    BYTE* base = NULL; LONG pitch = 0; DWORD len = 0;
++    if (SUCCEEDED(IMFMediaBuffer_QueryInterface(b, &SM_IID_IMF2DBuffer, (void**)&b2)) &&
++        SUCCEEDED(IMF2DBuffer_Lock2D(b2, &base, &pitch))) {
++    } else {
++        if (b2) { IMF2DBuffer_Release(b2); b2 = NULL; }
++        if (FAILED(IMFMediaBuffer_Lock(b, &base, NULL, &len))) {
++            IMFMediaBuffer_Release(b);
++            return sm_fail(m, "locking a decoded picture", E_FAIL);
++        }
++        pitch = m->nv_stride;
++    }
++    const UINT32 plane_h = m->nv_h ? m->nv_h : (UINT32)m->info.height;
++
++    AcquireSRWLockExclusive(&m->lock);
++    while (m->vq_n == SM_VQ && !m->stop)
++        SleepConditionVariableSRW(&m->cv, &m->lock, INFINITE, 0);
++    const int slot = (m->vq_head + m->vq_n) % SM_VQ;
++    ReleaseSRWLockExclusive(&m->lock);
++
++    int rc = 0;
++    if (!m->stop && pitch > 0) {
++        if (m->layout == SAIL_MOVIE_YUV420)
++            sm_nv12_to_i420(m, base, base + (size_t)pitch * plane_h, (int)pitch, m->vq[slot].px);
++        else
++            sm_nv12_to_rgb(m, base, base + (size_t)pitch * plane_h, (int)pitch, m->vq[slot].px);
++        AcquireSRWLockExclusive(&m->lock);
++        m->vq[slot].pts = m->frames_out * m->frame_dur;
++        m->frames_out++;
++        m->vq_n++;
++        ReleaseSRWLockExclusive(&m->lock);
++    } else if (pitch <= 0) {
++        rc = sm_fail(m, "decoded picture has no pitch", E_FAIL);
++    }
++    if (b2) { IMF2DBuffer_Unlock2D(b2); IMF2DBuffer_Release(b2); }
++    else IMFMediaBuffer_Unlock(b);
++    IMFMediaBuffer_Release(b);
++    return rc;
++}
++
++/* Pulls every picture the decoder has ready. */
++static int sm_drain_output(SailMovie* m)
++{
++    for (;;) {
++        if (m->stop) return 0;
++        MFT_OUTPUT_DATA_BUFFER odb;
++        memset(&odb, 0, sizeof odb);
++        IMFSample* own = NULL;
++        if (!m->provides_samples) {
++            IMFMediaBuffer* b = NULL;
++            if (FAILED(s_mf.CreateSample(&own)) ||
++                FAILED(s_mf.CreateMemoryBuffer(m->out_cb ? m->out_cb : m->nv_w * m->nv_h * 3 / 2, &b)))
++                return sm_fail(m, "allocating an output sample", E_OUTOFMEMORY);
++            IMFSample_AddBuffer(own, b);
++            IMFMediaBuffer_Release(b);
++            odb.pSample = own;
++        }
++        DWORD status = 0;
++        HRESULT hr = IMFTransform_ProcessOutput(m->mft, 0, 1, &odb, &status);
++        if (odb.pEvents) IMFCollection_Release(odb.pEvents);
++        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
++            if (own) IMFSample_Release(own);
++            return 0;
++        }
++        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
++            if (own) IMFSample_Release(own);
++            if (sm_set_output_type(m) < 0) return -1;
++            fprintf(stderr, "[sail_movie] decoder output %ux%u NV12, stride %ld\n",
++                    m->nv_w, m->nv_h, (long)m->nv_stride);
++            continue;
++        }
++        if (FAILED(hr)) {
++            if (own) IMFSample_Release(own);
++            return sm_fail(m, "H.264 decoder ProcessOutput", hr);
++        }
++        int rc = odb.pSample ? sm_emit_frame(m, odb.pSample) : 0;
++        if (odb.pSample && odb.pSample != own) IMFSample_Release(odb.pSample);
++        if (own) IMFSample_Release(own);
++        if (rc < 0) return rc;
++    }
++}
++
++static int sm_feed_au(SailMovie* m, const uint8_t* p, size_t n)
++{
++    IMFSample* s = NULL; IMFMediaBuffer* b = NULL; BYTE* d = NULL;
++    if (FAILED(s_mf.CreateSample(&s)) || FAILED(s_mf.CreateMemoryBuffer((DWORD)n, &b)) ||
++        FAILED(IMFMediaBuffer_Lock(b, &d, NULL, NULL))) {
++        if (b) IMFMediaBuffer_Release(b);
++        if (s) IMFSample_Release(s);
++        return sm_fail(m, "allocating an input sample", E_OUTOFMEMORY);
++    }
++    memcpy(d, p, n);
++    IMFMediaBuffer_Unlock(b);
++    IMFMediaBuffer_SetCurrentLength(b, (DWORD)n);
++    IMFSample_AddBuffer(s, b);
++    IMFMediaBuffer_Release(b);
++    /* Decode order; the presentation time is counted at the output. */
++    IMFSample_SetSampleTime(s, m->in_count * 333667);
++    m->in_count++;
++    int rc = 0;
++    for (;;) {
++        HRESULT hr = IMFTransform_ProcessInput(m->mft, 0, s, 0);
++        if (hr == MF_E_NOTACCEPTING) {
++            if (sm_drain_output(m) < 0 || m->stop) { rc = -1; break; }
++            continue;
++        }
++        if (FAILED(hr)) rc = sm_fail(m, "H.264 decoder ProcessInput", hr);
++        break;
++    }
++    IMFSample_Release(s);
++    if (rc == 0) rc = sm_drain_output(m);
++    return rc;
++}
++
++/* Hands every complete access unit to the decoder. AUs start at an access
++ * unit delimiter (NAL type 9), which every picture in these streams has. */
++static int sm_video_push(SailMovie* m, int flush)
++{
++    size_t start = 0, scan = m->ves_scan < 4 ? 4 : m->ves_scan;
++    const uint8_t* v = m->ves;
++    for (;;) {
++        size_t q = scan, hit = 0; int found = 0;
++        for (; q + 4 <= m->ves_n; q++) {
++            if (v[q] == 0 && v[q + 1] == 0 && v[q + 2] == 1 && (v[q + 3] & 0x1F) == 9) {
++                hit = (q > start && v[q - 1] == 0) ? q - 1 : q;
++                found = 1; break;
++            }
++        }
++        if (!found) { scan = q; break; }
++        if (hit > start && sm_feed_au(m, v + start, hit - start) < 0) return -1;
++        start = hit; scan = q + 4;
++    }
++    if (flush && m->ves_n > start) {
++        if (sm_feed_au(m, v + start, m->ves_n - start) < 0) return -1;
++        start = m->ves_n;
++    }
++    memmove(m->ves, m->ves + start, m->ves_n - start);
++    m->ves_n -= start;
++    m->ves_scan = scan > start ? scan - start : 0;
++    return 0;
++}
++
++/* ----------------------------------------------------------- ATRAC3plus */
++
++static void sm_audio_put(SailMovie* m, float* const* pl, int n)
++{
++    const int oc = m->out_ch;
++    AcquireSRWLockExclusive(&m->lock);
++    for (int i = 0; i < n; i++) {
++        if (m->ar_n == m->ar_cap) {   /* nobody is reading: drop the oldest */
++            m->ar_head = (m->ar_head + 1) % m->ar_cap;
++            m->ar_n--;
++        }
++        float* o = m->ar + (size_t)((m->ar_head + m->ar_n) % m->ar_cap) * oc;
++        /* Decoder planes come in channel-unit order; for 5.1 that is
++         * L R | C | Ls Rs | LFE. */
++        const float L = pl[0][i], R = m->at3_ch > 1 ? pl[1][i] : L;
++        if (oc == 6 && m->at3_ch == 6) {
++            o[0] = L; o[1] = pl[2][i]; o[2] = R; o[3] = pl[3][i]; o[4] = pl[4][i]; o[5] = pl[5][i];
++        } else if (oc == 2) {
++            if (m->at3_ch >= 6) {
++                const float c = pl[2][i] * 0.7071f;
++                o[0] = (L + c + pl[3][i] * 0.7071f) * 0.5f;
++                o[1] = (R + c + pl[4][i] * 0.7071f) * 0.5f;
++            } else { o[0] = L; o[1] = R; }
++        } else {
++            for (int c = 0; c < oc; c++) o[c] = c < m->at3_ch ? pl[c][i] : 0.0f;
++        }
++        m->ar_n++;
++    }
++    ReleaseSRWLockExclusive(&m->lock);
++}
++
++static void sm_audio_push(SailMovie* m)
++{
++    static const int chmap[8] = {0, 1, 2, 3, 4, 6, 7, 8};
++    size_t q = 0;
++    float planes[8][SM_AT3_SAMPLES];
++    float* pl[8];
++    for (int c = 0; c < 8; c++) pl[c] = planes[c];
++    while (q + 8 <= m->aes_n) {
++        const uint8_t* h = m->aes + q;
++        if (h[0] != 0x0F || h[1] != 0xD0) {   /* resync on the next AU header */
++            q++;
++            continue;
++        }
++        const int fs = ((((h[2] & 3) << 8) | h[3]) * 8) + 8;
++        const int ch = chmap[(h[2] >> 2) & 7];
++        if (q + 8 + (size_t)fs > m->aes_n) break;
++        if (!m->at3 && ch > 0 && m->out_ch > 0) {
++            int ba = fs;
++            m->at3 = at3p_open(ch, &ba);
++            m->at3_ch = ch; m->at3_fs = fs;
++            if (!m->at3) {
++                fprintf(stderr, "[sail_movie] ATRAC3plus %d ch decoder unavailable; movie plays silent\n", ch);
++                m->out_ch = 0;
++            } else {
++                fprintf(stderr, "[sail_movie] ATRAC3plus %d ch, %d-byte frames\n", ch, fs);
++            }
++        }
++        if (m->at3 && fs == m->at3_fs) {
++            int n = 0;
++            if (at3p_decode_multi(m->at3, pl, &n, h + 8, fs) < 0 || n != SM_AT3_SAMPLES) {
++                for (int c = 0; c < 8; c++) memset(planes[c], 0, sizeof planes[c]);
++                n = SM_AT3_SAMPLES;   /* a bad frame plays as silence */
++            }
++            sm_audio_put(m, pl, n);
++        }
++        q += 8 + (size_t)fs;
++    }
++    memmove(m->aes, m->aes + q, m->aes_n - q);
++    m->aes_n -= q;
++}
++
++/* ------------------------------------------------------------- demuxing */
++
++static int sm_append(uint8_t** buf, size_t* n, size_t* cap, const uint8_t* p, size_t k)
++{
++    if (*n + k > *cap) {
++        size_t c = *cap ? *cap : (1u << 20);
++        while (c < *n + k) c *= 2;
++        uint8_t* nb = (uint8_t*)realloc(*buf, c);
++        if (!nb) return -1;
++        *buf = nb; *cap = c;
++    }
++    memcpy(*buf + *n, p, k);
++    *n += k;
++    return 0;
++}
++
++static int sm_pack(SailMovie* m, const uint8_t* s)
++{
++    size_t p = 0;
++    while (p + 6 <= SM_PACK) {
++        const uint32_t sc = rd32(s + p);
++        if (sc == 0x000001BA) { p += 14 + (s[p + 13] & 7); continue; }
++        if ((sc >> 8) != 1) break;                         /* rest of the pack is stuffing */
++        const uint8_t sid = (uint8_t)sc;
++        const size_t len = ((size_t)s[p + 4] << 8) | s[p + 5];
++        if (p + 6 + len > SM_PACK) break;
++        const uint8_t* body = s + p + 6;
++        if ((sid == 0xE0 || sid == 0xBD) && len >= 3) {
++            const size_t hl = 3 + (size_t)body[2];
++            if (hl <= len) {
++                const uint8_t* pay = body + hl;
++                size_t pn = len - hl;
++                if (sid == 0xE0) {
++                    if (sm_append(&m->ves, &m->ves_n, &m->ves_cap, pay, pn) < 0) return sm_fail(m, "video buffer", E_OUTOFMEMORY);
++                    if (sm_video_push(m, 0) < 0) return -1;
++                } else if (pn >= 4 && pay[0] < 0x10 && m->out_ch > 0) {
++                    /* ATRAC3plus on private stream 1: a 4-byte header (sub
++                     * stream id, 0, offset of the first AU), then AU bytes. */
++                    if (sm_append(&m->aes, &m->aes_n, &m->aes_cap, pay + 4, pn - 4) < 0) return sm_fail(m, "audio buffer", E_OUTOFMEMORY);
++                    sm_audio_push(m);
++                }
++            }
++        }
++        p += 6 + len;
++    }
++    return 0;
++}
++
++static DWORD WINAPI sm_thread(LPVOID arg)
++{
++    SailMovie* m = (SailMovie*)arg;
++    const HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    uint8_t* pack = (uint8_t*)malloc(SM_PACK);
++    int rc = pack ? sm_mft_open(m) : sm_fail(m, "pack buffer", E_OUTOFMEMORY);
++    if (rc == 0) {
++        _fseeki64(m->f, (long long)m->data_off, SEEK_SET);
++        for (uint64_t at = m->data_off; at + SM_PACK <= m->data_end && !m->stop; at += SM_PACK) {
++            if (fread(pack, 1, SM_PACK, m->f) != SM_PACK) break;
++            if (sm_pack(m, pack) < 0) { rc = -1; break; }
++        }
++    }
++    if (rc == 0 && !m->stop) {
++        if (sm_video_push(m, 1) == 0) {
++            IMFTransform_ProcessMessage(m->mft, MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
++            IMFTransform_ProcessMessage(m->mft, MFT_MESSAGE_COMMAND_DRAIN, 0);
++            sm_drain_output(m);
++        }
++    }
++    if (m->mft) { IMFTransform_Release(m->mft); m->mft = NULL; }
++    if (m->at3) { at3p_close(m->at3); m->at3 = NULL; }
++    free(pack);
++    if (SUCCEEDED(co)) CoUninitialize();
++    AcquireSRWLockExclusive(&m->lock);
++    m->done = 1;
++    ReleaseSRWLockExclusive(&m->lock);
++    fprintf(stderr, "[sail_movie] decoder %s: %lld frames, %s\n", m->failed ? "failed" : "finished",
++            (long long)m->frames_out, m->path);
++    return 0;
++}
++
++/* ------------------------------------------------------------ public API */
++
++int sail_movie_start(SailMovie* m, int layout, uint8_t alpha, int audio_channels)
++{
++    if (!m || m->thread) return -1;
++    m->layout = layout;
++    m->alpha = alpha;
++    m->out_ch = m->info.audio_channels ? audio_channels : 0;
++    const size_t px = (size_t)m->info.width * m->info.height;
++    const size_t fb = layout == SAIL_MOVIE_YUV420 ? px + px / 2 : px * 4;
++    for (int i = 0; i < SM_VQ; i++)
++        if (!(m->vq[i].px = (uint8_t*)malloc(fb))) return sm_fail(m, "frame queue", E_OUTOFMEMORY);
++    if (m->out_ch > 0) {
++        m->ar_cap = (m->info.audio_rate ? m->info.audio_rate : 48000) * SM_ARING_SECONDS;
++        if (!(m->ar = (float*)malloc((size_t)m->ar_cap * m->out_ch * sizeof(float))))
++            return sm_fail(m, "audio ring", E_OUTOFMEMORY);
++    }
++    m->thread = CreateThread(NULL, 0, sm_thread, m, 0, NULL);
++    if (!m->thread) return sm_fail(m, "starting the decode thread", HRESULT_FROM_WIN32(GetLastError()));
++    return 0;
++}
++
++int sail_movie_take_frame(SailMovie* m, int64_t t, uint8_t* dst, int dst_pitch, int64_t* pts)
++{
++    if (!m) return -1;
++    int rc = 0;
++    AcquireSRWLockExclusive(&m->lock);
++    /* Drop frames that are already late behind a newer due one. */
++    while (m->vq_n > 1 && m->vq[(m->vq_head + 1) % SM_VQ].pts <= t) {
++        m->vq_head = (m->vq_head + 1) % SM_VQ;
++        m->vq_n--;
++        WakeAllConditionVariable(&m->cv);
++    }
++    if (m->vq_n > 0 && m->vq[m->vq_head].pts <= t) {
++        const SmFrame* fr = &m->vq[m->vq_head];
++        const int w = m->info.width, h = m->info.height;
++        if (m->layout == SAIL_MOVIE_YUV420) {
++            for (int r = 0; r < h; r++)
++                memcpy(dst + (size_t)r * dst_pitch, fr->px + (size_t)r * w, (size_t)w);
++            const int cw = w / 2, ch = h / 2, cp = dst_pitch / 2;
++            const uint8_t* su = fr->px + (size_t)w * h;
++            const uint8_t* sv = su + (size_t)cw * ch;
++            uint8_t* du = dst + (size_t)h * dst_pitch;
++            uint8_t* dv = du + (size_t)h * dst_pitch / 4;
++            for (int r = 0; r < ch; r++) {
++                memcpy(du + (size_t)r * cp, su + (size_t)r * cw, (size_t)cw);
++                memcpy(dv + (size_t)r * cp, sv + (size_t)r * cw, (size_t)cw);
++            }
++        } else {
++            const int row = w * 4;
++            for (int r = 0; r < h; r++)
++                memcpy(dst + (size_t)r * dst_pitch, fr->px + (size_t)r * row, (size_t)row);
++        }
++        if (pts) *pts = fr->pts;
++        m->last_taken = fr->pts;
++        m->vq_head = (m->vq_head + 1) % SM_VQ;
++        m->vq_n--;
++        WakeAllConditionVariable(&m->cv);
++        rc = 1;
++    } else if (m->vq_n == 0 && m->done &&
++               (m->last_taken < 0 || t >= m->last_taken + m->frame_dur)) {
++        rc = -1;
++    }
++    ReleaseSRWLockExclusive(&m->lock);
++    return rc;
++}
++
++int sail_movie_read_audio(SailMovie* m, float* out, int frames)
++{
++    if (!m || m->out_ch <= 0 || !m->ar) return 0;
++    AcquireSRWLockExclusive(&m->lock);
++    int n = frames < m->ar_n ? frames : m->ar_n;
++    for (int i = 0; i < n; i++) {
++        memcpy(out + (size_t)i * m->out_ch, m->ar + (size_t)m->ar_head * m->out_ch,
++               (size_t)m->out_ch * sizeof(float));
++        m->ar_head = (m->ar_head + 1) % m->ar_cap;
++    }
++    m->ar_n -= n;
++    ReleaseSRWLockExclusive(&m->lock);
++    return n;
++}
++
++int sail_movie_failed(SailMovie* m) { return m ? m->failed : 1; }
++
++void sail_movie_close(SailMovie* m)
++{
++    if (!m) return;
++    if (m->thread) {
++        AcquireSRWLockExclusive(&m->lock);
++        InterlockedExchange(&m->stop, 1);
++        WakeAllConditionVariable(&m->cv);
++        ReleaseSRWLockExclusive(&m->lock);
++        WaitForSingleObject(m->thread, INFINITE);
++        CloseHandle(m->thread);
++    }
++    if (m->f) fclose(m->f);
++    for (int i = 0; i < SM_VQ; i++) free(m->vq[i].px);
++    free(m->ar); free(m->ves); free(m->aes);
++    free(m);
++}
++
++#endif /* _WIN32 */
+diff --git a/libs/codec/sail_movie.h b/libs/codec/sail_movie.h
+new file mode 100644
+--- /dev/null
++++ b/libs/codec/sail_movie.h
+@@ -0,0 +1,83 @@
++/*
++ * ps3recomp - host-side movie decoder behind cellSail
++ *
++ * Plays a PAMF movie (MPEG program stream: H.264 video on stream 0xE0,
++ * ATRAC3plus audio on private stream 1) for libs/codec/cellSail.c. Nothing in
++ * here touches guest memory or guest calls; cellSail owns that side.
++ *
++ *   video  Windows Media Foundation's H.264 decoder (msmpeg2vdec, part of
++ *          Windows), loaded at run time, so nothing extra is linked or shipped.
++ *   audio  the ATRAC3plus decoder cellAtrac already links
++ *          (third_party/at3_standalone, LGPL-2.1). A build with
++ *          PS3RECOMP_ATRAC_LGPL=OFF plays the picture without sound.
++ *
++ * Other hosts have no video decoder here yet: sail_movie_open says so and the
++ * caller keeps its old skip.
++ *
++ * A decode thread runs ahead of playback and fills a short queue of converted
++ * frames and a ring of PCM. The caller owns the clock: it asks for the frame
++ * due at a media time and pulls PCM as its audio output needs it.
++ */
++
++#ifndef PS3RECOMP_SAIL_MOVIE_H
++#define PS3RECOMP_SAIL_MOVIE_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct SailMovie SailMovie;
++
++typedef struct SailMovieInfo {
++    int width, height;          /* displayed picture size */
++    int fps_num, fps_den;       /* frame rate; 30000/1001 when the header has none */
++    int audio_channels;         /* 0 = no ATRAC3plus stream */
++    int audio_rate;             /* Hz */
++} SailMovieInfo;
++
++/* Pixel layouts sail_movie_start can produce. ARGB and RGBA are 4 bytes per
++ * pixel in memory order. YUV420 is planar 8-bit Y, then U, then V, each
++ * chroma plane half the width and height with half the Y pitch, U starting
++ * height * pitch bytes in and V a quarter of that after U. */
++enum { SAIL_MOVIE_ARGB = 0, SAIL_MOVIE_RGBA = 1, SAIL_MOVIE_YUV420 = 2 };
++
++/* Opens and probes a PAMF file. NULL on failure, with the reason in why. */
++SailMovie* sail_movie_open(const char* host_path, SailMovieInfo* info,
++                           char* why, size_t why_n);
++
++/* Starts decoding. layout is a SAIL_MOVIE_* value, alpha the byte written as
++ * every pixel's alpha, audio_channels the interleaved channel count the
++ * caller will read (6: L C R Ls Rs LFE, 2: stereo downmix, 0: no audio).
++ * Returns 0, or -1 with the reason logged. */
++int sail_movie_start(SailMovie* m, int layout, uint8_t alpha, int audio_channels);
++
++/* The frame due at media time t (in 90 kHz ticks from the first frame).
++ * Copies it to dst (rows of dst_pitch bytes) when it is newer than the last
++ * one taken, and returns
++ *    1  a new frame was copied; *pts gets its time (same units as t)
++ *    0  nothing new is due yet (the last frame stays on screen)
++ *   -1  the movie has ended: every frame was taken and the decoder is done
++ * Frames whose time has passed are dropped, so a slow caller skips frames
++ * rather than falling behind. */
++int sail_movie_take_frame(SailMovie* m, int64_t t, uint8_t* dst, int dst_pitch,
++                          int64_t* pts);
++
++/* Up to `frames` frames of interleaved float PCM, in the channel layout given
++ * to sail_movie_start. Returns the count read; fewer means the decoder has not
++ * caught up (or the audio has ended). */
++int sail_movie_read_audio(SailMovie* m, float* out, int frames);
++
++/* True once the decoder failed; the reason was logged. */
++int sail_movie_failed(SailMovie* m);
++
++/* Stops the decode thread and frees everything. NULL is allowed. */
++void sail_movie_close(SailMovie* m);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS3RECOMP_SAIL_MOVIE_H */
