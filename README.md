@@ -2,7 +2,7 @@
 
 A native Windows port of the PS3 game Hot Shots Golf: World Invitational (US, `NPUA80864`, known as Everybody's Golf 6 outside North America), made by statically recompiling the PS3 executable to x86-64 with [ps3recomp](https://github.com/sp00nznet/ps3recomp). No emulator runs underneath it.
 
-**It is playable.** The port targets the official update 1.03. It boots, shows the menus and plays full rounds with a keyboard or an Xbox-style controller. It runs at any resolution, including 1440p and 4K, with ultrawide support, HD texture packs and an opt-in 60, 90 or 120 FPS mode on the course. Intro and cutscene movies are skipped because there is no video decoder.
+**It is playable.** The port targets the official update 1.03. It boots, shows the menus and plays full rounds with a keyboard or an Xbox-style controller. It runs at any resolution, including 1440p and 4K, with ultrawide support, HD texture packs and an opt-in 60, 90 or 120 FPS mode on the course. Intro and replay movies play through the video decoder built into Windows.
 
 You must own the game. The game's code and data belong to Sony and Clap Hanz, and this project distributes no game files. See [Playing](#playing) for what you supply.
 
@@ -36,7 +36,7 @@ Updated 2026-11-22.
 | Launcher | `tools/hsg_launcher.py`: a Tkinter settings window. Settings are in `hsg_settings.json` and logs go to `logs/` |
 | Input | Xbox-style controllers (XInput) and the keyboard |
 | Audio | The mixer produces sound |
-| Intro and cutscene movies | Skipped. There is no video decoder |
+| Intro and replay movies | Play (Windows H.264 decoder). `HSG_MOVIES=0` skips them |
 | Known gaps | First-time shader compiles still pause on a cold cache. Some visuals have not been compared with a real PS3 |
 
 Details and evidence are in [docs/STATUS.md](docs/STATUS.md), [docs/MODERN-PC-ROADMAP.md](docs/MODERN-PC-ROADMAP.md) and [docs/orchestration/STATE.md](docs/orchestration/STATE.md).
@@ -80,7 +80,7 @@ The official executables are encrypted with a per-game license file. This projec
 
 **Needs.** Windows 10 or 11 on x86-64, a D3D12 GPU, and about 4 GB of free disk space for the game files, saves and caches. No minimum CPU, GPU or RAM has been tested; it was developed on a high-end Windows 11 PC. The first run on a new shader cache pauses while shaders compile.
 
-**Known gaps.** Intro and cutscene movies are skipped because there is no video decoder. First-time shader compiles can still pause on a cold cache. Some visuals have not been compared with a real PS3.
+**Known gaps.** First-time shader compiles can still pause on a cold cache. Some visuals have not been compared with a real PS3.
 
 ## Controls
 
