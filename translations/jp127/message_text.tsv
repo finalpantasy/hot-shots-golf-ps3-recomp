@@ -1,0 +1,342 @@
+# English for JP 1.27 (BCJS30089) message_text strings that have no US or Asia English.
+# Used by tools/jp127_english.py. Columns: table:group:index <TAB> jp-hash <TAB> English.
+# jp-hash is the first 16 hex digits of SHA-1 over the game's Japanese string (UTF-8 bytes), so
+# no game text is stored here. A row applies only while the hash still matches the game string
+# and the English keeps the same printf specifiers and button codes. Escapes: \n newline,
+# \xNN control byte (\x07A..\x07@ colour, \x0bX button icon), \ backslash.
+# Most rows are online-only features (Chip-in Golf lobby, Capsule Machine, tickets) whose
+# servers are gone; they are translated so no Japanese is left if those screens are reached.
+02c00325:6:4	5082a2da0b81b24c	Registering ranking...
+02c00325:6:5	b8ee7494237219be	Ranking registered.
+02c00325:6:6	30a37dd4eece08a8	Win Count Ranking: No. %d
+02c00325:6:7	28b1ca07cfd70599	Total Score Ranking: No. %d
+02c00325:6:8	d6e5e9646b0441da	See the ranking board in the lobby for details.\n(It may take a while for the data to appear.)
+02c00325:6:9	d2cd229d7f31b45c	Comment updated.\n \nIt may take a while to appear\non the ranking board,\nso please check back later.
+02c00325:6:10	2e0ca31837a36b43	Failed to update comment.
+02c00325:6:11	952166dbba920c5f	Failed to register score.\n[%s]\nIt will be registered again when you\nreturn to the lobby by %02d:%02d.
+02c00325:27:1	4ec238176fadc57a	Your Real Tournament booking came up\nwhile you were at the Capsule Machine.\nEntry in the tournament was cancelled.
+02c00325:27:2	98c31da3016a7dbe	Your Real Tournament booking came up\nduring Chip-in Golf. Entry in\nthe tournament was cancelled.
+02c00325:30:0	13c66880af33dba5	Not enough tickets.
+02c00325:30:1	5443fb107142d571	Buy tickets for the Capsule Machine\nfrom the PlayStation®Store?\n(Select "Yes" to go to the PlayStation®Store.)
+02c00325:30:2	91c9ef05fab0b3f9	Continue buying tickets\nfor the Capsule Machine?
+02c00325:30:3	4cffa605973e6dc1	The Capsule Machine failed.\nPlease wait a while and try again.
+02c00325:30:4	35c18b4e1db8ca06	You already have tickets,\nso you cannot buy more.\nUse up all your tickets\nbefore buying more.
+02c00325:30:5	73ca413d1720b6e3	You have every rare character,\nso you cannot buy tickets.
+02c00325:30:6	c83325a0b8e81262	You have every rare character,\nso you cannot use the Capsule Machine.
+02c00325:30:7	850a91370440c2c7	Your ticket count is not correct.\nPlease wait for it to sync with the server.
+02c00325:31:0	26c670e7f8d78a17	You have 0 balls left.\n \nTo play Chip-in Golf, enter an\nonline Real Tournament\nto earn balls.
+02c00325:32:0	9af32f2ac3daf672	Collaboration characters are\nnot sold as rare characters.
+02c00325:33:0	57e98629524508fd	Welcome to the Chip-in Golf Lobby!\n \nFirst, the \x07Arules\x07@.\nChip in this lobby's special balls\nto score points. Compete each day\nfor the best \x07A"Today's Total Score"\x07@.\nIt's that simple!
+02c00325:33:1	5cfd4235a6a76e19	Final places are set the next day,\nso check the \x07Aranking board\x07@\nto see how you did!\n \nBe sure to check the ranking board\nin the \x07Alobby where you set\nyour record\x07@!
+02c00325:33:2	c75f8d5543f3270b	 \nThe basic controls are...
+02c00325:33:3	ce876b5594db126b	...that.\n \nYou get \x07A10 shots\x07@ from each spot.\nIf you \x07Achip in\x07@ or land in a\n\x07Abunker or pond\x07@, you \x07Acan't shoot\nfrom that spot again\x07@, so\n\x07Amove to a new spot\x07@!
+02c00325:33:4	b9af0c176f263f9d	Each shot uses up one ball.\nAnd \x07Awhen you run out of balls,\nyou can't take any more shots!
+02c00325:33:5	b50f59c5595c412f	\x07ATo get more balls,\nenter a Real Tournament!\n \nYou'll earn balls based on the\ntournament's grade and your result\x07@.
+02c00325:33:6	7c85d23a25c524a2	For more \x07AChip-in Golf\x07@ info,\nread the FAQs on the\n\x07Dyellow sign\x07@ (\x07DBasics\x07@) and the\n\x07Ared sign\x07@ (\x07AAdvanced\x07@)\nin the lobby.\n \nNow, enjoy Chip-in Golf!
+02c00325:34:0	6bc6e05f3ab0caa1	Basics 1\n \nQ. I can't chip in.\n \nA. Try \x07Ashort shots\x07@ from \x07Aflat\n    ground on the fairway\x07@.\n    Once you get the hang of it, go longer\n    \x07Aand raise your Today's Total Score!
+02c00325:34:1	d670bcd4890bb925	Basics 2\n \nQ. Where can I see the rankings?\n \nA. Press \x0bA \x07Anear the ranking board\x07@\n    in the Chip-in Golf Lobby.
+02c00325:34:2	49473aa9715af2a4	Basics 3\n \nQ. What if I run out of balls?\n \nA. Play a round in a \x07AReal Tournament\x07@\n    to \x07Aearn balls\x07@!\n    \x07AGood results\x07@ earn \x07Aextra\x07@ balls.\n \n    \x07AYou earn even more balls\n    playing as a rare character!
+02c00325:34:3	b4d434a61433d613	Basics 4\n \nQ. What is the \x07ABest Score\x07@?\n \nA. Your \x07Ascore for a chip-in\x07@ on the\n    \x07Afirst of your 10 shots\x07@.\n    See how high you can go\n    \x07Aagainst everyone in the lobby!
+02c00325:34:4	5947bcbb61c287c3	Basics 5\n \nQ. What is the Lie Bonus?\n \nA. The lie is the ground and\n    conditions under your ball.\n    \x07AChipping in from a tough lie\x07@ like a\n    \x07Abunker\x07@ or \x07Arough\x07@ \x07Ascores more\x07@!
+02c00325:34:5	4ca3b5f71823c0e9	Basics 6\n \nQ. What are the red circles?\n \nA. \x07ANo-shot areas\x07@. \x07AAfter a chip-in\x07@,\n    \x07Ayou can't shoot from that spot again\x07@.\n    When one appears, find a new spot\n    and \x07Amove\x07@ there.
+02c00325:34:6	cea492029dc4ecb7	Basics 7\n \nQ. What if I land in a bunker or pond?\n \nA. \x07ABunkers\x07@ and \x07Aponds\x07@ give a \x07Apenalty\x07@:\n    \x07Ayou lose balls.\x07@\n    Your count can't go below zero,\n    but try not to fall in...
+02c00325:34:7	7afdac8c33c24cfa	Basics 8\n \nQ. My pet cat disappeared!\n \nA. So you can focus on Chip-in Golf,\n    \x07Apets are not allowed\x07@ in this area.\n    Thank you for understanding.
+02c00325:35:0	5ae60f89937fa66f	Advanced 1\n \nQ. I can't clear the bunker in front.\n \nA. After starting a shot, hold \x0bJ\n    while setting power for \x07Abackspin\x07@.\n    The ball \x07Aflies a bit higher\x07@,\n    but \x07Ait wobbles more\x07@.\n \n    \x07ARare characters wobble less!
+02c00325:35:1	57ae0a0461269d8f	Advanced 2\n \nQ. The wind is too strong to chip in.\n \nA. \x07ATry to\x07@ hit with a \x07Atailwind\x07@\n     or into a \x07Aheadwind\x07@.\n     Not sure which is which?\n     \x07AAsk the players around you!
+02c00325:35:2	f72c1fc25ea553b9	Advanced 3\n \nQ. I can't sink shots from high-rated lies.\n \nA. After starting a shot, hold \x0bH\n    while setting power for \x07Atopspin\x07@\n    to \x07Areduce wobble a little\x07@.\n \n\x07A    The higher a rare character's rarity,\n    the less the ball wobbles!
+02c00325:35:3	4f3e3bf8b7007f94	Advanced 4\n \nQ. What is the Target Score?\n \nA. \x07AReach a Target Score\x07@ to unlock\n    more things to do in the lobby!\n    \x07AWhat you unlock is a surprise!\x07@\n    \x07ATarget Scores are never reset.
+02c00325:35:4	6b1403e7dbb8ee46	Advanced 5\n \nQ. I want to improve fast.\n \nA. \x07ACompete with players\x07@ in the\n    same lobby and \x07Atrade tips on\n    rare characters\x07@. It's the\n    quickest way to get better!\n    \x07APlease be polite online!
+02c00325:35:5	73f11d7db76965b9	Advanced 6\n \nQ. I want to be No. 1 in the rankings.\n \nA. \x07ARare characters\x07@ from the\n    Capsule Machine reduce wobble\n    based on their rarity!\n\x07@    \x07ABuy tickets, then use the Capsule\n    Machine.\x07@ Get ahead of everyone!!
+02c00325:36:0	0822e04b8886cba0	Open from \x07A%s\x07@\nto \x07A%s\x07@.
+02c00325:36:1	a9173de95fa234ee	You got \x07A%d\x07@ Chip-in Golf balls!
+02c00325:37:0	41810ba0416770fd	Thanks for playing Chip-in Golf!\n \n\x07AThe ranking board has been reset.\x07@\n \nEnjoy the new ranking board!
+02c00325:38:0	80a54788dee48510	\x07A\nHere are yesterday's rankings!
+02c00325:38:1	fa2cff89f430116a	 \nGood luck today!
+02c00325:40:0	bec1ac8682e37120	\x07A*Notice*\x07@\nTo everyone who has already reached\na Chip-in Golf Target Score:\n \nNew lobby spells are now unlocked!\nPlease visit the\nChip-in Golf Lobby.
+02c00325:40:1	0096b178ee2f2bc6	\x07A*Notice*\x07@\nYou have already reached a Target Score.\nNew lobby spells are now unlocked.
+02c00325:40:2	1b1fdf49a7f5288f	\x07A*Notice*\x07@\nThere are new spells to earn\nwith Chip-in Golf Target Scores!\nAim for them and keep\nhaving fun!
+02c00325:40:3	602dd6247add7a48	New spells are added to\n\x07A- Spells\x07@ under \x0bD\x07A Quick Chat\x07@.
+02c00325:40:4	bc6aaeddc6495923	You reached the Target Score of \x07A%d\x07@!\nNew spell \x07A%s\x07@ unlocked.\n*What it does*\n%s
+02c00325:41:8	bfc0a38b29ced352	Say \x07ADisguise\x07@ in \x07Alobby chat\x07@ to\x07A\nturn into a nearby object\x07@.\x07A\nIt wears off after a while\x07@ or with \x07ARevert\x07@.
+02c00325:41:9	5d06cf08af8d035a	Say \x07AGhost\x07@ in \x07Alobby chat\x07@ to\x07A\nturn invisible\x07@.\x07A\n\x07@Say \x07ARevert\x07@ to \x07Areturn to normal\x07@.
+02c00325:41:10	8db2de79d8bca4a0	Say \x07AMini\x07@ in \x07Alobby chat\x07@ to\x07A\n\x07Abecome even smaller\x07@ than with Shrink.\nSay \x07ARevert\x07@ to \x07Areturn to normal\x07@.
+02c00325:41:11	9acb8d8fc50de860	Say \x07AGiant\x07@ in \x07Alobby chat\x07@ to\x07A\n\x07Abecome even bigger\x07@ than with Grow.\nSay \x07ARevert\x07@ to \x07Areturn to normal\x07@.
+02c00325:41:12	5c11a3977c476d22	Say \x07ACritter\x07@ in \x07Alobby chat\x07@ to\x07A\nturn into a nearby animal\x07@.\x07A\nIt wears off after a while\x07@ or with \x07ARevert\x07@.
+02c00325:41:13	64ddc5b1b7fb350c	Say \x07ACritter+\x07@ in \x07Alobby chat\x07@ to\n\x07Astay a nearby animal\x07@.\nSay \x07ARevert\x07@ to \x07Areturn to normal\x07@.
+02c00325:41:14	c685ef619e985c15	Say \x07ADisguise+\x07@ in \x07Alobby chat\x07@ to\n\x07Astay a nearby object\x07@.\nSay \x07ARevert\x07@ to \x07Areturn to normal\x07@.
+11ce6dc8:15:0	7b094bd47201d69c	Spells
+11ce6dc8:16:0	73a54cea44072718	Revert
+11ce6dc8:16:1	70a0a467f78b6509	Grow
+11ce6dc8:16:2	339792dc3fe2ed07	Vanish
+11ce6dc8:16:3	5a1eee899d8a119a	Boom
+11ce6dc8:16:4	be4e1e2fd4d1e850	Shrink
+11ce6dc8:16:5	5d1d5c7d77c2bb86	Warp
+11ce6dc8:16:6	fe3746751334969f	Morph
+11ce6dc8:16:7	b4d68cee29365284	Freeze
+11ce6dc8:16:8	9c3ca28279f43e14	It's here!!!
+11ce6dc8:16:9	b39a0dfaf68d2612	Here I come, Top 100!
+11ce6dc8:16:10	0173816f6610e8bd	Aiming for the podium!!
+11ce6dc8:16:11	ad083aa273574ab6	What a view up here!
+11ce6dc8:16:12	836d4865350e2d0f	My potential is unlimited!
+11ce6dc8:16:13	f43f4ee76d84851d	Master of staying calm.
+11ce6dc8:16:14	a721fdaaa27840bb	Big leap forward!
+11ce6dc8:16:15	74c17692f253b8b6	This is the Hot Shots spirit!
+11ce6dc8:16:16	b8a72709d45d7ff5	Always aiming higher.
+11ce6dc8:16:17	f58b35653564b39c	Never giving up makes me strong.
+11ce6dc8:16:18	c6e6d787ff6c718f	I'm here because you're here.
+11ce6dc8:16:19	438cfdeaea1be2e7	I love Hot Shots Golf!
+11ce6dc8:16:20	2bf8d63ad050de58	Disguise
+11ce6dc8:16:21	9da4cd1ba5ab2865	Ghost
+11ce6dc8:16:22	60dfcaef219dc134	Mini
+11ce6dc8:16:23	b8dabe2a81fbad93	Giant
+11ce6dc8:16:24	3cce0dabc5e0d77e	Critter
+11ce6dc8:16:25	dde8a2fa24156896	Critter+
+11ce6dc8:16:26	5e9e108034be9bb4	Disguise+
+11ce6dc8:17:0	69dc67c4f1e5ec0b	Not There Yet
+11ce6dc8:18:0	8aa5ea5f48243e8c	A very average score.
+11ce6dc8:18:1	4845ba0fa0e5a133	Nothing special this time.
+11ce6dc8:18:2	b2c190b7fb16d60a	Not my best...
+11ce6dc8:18:3	d2da6ae89b89bf06	Feeling down...
+11ce6dc8:18:4	5eeaacbe2b19f39a	So close!
+11ce6dc8:18:5	9f427ac474322218	If only I'd missed that one shot!!
+11ce6dc8:18:6	3ef77b9b243e3cbe	If that one had dropped...
+11ce6dc8:18:7	f7a87a7803620ba2	Please let this score be a dream.
+11ce6dc8:18:8	efd26bd6a4486390	Still flying low.
+11ce6dc8:18:9	5a877d5bdd94d285	I'm in a slump lately.
+11ce6dc8:18:10	345b94e18123ff60	It's not over yet!
+11ce6dc8:18:11	706d156e5e9e3d3d	Our fight has only just begun!
+11ce6dc8:18:12	df4b58456ad889ac	No rush, no rush.
+11ce6dc8:18:13	a93fd24d799c1045	I need more practice...
+11ce6dc8:18:14	08a9ae6393099782	Sorry about this ranking.
+11ce6dc8:18:15	90e17ac55309aa19	Sweaty hands, missed the shot.
+11ce6dc8:18:16	d465d78c8f40b76a	The last hole got me!
+11ce6dc8:18:17	c4d7634f27a6edaf	Cracked under pressure...
+11ce6dc8:18:18	a334b49eed99a579	The wind? The weather? Or me?
+11ce6dc8:18:19	a8cbfa472a395b4d	Old soldiers never die...
+160a1096:0:12	1adeb6e882278697	 took 2nd in a Daily Int'l Tournament!!\nHeld on %04d/%02d/%02d\nin the %s.\n \nPlace: 2 / %d players\nScore: %s  %d Pts
+160a1096:0:13	793f4953848cb8be	 placed in the top 10%% of a Daily Int'l Tournament!\nHeld on %04d/%02d/%02d\nin the %s,\nfinishing number %d.\n \nPlace: %d / %d players\nScore: %s  %d Pts
+160a1096:0:14	18b92511505e214b	 placed in the top 20%% of a Daily Int'l Tournament!\nHeld on %04d/%02d/%02d\nin the %s,\nfinishing number %d.\n \nPlace: %d / %d players\nScore: %s  %d Pts
+160a1096:0:15	7b5cc281e4e57585	 won a Daily Int'l Tournament Tour!!\nHeld from %s to %s\nin the %s.\n \nPlace: 1 / %d players\nTour Points: %d TP
+160a1096:0:16	71e521acc436ab8a	 took 2nd in a Daily Int'l Tournament Tour!!\nHeld from %s to %s\nin the %s.\n \nPlace: 2 / %d players\nTour Points: %d TP
+160a1096:0:17	ee1faf49fc3dc79e	 placed in the Top 100 of a Daily Int'l Tournament Tour!\nHeld from %s to %s\nin the %s,\nfinishing number %d.\n \nPlace: %d / %d players\nTour Points: %d TP
+160a1096:0:18	e5e102f188d4d51a	 placed in the top 10%% of a Daily Int'l Tournament Tour!\nHeld from %s to %s\nin the %s,\nfinishing number %d.\n \nPlace: %d / %d players\nTour Points: %d TP
+160a1096:0:19	4f9fa8a6de5312d3	 placed in the top 20%% of a Daily Int'l Tournament Tour!\nHeld from %s to %s\nin the %s,\nfinishing number %d.\n \nPlace: %d / %d players\nTour Points: %d TP
+160a1096:0:20	3aed85ce561d5ad6	 hit a lucky number in a Daily Int'l Tournament Tour!\nHeld from %s to %s\nin the %s,\nfinishing number %d, a lucky number!\n \nPlace: %d / %d players
+36751257:0:248	2b008f6f1dbaa335	Red Bull 5G Shirt: West
+36751257:0:249	5d7493bd266f6a06	Red Bull 5G Shirt: East
+36751257:0:620	c774da6bf4e12cb6	Famitsu T-shirt
+36751257:0:621	09d03930bb0f8490	Gochi Hoodie
+36751257:0:642	8a4cafbe4f4e6e76	Kazuma's Clothes
+36751257:0:643	d0f4f010e8944d09	Pac-Man
+36751257:0:644	fbeb704698c5e03f	Famitsu Green Ranger Suit
+36751257:0:645	d10b0ab3e603910c	Famitsu Pink Ranger Suit
+36751257:0:646	b9ff829da65e32ae	Famitsu Red Ranger Suit
+549b1f55:2:21	81852379d593ee92	Registered: %d
+549b1f55:2:22	7a28cffdb142df8f	No. %d: %s
+549b1f55:2:23	a649fe4cfc46b13d	, %s
+549b1f55:2:24	7b1434d03cd9c328	Congratulations!
+549b1f55:2:25	a7b21b0b5c0e8679	\x07A*It may take a while for the data to appear.
+549b1f55:2:26	8eae3d2aa69812b5	This player is in another grade now.
+549b1f55:2:27	61759da8ee7e0a39	\x07A*These are provisional rankings.
+549b1f55:18:0	73a54cea44072718	Revert
+549b1f55:18:1	70a0a467f78b6509	Grow
+549b1f55:18:2	339792dc3fe2ed07	Vanish
+549b1f55:18:3	5a1eee899d8a119a	Boom
+549b1f55:18:4	be4e1e2fd4d1e850	Shrink
+549b1f55:18:5	5d1d5c7d77c2bb86	Warp
+549b1f55:18:6	fe3746751334969f	Morph
+549b1f55:18:7	b4d68cee29365284	Freeze
+549b1f55:18:8	2bf8d63ad050de58	Disguise
+549b1f55:18:9	9da4cd1ba5ab2865	Ghost
+549b1f55:18:10	60dfcaef219dc134	Mini
+549b1f55:18:11	b8dabe2a81fbad93	Giant
+549b1f55:18:12	3cce0dabc5e0d77e	Critter
+549b1f55:18:13	dde8a2fa24156896	Critter+
+549b1f55:18:14	5e9e108034be9bb4	Disguise+
+549b1f55:19:0	579e627eb06bacab	Return to normal
+549b1f55:19:1	406fd34b2c7c490a	Get bigger
+549b1f55:19:2	ab21f2b9eeec9a49	Turn see-through
+549b1f55:19:3	350aa4226e3a0cec	Explode
+549b1f55:19:4	7e5bb4fbdfad5358	Get smaller
+549b1f55:19:5	44d4cea40875343c	Warp
+549b1f55:19:6	ed4ac86a6a1135f2	Change shape
+549b1f55:19:7	e0a6fc5b7d32d39a	Freeze
+549b1f55:19:8	c70bdb91d7841e9c	Turn into a nearby object for a while
+549b1f55:19:9	ab21f2b9eeec9a49	Turn invisible
+549b1f55:19:10	04c800399faf4719	Get even smaller
+549b1f55:19:11	341168ba21ad466a	Get even bigger
+549b1f55:19:12	aecb7f63332dde25	Turn into a nearby animal for a while
+549b1f55:19:13	6cec9f926b350e0d	Stay a nearby animal
+549b1f55:19:14	c5bc5a1ab26ee717	Stay a nearby object
+549b1f55:20:0	974201d65e25b222	\x0bC jumps 2x higher
+549b1f55:20:1	26b3dd824533ff39	\x0bB + \x0bS dash boost
+549b1f55:20:2	1e2c4c93cb68fe0f	Rotate \x0bS left fast to spin
+549b1f55:20:3	6dd2138ed9b51606	\x0bC jumps 3x higher
+549b1f55:20:4	aa3e435908e853af	\x0bB + \x0bS super dash
+549b1f55:20:5	0faf0ee9f85e37db	Press \x0bA while jumping to glide
+549b1f55:20:6	863e50cef9975356	Mash \x0bB to throw a tantrum
+549b1f55:21:0	18013932b46f4ab9	\x07ATickets expiring on %04d/%02d/%02d: %d
+549b1f55:21:1	b6d5ab622c8dd4da	About Tickets
+549b1f55:22:0	738cded3c8fd5429	 \n- Odds differ for each capsule prize.\n \n- Once you have a character's top rarity,\n  that character no longer appears,\n  so the odds change.\n \n- Any change to the odds will be\n  announced in Player's Information.\n  The odds do not change otherwise\n  (except after getting a top rarity).\n \n- You can get the same prize again.\n  If you get a character at a rarity you\n  already have, or lower, you get points\n  for that rarity instead. Collect points\n  to get higher rarities and\n  color variations too.\n \n- Odds are shown to two decimal places,\n  so they may not add up to 100 percent.\n \n- Capsules cannot be returned or\n  cancelled after purchase.\n \n- To update your rare characters, you may\n  need to reconnect from\n  Main Menu > Online > Choose Lobby.\n
+549b1f55:22:1	563273e391dc5ba8	 \nThank you for playing\nHot Shots Golf: World Invitational.\nPlease note the following about tickets.\n \n- Tickets expire 4 months after\n  the purchase date.\n  \n  Example: tickets bought on 1/1/2013\n  expire on 5/1/2013.\n \n- You cannot buy tickets while you\n  still have some.\n  Use up all your tickets first.\n \n- Unused tickets cannot be returned\n  or cancelled.
+549b1f55:23:0	c5996c37ad23c7cd	\x07DPenalty: %d balls lost.
+549b1f55:24:0	e96065837625726f	Revert
+549b1f55:24:1	cba95a5286f058cf	Grow
+549b1f55:24:2	0c2319113c765948	Vanish
+549b1f55:24:3	a667b74672da8b79	Boom
+549b1f55:24:4	a863e12d8f78b264	Shrink
+549b1f55:24:5	34e089301ee427e5	Warp
+549b1f55:24:6	6331e272598f5bbc	Morph
+549b1f55:24:7	a1b440620dcd8686	Freeze
+549b1f55:24:8	cb851ea0857ada55	Disguise
+549b1f55:24:9	d818c3bad160788c	Ghost
+549b1f55:24:10	2eacd192c3d248f8	Mini
+549b1f55:24:11	a5f95ea78bd963fc	Giant
+549b1f55:24:12	146f12733d821473	Critter
+549b1f55:24:13	c42d4cebadc95993	Critter+
+549b1f55:24:14	5b47358a8dc2de7e	Disguise+
+560a838c:1:20	2ea4d0a728423a5a	Ten-gallon hat is his trademark. Host of the Shingo Katayama Invitational Nestle Japan Match Play Championship Lexus Cup. Known for power, and his sidespin is a work of art!
+560a838c:2:90	5f93d07113276a7b	Proof of entry in the "Docomodake Cup." Improves approach.
+560a838c:2:100	5f93d07113276a7b	Proof of entry in the "Docomodake Cup." Improves approach.
+560a838c:2:110	d6f891083c060459	Proof of entry in the "Docomodake Tour." More distance, but impact is harder.
+560a838c:2:130	6775e0c3a2639f6a	Club with a Pac-Man design. More distance and extra power shots. *Performs even better when Pac-Man uses it.
+560a838c:3:120	41b113328813a2ad	Proof of entry in the "Docomodake Cup." Gives extra power shots.
+560a838c:3:130	41b113328813a2ad	Proof of entry in the "Docomodake Cup." Gives extra power shots.
+560a838c:3:140	2eaadd92fea4d3fe	Proof of entry in the "Docomodake Tour." More distance, but control is harder.
+560a838c:3:150	090c174f0d225054	Ball with a Pac-Man design. More distance and extra power shots. *Performs even better when Pac-Man uses it.
+560a838c:10:10	9024e11b870e209b	View your ticket purchase history.
+560a838c:77:4	acef0c9238372a67	You have no rare characters. To use a rare character, buy a capsule in an online lobby.
+560a838c:77:5	08e730ba3f9923d8	\x07A*Collaboration characters are not sold as rare characters.
+560a838c:77:6	12a49af7d96c4bbc	\x07AThis item is no longer sold on the PlayStation®Store.
+560a838c:79:0	71f2fefb087c7945	Choose the machine with the capsule you want.
+560a838c:79:1	269f37f418d47e2d	Use %d tickets to turn the Capsule Machine %d times.
+560a838c:79:2	157428e9fab3d2bd	Notes about capsules.
+560a838c:79:3	b36ac32aae355295	Choose a capsule prize (rare character) to see its details.
+560a838c:79:4	597812e1f6a39722	Details of the capsule prize (rare character).
+560a838c:79:5	d89bdf47acf68d67	You have every rare character, so you cannot use the Capsule Machine.
+560a838c:79:6	946e5529b94296e5	Communicating. Please wait.
+560a838c:79:7	f7763d6c50ff87bc	Your rare characters.
+560a838c:80:0	03f13148152d166d	Rare character. The ultimate all-rounder, stronger in every way. Good with approach. Shot: straight.
+560a838c:80:1	ef8263b9572f0dce	Rare character. Hidden potential that raises every skill. Good with approach. Shot: fade.
+560a838c:80:2	67b500781b1cea20	Rare character. Stronger all round and no longer struggles in rain. Now good in the rough. Shot: straight.
+560a838c:80:3	a3ba831947db732f	Rare character. A hard worker who built every skill around power. Good in bunkers. Shot: draw.
+560a838c:80:4	238250931376721d	Rare character. A prodigy whose skills grew beyond all expectations. Good with approach. Shot: straight.
+560a838c:80:5	09f06139eb1e005f	Rare character. Natural distance and training raised every other skill. Good in bunkers. Shot: draw.
+560a838c:80:6	2fd263fcaa8e7fce	Rare character. Already balanced, now even stronger, with ideal skills. Good in the rough. Shot: fade.
+560a838c:80:7	e742fc7aa6fc6488	Rare character. Stronger all round, beat the rough and became good in bunkers. Shot: straight.
+560a838c:80:8	396180445f7ba9bc	Rare character. Rock-steady, no longer weak in bunkers, and good with approach. Hardly a weak spot left. Shot: straight.
+560a838c:80:9	48b6ea64588c5726	Rare character. Even more raw power and better all round. Still good in the rough. Shot: draw.
+560a838c:80:10	5950d54c622ff474	Rare character. Natural talent raised every skill, beat the rain and made the rough a strength. Shot: straight.
+560a838c:80:11	bacf659d7f72a8ca	Rare character. Steadier and stronger in every skill, went from weak in the rough to good in bunkers. Shot: fade.
+560a838c:80:12	9422cd56eb91b959	Rare character. Stronger all round and still good with approach. Her talent shines. Shot: straight.
+560a838c:80:13	7ced23adfa820020	Rare character. Steadier and always improving. Good with approach. Shot: straight.
+560a838c:80:14	02a19acc012112b9	Rare character. Talent in full bloom with excellent balance. Great with approach. Shot: straight.
+560a838c:81:0	e9ee2b6ed2e2df4e	Your ticket purchase history.
+560a838c:81:1	4dbedcdf7c9b7a0a	How tickets work.
+560a838c:81:2	5cc48ffddcbbcc81	About the tickets needed for the Capsule Machine. You can check them any time in the lobby from \x0b@ Menu > Options > Ticket History.
+5b259f0e:0:1	b59159ea59ed0081	This item is no longer sold on the PlayStation®Store.
+5b259f0e:7:0	99447224937224d3	You left the lobby to go to\nthe PlayStation®Store.\nRejoining the same lobby.
+5b259f0e:7:1	8d0fb21fbcf87724	The lobby is full, so you could not enter.\nPlease choose a lobby again.
+62962d59:0:208	d26126df8d78258f	Kazuma's Head
+62962d59:0:209	774525cf5ada4df3	Toro Hat
+62962d59:0:239	017ce807309f4a57	Red Bull 5G Cap
+62962d59:0:255	ca1707829addab54	Pancho's Head: 2
+62962d59:0:256	cc3eb33dfe8f8160	Pancho's Head: 3
+62962d59:0:257	205b1e4413f64d9a	Pancho's Head: 4
+62962d59:0:560	382d438ceae6728f	Mizushina: Head
+6626031c:0:20	8cd0696c7107d1b7	Known for his trademark\nten-gallon hat\nand his power.\n \nHe first picked up a club\nat age 2 and went on\nto win junior events.\nHe came back from major\nback surgery to win 28\ntour events and earn a\nlifetime tour exemption,\nonly the 7th ever.\n \nHe can be tricky, but\nlearn his strengths\nand have fun!!
+6626031c:1:20	72fcd1c8f88143f6	The Star of Ibaraki
+6626031c:2:20	f48cf3cb887c67b3	42
+6626031c:3:20	0523e6f3d005d5a6	Ibaraki, Japan
+6626031c:4:20	4008365c19c6f0bb	5' 7"
+6626031c:5:20	6a5f7adbe601c276	165 lbs
+6626031c:6:20	0140b61db8a1ff97	Peaches
+6626031c:7:20	5fc357946323238d	Pickles
+6721dec3:1:90	e237ec92c6935b3e	Girl Docomodake Club
+6721dec3:1:100	2a8d6075da5be33d	Boyfriend Docomodake Club
+6721dec3:1:110	7679071735f68d54	Papa Docomodake Club
+6721dec3:1:130	4afac52929221d13	Pac-Man Club
+6721dec3:2:90	7eecad4f44ff4438	Girl Docomodake
+6721dec3:2:100	da56fb9c4808066d	Boyfriend Docomodake
+6721dec3:2:110	f609614008408051	Papa Docomodake
+6721dec3:2:130	d0f4f010e8944d09	Pac-Man
+6721dec3:6:120	95ae8062895e4100	Papa Docomodake Ball
+6721dec3:6:130	e145fdf8f0baf68c	Mama Docomodake Ball
+6721dec3:6:140	06f9b9e375c53d8c	Girl Docomodake Ball
+6721dec3:6:150	930726aff7c70ec7	Pac-Man Ball
+6721dec3:7:120	f609614008408051	Papa Docomodake
+6721dec3:7:130	cb85eab0acba2fc8	Mama Docomodake
+6721dec3:7:140	7eecad4f44ff4438	Girl Docomodake
+6721dec3:7:150	d0f4f010e8944d09	Pac-Man
+7c5086b6:7:12	77803a948bf66a7e	Chip-in History
+7c5086b6:7:13	ea06fbd7e824bf0e	Buy Tickets
+7c5086b6:7:14	0b47321cd762994e	Capsule Machine
+7c5086b6:7:15	8f7ba327f66726ba	Ticket History
+8857c16e:0:20	2b9ac9b981a4dda8	Katayama
+8857c16e:1:6	acfb1f5a5e627f4d	Hatsune Miku
+8857c16e:2:2	5023a833bd64cd5f	Rare Costume
+8857c16e:3:9	9fc11525196e82ad	Spare
+8857c16e:3:10	9fc11525196e82ad	Spare
+8857c16e:3:11	9fc11525196e82ad	Spare
+8857c16e:3:12	9fc11525196e82ad	Spare
+8857c16e:3:13	9fc11525196e82ad	Spare
+8857c16e:3:14	9fc11525196e82ad	Spare
+8857c16e:3:15	9fc11525196e82ad	Spare
+8857c16e:3:16	9fc11525196e82ad	Spare
+8857c16e:3:17	9fc11525196e82ad	Spare
+8857c16e:3:18	9fc11525196e82ad	Spare
+8857c16e:3:19	9fc11525196e82ad	Spare
+8f7d7ebd:3:32	deb0b5d1e377a954	Girl Docomodake Club Only
+8f7d7ebd:3:33	311f90e25befda86	Boyfriend Docomodake Club Only
+8f7d7ebd:3:34	c1a68f959259aded	Papa Docomodake Club Only
+8f7d7ebd:3:36	b86bcb241a5f9206	Pac-Man Club Only
+8f7d7ebd:3:64	ac983b9641b0c26f	Papa Docomodake Ball Only
+8f7d7ebd:3:65	df1a8399e933f834	Mama Docomodake Ball Only
+8f7d7ebd:3:66	d085430af7f6d0be	Girl Docomodake Ball Only
+8f7d7ebd:3:67	ddea90b04ef0282b	Pac-Man Ball Only
+8f7d7ebd:3:103	bbdef9abe7621e3b	Kazuma Only
+8f7d7ebd:3:107	418d140c5086c98e	Katayama Only
+9665af12:1:9	d2e669c1b751f28f	View rankings.
+9665af12:4:3	760c21e96fcb5d71	View wins and 2nd places by grade.
+9665af12:4:4	47d52389b0eab346	View your best scores for 9H (OUT), 9H (IN) and 18H.
+9665af12:4:5	7e16288a29b74819	View Chip-in Golf rankings.
+b1518f46:4:36	5840c302c909d23d	All Rare Characters
+e89e25b4:9:1	b59159ea59ed0081	This item is no longer sold on the PlayStation®Store.
+ecf31809:1:18	f28c7b8da12a86e6	%d pts
+ecf31809:2:4	adee5100d5ff0915	%d players
+ecf31809:2:5	d710fae032d65d79	No. %d
+ecf31809:2:6	85aa82327de5c3fa	No. ---
+ecf31809:5:0	74c77a8ab02863de	th
+ecf31809:6:12	2438223abb6c431f	Double Eagle+
+ecf31809:29:1	8aed85330cf4ccbc	%02d:%02d
+ecf31809:31:0	78b1213a62cef9d9	Date
+ecf31809:31:1	65f101b159a106e9	Obtained By
+ecf31809:31:2	3c131c2951c02d0e	Price
+ecf31809:31:3	429defe3eec1bbcc	Tickets
+ecf31809:31:4	1db118371c67e76c	Total
+ecf31809:31:5	f0ba49ce310105a6	Expires
+ecf31809:32:0	3d8f89d6f55a2951	First Login Bonus
+ecfd80b5:0:560	411a291eacd08cda	Famicom Tsushin (1st Issue)
+ecfd80b5:0:561	f609614008408051	Papa Docomodake
+ecfd80b5:0:562	7eecad4f44ff4438	Girl Docomodake
+ecfd80b5:0:568	cb99250852b5ee3e	Duck
+ecfd80b5:0:569	04b5ff839bbee01e	Banner: Toro Print
+ed280600:0:44	65163841d43d0f66	PlayStation®Move motion controller
+ed280600:0:45	33d5b63414b0f06f	PlayStation®Move navigation controller
+ed280600:0:47	967a8b72c0be36d7	Hot Shots Golf: World Invitational
+f212f7bc:0:89	7dfc4670e0e6fe96	Famitsu Green Ranger Mask
+f212f7bc:0:90	80c79462c6883036	Famitsu Pink Ranger Mask
+f212f7bc:0:91	6d0bea2394023eec	Famitsu Red Ranger Mask
+f212f7bc:0:92	e509d06899cde19c	Famitsu Yellow Ranger Mask
+f212f7bc:0:93	3249cddf75d66e22	Famitsu Blue Ranger Mask
+f212f7bc:0:94	13b58ea6219d107e	Famitsu Black Ranger Mask
+f212f7bc:0:95	d45a135fb6a9c283	Famitsu White Ranger Mask
+f212f7bc:0:96	cc9428b2b0407286	Mizushina
+f212f7bc:0:97	9315fc03c66e1bea	Sugashi Kawata
+f212f7bc:0:98	611d88f7f1a0c8b0	Leona Ebihara
+f212f7bc:0:99	64d4a1d5ca0204a6	Francois Hayashi
+f212f7bc:0:461	cd8042d546902568	Mizushina: Face
+f212f7bc:0:491	098e35f0053e5792	Kazuma Kiryu
+f212f7bc:0:493	7dfc4670e0e6fe96	Famitsu Green Ranger Mask
+f212f7bc:0:494	80c79462c6883036	Famitsu Pink Ranger Mask
+f212f7bc:0:495	6d0bea2394023eec	Famitsu Red Ranger Mask

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Assemble the game data for the JP 1.27 build (Minna no Golf 6, BCJS30089).
 
-usage: build_ultimate_data.py [--base us|asia] [--out A:/hsg-ultimate] [--dry]
+usage: build_ultimate_data.py [--base us|asia] [--out A:/hsg-ultimate] [--lang en|ja] [--dry]
 
 Writes (nothing goes into git; every path is outside the repo):
   <out>/game/                      the "disc" (/dev_bdvd, --game-dir):
@@ -26,6 +26,9 @@ Other localized variants (US_02/03/07, EU_*, AS_09/10) are left out. A JP update
 wins over a renamed base file. Archive entry keys inside the renamed base archives still hash
 the base's internal paths (data/chara_localize/..., data/course_localize/...); the JP build
 retries those names at run time (port/hsg_jp127_hooks.cpp), so the archives are not rewritten.
+
+--lang en (default) then rebuilds the JP updates' localized archives with English text and
+textures (tools/jp127_english.py); --lang ja leaves the Japanese update files as they are.
 
 Files on the same volume as <out> are hard-linked, others copied. Existing files with the same
 size and mtime are kept, so a second run only adds what changed.
@@ -151,6 +154,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", choices=sorted(BASES), default="us")
     ap.add_argument("--out", default="A:/hsg-ultimate")
+    ap.add_argument("--lang", choices=["en", "ja"], default="en")
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
     cfg, out = BASES[a.base], Path(a.out)
@@ -206,6 +210,9 @@ def main():
             f"base={a.base}\nusrdir={cfg['usrdir']}\nupdates={vers[0]}..{vers[-1]}\n", encoding="utf-8")
     print(f"[data] {'would place' if a.dry else 'placed'}: {pl.linked} linked, {pl.copied} copied, "
           f"{pl.kept} unchanged, {stale} stale removed -> {game} and {hdd}")
+    if a.lang == "en":
+        import jp127_english
+        print("[data] english:", jp127_english.build(out, a.dry))
     return 0
 
 
