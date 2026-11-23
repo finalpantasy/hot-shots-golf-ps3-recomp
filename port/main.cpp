@@ -490,7 +490,13 @@ static bool matches_target_elf(FILE* file)
 {
     // SHA-256 of the selected profile's decrypted_elf_sha256 in config/target.json.
     static const uint8_t expected[] = {
-#ifdef HSG_TARGET_OFFICIAL_1_03
+#if defined(HSG_TARGET_JP_1_27)
+        // JP 1.27 (BCJS30089) EBOOT, A:/hsg-updates/x/an/eboot/jp127.elf
+        0xd9, 0x81, 0xeb, 0x70, 0x68, 0x07, 0x6b, 0xef,
+        0x9e, 0xda, 0xc6, 0x2c, 0x82, 0x32, 0x01, 0xa0,
+        0x10, 0xc0, 0xf3, 0x3f, 0x69, 0x2e, 0xf1, 0xed,
+        0x35, 0xd8, 0xd9, 0x48, 0xbc, 0xab, 0x59, 0x60,
+#elif defined(HSG_TARGET_OFFICIAL_1_03)
         0x8c, 0xb1, 0x8c, 0x2e, 0xc0, 0x6c, 0x8a, 0x0e,
         0xd2, 0xde, 0x12, 0xd3, 0xdd, 0x3b, 0xdd, 0x09,
         0xca, 0xa3, 0x6a, 0xf5, 0x5d, 0x49, 0xc1, 0x8a,
@@ -503,7 +509,11 @@ static bool matches_target_elf(FILE* file)
 #endif
     };
     // Reject incomplete or oversized inputs before the hash reads their data.
+#if defined(HSG_TARGET_JP_1_27)
+    constexpr int64_t expected_size = 14406392;
+#else
     constexpr int64_t expected_size = 14340360;
+#endif
     if (!file || _fseeki64(file, 0, SEEK_END) != 0 ||
         _ftelli64(file) != expected_size || _fseeki64(file, 0, SEEK_SET) != 0)
         return false;
@@ -825,7 +835,9 @@ int main(int argc, char** argv)
     std::unique_ptr<FILE, decltype(&fclose)> pinned_elf(
         _fsopen(rp.elf.c_str(), "rb", _SH_DENYWR), fclose);
     if (!matches_target_elf(pinned_elf.get())) {
-#ifdef HSG_TARGET_OFFICIAL_1_03
+#if defined(HSG_TARGET_JP_1_27)
+        const char* target_profile = "JP 1.27 (BCJS30089)";
+#elif defined(HSG_TARGET_OFFICIAL_1_03)
         const char* target_profile = "official 1.03";
 #else
         const char* target_profile = "fixed 1.02";
@@ -842,8 +854,13 @@ int main(int argc, char** argv)
         keep_explorer_message_open(argc);
         return 1;
     }
+#if defined(HSG_TARGET_JP_1_27)
+    if (strcmp(cellGame_get_title_id(), "BCJS30089") != 0) {
+        fprintf(stderr, "Unsupported title ID in %s. Use the BCJS30089 data root from tools/build_ultimate_data.py.\n", sfo.c_str());
+#else
     if (strcmp(cellGame_get_title_id(), "NPUA80864") != 0) {
         fprintf(stderr, "Unsupported title ID in %s. Use the US NPUA80864 game files.\n", sfo.c_str());
+#endif
         keep_explorer_message_open(argc);
         return 1;
     }

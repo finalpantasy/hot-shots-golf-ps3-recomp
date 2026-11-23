@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "profile": "jp-1.27",
+  "description": "Optional second build: the Japanese 1.27 program (Minna no Golf 6, BCJS30089) on US base data with the JP updates 1.01-1.27 layered on top. The US official-1.03 profile stays the default and is not changed by this one.",
+  "executable": "A:/hsg-ultimate/build/HotShotsGolfRecomp.exe",
+  "elf": "A:/hsg-ultimate/eboot/jp127.elf",
+  "elf_source": "A:/hsg-updates/x/an/eboot/jp127.elf (rpcs3 --decrypt of the 01.27 update EBOOT.BIN)",
+  "elf_sha256": "d981eb7068076bef9edac62c823201a010c0f33f692ef1ed35d8d948bcab5960",
+  "elf_fnv1a64": "A5E6D63E17879474",
+  "game_dir": "A:/hsg-ultimate/game",
+  "hdd0": "A:/hsg-ultimate/hdd0",
+  "data_tool": "tools/build_ultimate_data.py --base us",
+  "dev_flash": "work/runtime/firmware-codex/dev_flash",
+  "title_id": "BCJS30089",
+  "app_ver": "01.27",
+  "pipeline": "pipeline-jp127.toml",
+  "insn_patches": "config/insn-patches-jp127.json (none applied; US 1.03 mapping table only)",
+  "spu_jobs_manifest": "tools/spu_jobs-jp127.json",
+  "spu_jobs_registered": 16,
+  "lift_hooks": "tools/jp_lift_hooks.py + port/hsg_jp127_hooks.cpp (FB_FindEntryByPath 0x00788B64 name fallback)",
+  "runtime_program_gate": "external/ps3recomp/libs/system/hsg_program.c (US 1.03 address patches stand down on this ELF)"
+}

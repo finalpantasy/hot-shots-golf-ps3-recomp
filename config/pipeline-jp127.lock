@@ -1,0 +1,24 @@
+{
+  "stages": {
+    "analyze": {
+      "fingerprint": "c0841b4155e332986468eda7abc3bc40ef3304f41c57bc01418efa9fc02eff7a",
+      "outputs": "b3c93c37db1961844aa811b1245b2d828bf8cb91377753fa1e7ab81101b45962",
+      "completed_at": "2026-11-23T02:21:47.719044+00:00"
+    },
+    "spu": {
+      "fingerprint": "968366524563e311a615b8064d78475ce82b870e0619fecdeedda6dab2a85d5c",
+      "outputs": "e7d61607cd4e0fc475c8a4b312d2904103eb42e12b33ee224660cf6c1b64fe51",
+      "completed_at": "2026-11-23T02:23:49.677961+00:00"
+    },
+    "lift": {
+      "fingerprint": "3f627b40556af3e0706c2f160805460c79aea3b48405b75fa0d299cb2d13d7a2",
+      "outputs": "534e1c80ef6cd4a7b9791cec3da3b37149fc73b6d0665fa0b7bfa18b5fe17cd3",
+      "completed_at": "2026-11-23T02:47:21.370286+00:00"
+    },
+    "build": {
+      "fingerprint": "1b1da8ac8b724cef3c69d82c704b75c7affb5f7272a6c9021b1c9e99d00d5b75",
+      "outputs": "d80134d36bd3b2e3218777d0d75c98133255b8dbb5a5f832ad3d35b55e9b64f6",
+      "completed_at": "2026-11-23T03:24:38.055849+00:00"
+    }
+  }
+}

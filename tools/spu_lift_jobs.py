@@ -382,7 +382,7 @@ def main():
     if failed:
         print("[spu_lift_jobs] nothing registered", file=sys.stderr)
         return 1
-    print(f"[spu_lift_jobs] wrote {out.relative_to(ROOT)} ({len(regs)} job(s))")
+    print(f"[spu_lift_jobs] wrote {out.relative_to(ROOT) if out.is_relative_to(ROOT) else out} ({len(regs)} job(s))")
     return 0
 
 

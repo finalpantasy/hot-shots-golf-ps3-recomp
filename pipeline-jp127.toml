@@ -1,0 +1,79 @@
+# JP 1.27 (Minna no Golf 6, BCJS30089) second build target. Optional exe beside the
+# US 1.03 default (pipeline-1.03.toml), which this file does not touch.
+# Inputs and outputs live on A: under A:/hsg-ultimate (fast NVMe, new work).
+# The ELF is a copy of A:/hsg-updates/x/an/eboot/jp127.elf
+# (SHA-256 d981eb7068076bef9edac62c823201a010c0f33f692ef1ed35d8d948bcab5960).
+[toolchain]
+python = ".venv/Scripts/python.exe"
+cmake = ".venv/Lib/site-packages/cmake/data/bin/cmake.exe"
+clang_cl = "external/llvm-mingw/bin/x86_64-w64-mingw32-clang.exe"
+ps3recomp = "external/ps3recomp"
+eboot = "A:/hsg-ultimate/eboot/jp127.elf"
+out = "A:/hsg-ultimate"
+
+[[stages]]
+name = "analyze"
+inputs = [
+  "A:/hsg-ultimate/eboot/jp127.elf",
+  "external/ps3recomp/tools/ppu_loader.py",
+  "external/ps3recomp/tools/gen_imports.py",
+  "external/ps3recomp/tools/extract_spu_images.py",
+  "external/ps3recomp/tools/spu_lifter.py"
+]
+outputs = ["A:/hsg-ultimate/analysis"]
+commands = [
+  ["${python}", "${ps3recomp}/tools/ppu_loader.py", "${eboot}", "-o", "${out}/analysis"],
+  ["${python}", "${ps3recomp}/tools/gen_imports.py", "${eboot}", "-o", "${out}/analysis/imports_named.json"],
+  ["${python}", "${ps3recomp}/tools/extract_spu_images.py", "${eboot}", "--output", "${out}/analysis/spu/images"],
+  ["${python}", "${ps3recomp}/tools/spu_lifter.py", "${out}/analysis/spu/images/spu_0000_at_00CAB980.elf", "--auto-functions", "${out}/analysis/spu/images/spu_0000_at_00CAB980.elf", "--output", "${out}/analysis/spu/lifted"]
+]
+
+[[stages]]
+name = "spu"
+inputs = [
+  "A:/hsg-ultimate/eboot/jp127.elf",
+  "external/ps3recomp/tools/build_spu_workloads.py",
+  "external/ps3recomp/tools/spu_program_pipeline.py",
+  "external/ps3recomp/tools/spu_lifter.py",
+  "external/ps3recomp/tools/find_spu_functions.py",
+  "external/ps3recomp/tools/spu_disasm.py",
+  "tools/spu_lift_jobs.py",
+  "tools/spu_jobs-jp127.json"
+]
+outputs = ["A:/hsg-ultimate/spu"]
+commands = [
+  ["${python}", "${ps3recomp}/tools/build_spu_workloads.py", "--input", "${eboot}", "--lifted", "${out}/spu", "--out", "${out}/spu/spu_workloads.c", "--constructor", "--allow-partial"],
+  ["${python}", "tools/spu_lift_jobs.py", "--manifest", "tools/spu_jobs-jp127.json", "--input", "${eboot}", "--lifted", "${out}/spu", "--out", "${out}/spu/spu_jobs_register.c"]
+]
+
+# No --insn-patches: the JP target starts with no game-address instruction
+# patches (config/insn-patches-jp127.json lists the US ones and their JP status).
+[[stages]]
+name = "lift"
+inputs = [
+  "A:/hsg-ultimate/eboot/jp127.elf",
+  "A:/hsg-ultimate/analysis/jp127.functions.json",
+  "A:/hsg-ultimate/analysis/jp127.imports.json",
+  "external/ps3recomp/tools/ppu_lifter.py",
+  "external/ps3recomp/tools/gen_hle_nids.py",
+  "tools/jp_lift_hooks.py"
+]
+outputs = ["A:/hsg-ultimate/generated/recompiled"]
+commands = [
+  ["${python}", "${ps3recomp}/tools/ppu_lifter.py", "${eboot}", "--functions", "${out}/analysis/jp127.functions.json", "--hle-stubs", "${out}/analysis/jp127.imports.json", "--code-end", "0xd27698", "--chunks", "64", "--output", "${out}/generated/recompiled"],
+  ["${python}", "tools/jp_lift_hooks.py", "${out}/generated/recompiled"],
+  ["${python}", "${ps3recomp}/tools/gen_hle_nids.py", "--all", "--out", "${out}/generated/recompiled/ppu_hle_nids.cpp"]
+]
+
+[[stages]]
+name = "build"
+inputs = [
+  "A:/hsg-ultimate/generated/recompiled",
+  "port",
+  "external/ps3recomp"
+]
+outputs = ["A:/hsg-ultimate/build/HotShotsGolfRecomp.exe"]
+commands = [
+  ["${cmake}", "-S", "port", "-B", "${out}/build", "-G", "Ninja", "-DPS3RECOMP_DIR=${root}/${ps3recomp}", "-DRECOMP_DIR=${out}/generated/recompiled", "-DHSG_TARGET_PROFILE=jp-1.27", "-DPython3_EXECUTABLE=${root}/${python}", "-DPORT_SPU_INPUTS:STRING=", "-DSPU_DIR=${out}/spu", "-DCMAKE_CXX_FLAGS:STRING=", "-DCMAKE_EXE_LINKER_FLAGS:STRING=", "-DCMAKE_C_COMPILER=${root}/${clang_cl}", "-DCMAKE_C_COMPILER_ARG1=--driver-mode=cl", "-DCMAKE_CXX_COMPILER=${root}/${clang_cl}", "-DCMAKE_CXX_COMPILER_ARG1=--driver-mode=cl", "-DCMAKE_BUILD_TYPE=Release"],
+  ["${cmake}", "--build", "${out}/build", "--config", "Release"]
+]

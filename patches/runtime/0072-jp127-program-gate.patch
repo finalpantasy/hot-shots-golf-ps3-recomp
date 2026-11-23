@@ -1,0 +1,133 @@
+diff --git a/libs/system/hsg_dlc_earn.c b/libs/system/hsg_dlc_earn.c
+index fe89b42..5b8253e 100644
+--- a/libs/system/hsg_dlc_earn.c
++++ b/libs/system/hsg_dlc_earn.c
+@@ -373,6 +373,10 @@ static int ends_with(const char* s, const char* suf)
+ int hsg_dlc_earn_resolve(const char* host_path, char* out, size_t cap)
+ {
+     if (!earn_on() || !host_path) return 0;
++    {   /* US 1.03 data (challenge_param.US_01.xb, NPUA80864 licences) only. */
++        extern int hsg_program_is_jp127(void);
++        if (hsg_program_is_jp127()) return 0;
++    }
+     char p[1100];
+     snprintf(p, sizeof p, "%s", host_path);
+     for (char* c = p; *c; c++) if (*c == '\\') *c = '/';
+diff --git a/libs/system/hsg_fps.c b/libs/system/hsg_fps.c
+index b2f0080..af3cad2 100644
+--- a/libs/system/hsg_fps.c
++++ b/libs/system/hsg_fps.c
+@@ -117,6 +117,13 @@ void hsg_fps_boot(void)
+ {
+     const char* e = getenv("HSG_FPS");
+     if (!e || !*e) return;
++    {   /* Every address here is the US 1.03 EBOOT's (hsg_program.c). */
++        extern int hsg_program_is_jp127(void);
++        if (hsg_program_is_jp127()) {
++            fprintf(stderr, "[fps] HSG_FPS=%s ignored: JP 1.27 program, the frame route has US 1.03 addresses\n", e);
++            return;
++        }
++    }
+     int fps = atoi(e);
+     const char* lg = getenv("HSG_FPS_LOG");
+     if (lg && *lg && (fps == 30 || fps == 60 || fps == 90 || fps == 120)) {
+diff --git a/libs/system/hsg_tweaks.c b/libs/system/hsg_tweaks.c
+index 5ea4fbf..ac9763f 100644
+--- a/libs/system/hsg_tweaks.c
++++ b/libs/system/hsg_tweaks.c
+@@ -284,6 +284,13 @@ static int cond_ok(const tweak* t)
+ 
+ static void apply_insn(void)
+ {
++    {   /* k_insn holds US 1.03 addresses (hsg_program.c); the JP lift has none of them. */
++        extern int hsg_program_is_jp127(void);
++        if (hsg_program_is_jp127()) {
++            fprintf(stderr, "[TWEAK] insn entries ignored: JP 1.27 program (k_insn is US 1.03)\n");
++            return;
++        }
++    }
+     for (jn* e = s_insn_list ? s_insn_list->kid : NULL; e; e = e->next) {
+         double f; unsigned long long a = 0, w = 0;
+         jn* ja = j_get(e, "addr"); jn* jw = j_get(e, "value");
+diff --git a/libs/system/hsg_widecull.c b/libs/system/hsg_widecull.c
+index 18a5428..7bf6079 100644
+--- a/libs/system/hsg_widecull.c
++++ b/libs/system/hsg_widecull.c
+@@ -47,6 +47,13 @@ void hsg_widecull_boot(void)
+ {
+     const char* e = getenv("RSX_ASPECT");
+     if (!e || strcmp(e, "expand") != 0) return;
++    {   /* The k word and the culling patches are the US 1.03 EBOOT's (hsg_program.c). */
++        extern int hsg_program_is_jp127(void);
++        if (hsg_program_is_jp127()) {
++            fprintf(stderr, "[widecull] JP 1.27 program: culling left at 16:9 (US 1.03 addresses)\n");
++            return;
++        }
++    }
+     {   /* HSG_WIDECULL=0: keep the title's 16:9 culling (A/B checks). */
+         const char* o = getenv("HSG_WIDECULL");
+         if (o && o[0] == '0') {
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 9d7fa27..5e2f1c9 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3693,6 +3693,7 @@ static int32_t g_ppu_primary_priority = 1001;
+ extern "C" void hsg_tweaks_boot(void);   /* libs/system/hsg_tweaks.c */
+ extern "C" void hsg_widecull_boot(void);  /* libs/system/hsg_widecull.c */
+ extern "C" void hsg_fps_boot(void);       /* libs/system/hsg_fps.c */
++extern "C" void hsg_program_identify(const uint8_t* elf, size_t size);  /* libs/system/hsg_program.c */
+ extern "C" uint32_t ppu_load_elf(const char* path)
+ {
+     g_ppu_primary_priority = 1001;
+@@ -3708,6 +3709,8 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+     if (sz < 64 || memcmp(file, "\x7F""ELF", 4) != 0 || file[4] != 2 /*ELFCLASS64*/ || file[5] != 2 /*MSB*/) {
+         fprintf(stderr, "[ppu] not a 64-bit big-endian ELF\n"); free(file); return 0;
+     }
++    /* US 1.03 or JP 1.27: the HSG address patches check this (hsg_program.c). */
++    hsg_program_identify(file, (size_t)sz);
+     uint64_t fsz = (uint64_t)sz;
+     uint32_t entry = (uint32_t)be64(file + 24);
+     uint64_t phoff = be64(file + 32);
+diff --git a/libs/system/hsg_program.c b/libs/system/hsg_program.c
+new file mode 100644
+index 0000000..848e779
+--- /dev/null
++++ b/libs/system/hsg_program.c
+@@ -0,0 +1,37 @@
++/*
++ * ps3recomp - which Hot Shots Golf program is loaded
++ *
++ * The HSG runtime patches (hsg_fps.c, hsg_widecull.c, hsg_tweaks.c,
++ * hsg_dlc_earn.c) hold game addresses and file names of the US 1.03 EBOOT
++ * (NPUA80864). The same runtime also runs the JP 1.27 EBOOT (Minna no Golf 6,
++ * BCJS30089), where those addresses are other code and data. ppu_load_elf
++ * hands the ELF file to hsg_program_identify() before any guest code runs; it
++ * is recognised by the FNV-1a-64 of the whole file. On the JP program each
++ * US-address patch stands down (hsg_program_is_jp127() != 0). Any other file,
++ * the US 1.03 and fixed 1.02 EBOOTs included, leaves everything as it was.
++ */
++#include <stdio.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define HSG_JP127_SIZE  14406392u
++#define HSG_JP127_FNV   0xA5E6D63E17879474ull   /* SHA-256 d981eb70...bcab5960 */
++
++static int s_jp127;
++
++void hsg_program_identify(const uint8_t* elf, size_t size)
++{
++    s_jp127 = 0;
++    if (!elf || size != HSG_JP127_SIZE) return;
++    uint64_t h = 1469598103934665603ull;
++    for (size_t i = 0; i < size; i++) h = (h ^ elf[i]) * 1099511628211ull;
++    if (h == HSG_JP127_FNV) {
++        s_jp127 = 1;
++        fprintf(stderr, "[hsg] program: JP 1.27 (BCJS30089); US 1.03 address patches off\n");
++    }
++}
++
++int hsg_program_is_jp127(void)
++{
++    return s_jp127;
++}
