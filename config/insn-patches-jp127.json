@@ -1,6 +1,182 @@
 {
- "comment": "JP 1.27 (BCJS30089) has no game-address instruction patches yet: 'patches' is empty and pipeline-jp127.toml lifts without --insn-patches. 'us_1_03_mapping' maps each US 1.03 patch (config/insn-patches-1.03.json) to its JP address by matching masked code around it (tools/jp_addr_map.py); every one of them is an optional feature (HSG_TWEAKS boot menu, ultrawide culling, HSG_FPS) whose runtime side stands down on the JP program (libs/system/hsg_program.c).",
- "patches": [],
+ "comment": "JP 1.27 (BCJS30089) game-address instruction patches. 'patches' holds the HSG_FPS lines (guard g_hsg_fps; runtime libs/system/hsg_fps.c, JP address set), each mapped from the US 1.03 line by side-by-side disassembly; pipeline-jp127.toml lifts with --insn-patches this file. 'us_1_03_mapping' maps each US 1.03 patch (config/insn-patches-1.03.json) to its JP address (tools/jp_addr_map.py, fps lines by disassembly); the HSG_TWEAKS and ultrawide-cull lines are still not applied (their runtime side is off on JP, libs/system/hsg_program.c). Note US 0x1B150 has a second JP copy at 0x1B3D8 that needs no patch: it follows stb 1 to +4 at 0x1B3A0.",
+ "patches": [
+  {
+   "addr": "0x00018A14",
+   "orig": "0x88090004",
+   "new": "0x38000001",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_IsInterpSubFrame: sub-frame whenever S != 0 (not only in slow motion) [JP 1.27; US 1.03 line 0x00018A14]"
+  },
+  {
+   "addr": "0x00018B2C",
+   "orig": "0x91680008",
+   "new": "0x8149FFE4",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (start): r10 = K (drops S=0; Main_Tick sets S=-1 on start) [JP 1.27; US 1.03 line 0x00018B2C]"
+  },
+  {
+   "addr": "0x00018B38",
+   "orig": "0x99680004",
+   "new": "0x7C6351D6",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (start): divisor = n * K (drops A=0, already 0 here) [JP 1.27; US 1.03 line 0x00018B38]"
+  },
+  {
+   "addr": "0x00018B84",
+   "orig": "0x7C6B07B4",
+   "new": "0x816AFFE4",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r11 = K [JP 1.27; US 1.03 line 0x00018B84]"
+  },
+  {
+   "addr": "0x00018B88",
+   "orig": "0x81280008",
+   "new": "0x7C6359D6",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r3 = n * K (new divisor) [JP 1.27; US 1.03 line 0x00018B88]"
+  },
+  {
+   "addr": "0x00018B8C",
+   "orig": "0x39080008",
+   "new": "0x7C6B07B4",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r11 = n * K for the S rescale [JP 1.27; US 1.03 line 0x00018B8C]"
+  },
+  {
+   "addr": "0x00018B94",
+   "orig": "0x7D2907B4",
+   "new": "0xE928000A",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r9 = S, sign-extended (moved from 0x18B88) [JP 1.27; US 1.03 line 0x00018B94]"
+  },
+  {
+   "addr": "0x00018BAC",
+   "orig": "0x7C0007B4",
+   "new": "0x39080008",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r8 = &S (moved from 0x18B8C; drops extsw of the old divisor, always > 0) [JP 1.27; US 1.03 line 0x00018BAC]"
+  },
+  {
+   "addr": "0x00018BF4",
+   "orig": "0x38000001",
+   "new": "0x81228250",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_StopSlowMotion: r9 = &divisor [JP 1.27; US 1.03 line 0x00018BF4]"
+  },
+  {
+   "addr": "0x00018BF8",
+   "orig": "0x39200000",
+   "new": "0x8009FFE4",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_StopSlowMotion: r0 = K [JP 1.27; US 1.03 line 0x00018BF8]"
+  },
+  {
+   "addr": "0x00018BFC",
+   "orig": "0x980B0019",
+   "new": "0xB00B0018",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_StopSlowMotion: halfword at +0x18: start request 0, stop request K (nonzero) [JP 1.27; US 1.03 line 0x00018BFC]"
+  },
+  {
+   "addr": "0x00018C00",
+   "orig": "0x992B0018",
+   "new": "0x90090000",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): App_StopSlowMotion: divisor = K [JP 1.27; US 1.03 line 0x00018C00]"
+  },
+  {
+   "addr": "0x00018C18",
+   "orig": "0xC0028254",
+   "new": "0xC009FFE0",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Game_GetTimeScale: K / divisor (= 1/n, the game's slow-motion scale) [JP 1.27; US 1.03 line 0x00018C18]"
+  },
+  {
+   "addr": "0x000192A8",
+   "orig": "0x881F0004",
+   "new": "0x38000001",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Render: phase 4 InterpDraw(fraction) instead of phase 2 Draw (base InterpDraw calls Draw) [JP 1.27; US 1.03 line 0x000192A8]"
+  },
+  {
+   "addr": "0x0001B0D0",
+   "orig": "0x881E0004",
+   "new": "0x38000001",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: always take the fixed-step + interpolation path (was: slow motion active) [JP 1.27; US 1.03 line 0x0001B150]"
+  },
+  {
+   "addr": "0x0001B150",
+   "orig": "0x881E0004",
+   "new": "0x38000001",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: phase 3 InterpUpdate(fraction) every tick [JP 1.27; US 1.03 line 0x0001B1D0]"
+  },
+  {
+   "addr": "0x0001B858",
+   "orig": "0x881E0004",
+   "new": "0x38000001",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: renderer step flag 1 on logic ticks, as in slow motion (the interp path after the logic phases steps the renderer clock a second time) [JP 1.27; US 1.03 line 0x0001B6DC]"
+  },
+  {
+   "addr": "0x0001B420",
+   "orig": "0x881E0004",
+   "new": "0x38000001",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: renderer rate multiplier on every tick [JP 1.27; US 1.03 line 0x0001B7A8]"
+  },
+  {
+   "addr": "0x0001B444",
+   "orig": "0xFC006818",
+   "new": "0xC009FFEC",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: renderer rate = 30 * M (M = 1 / steps this frame, from hsg_fps.c) [JP 1.27; US 1.03 line 0x0001B7CC]"
+  },
+  {
+   "addr": "0x008DEED8",
+   "orig": "0x3800003C",
+   "new": "0x3800001E",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Renderer_WaitVBlankAndFlip: interval 30/fps - 1: flip on every vblank at the 30 FPS setting [JP 1.27; US 1.03 line 0x008CF894]"
+  },
+  {
+   "addr": "0x00019560",
+   "orig": "0x7D2907B4",
+   "new": "0x3D200190",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Render: lis r9,0x190 (was extsw r9,r9 of S+1; the S+1 / D conversion below is now dead) [JP 1.27; US 1.03 line 0x00019528]"
+  },
+  {
+   "addr": "0x0001958C",
+   "orig": "0xEC200824",
+   "new": "0xC029FFF0",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Render: phase 4 fraction f1 = lfs 0x18FFFF0 (draw fraction from hsg_fps.c, was fdivs (S+1)/D) [JP 1.27; US 1.03 line 0x00019554]"
+  },
+  {
+   "addr": "0x0001B7CC",
+   "orig": "0x7D2907B4",
+   "new": "0x3D200190",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: lis r9,0x190 (was extsw r9,r9 of S+1; the S+1 / D conversion below is now dead) [JP 1.27; US 1.03 line 0x0001B65C]"
+  },
+  {
+   "addr": "0x0001B7FC",
+   "orig": "0xEC200824",
+   "new": "0xC029FFF0",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: phase 3 fraction f1 = lfs 0x18FFFF0 (draw fraction from hsg_fps.c, was fdivs (S+1)/D) [JP 1.27; US 1.03 line 0x0001B68C]"
+  },
+  {
+   "addr": "0x0091D280",
+   "orig": "0xC3A2A8C0",
+   "new": "0xC3A2E410",
+   "guard": "g_hsg_fps",
+   "note": "fps (HSG_FPS, hsg_fps.c): renderer effect-timer step 0x90DC18: skip threshold f29 = lfs 0xDAC414 (was 0.0); 1e30 on frames that close no stock 30 Hz frame, so its per-call countdowns keep the stock rate [JP 1.27; US 1.03 line 0x0090DC3C]"
+  }
+ ],
  "us_1_03_mapping": [
   {
    "us_addr": "0x0001C0C8",
@@ -175,7 +351,7 @@
    "jp_addr": "0x00018A14",
    "jp_word": "0x88090004",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_IsInterpSubFrame: sub-frame whenever S != 0 (not only in slow motion)"
   },
   {
@@ -187,7 +363,7 @@
    "jp_addr": "0x00018B2C",
    "jp_word": "0x91680008",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (start): r10 = K (drops S=0; Main_Tick sets S=-1 on start)"
   },
   {
@@ -199,7 +375,7 @@
    "jp_addr": "0x00018B38",
    "jp_word": "0x99680004",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (start): divisor = n * K (drops A=0, already 0 here)"
   },
   {
@@ -211,7 +387,7 @@
    "jp_addr": "0x00018B84",
    "jp_word": "0x7C6B07B4",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r11 = K"
   },
   {
@@ -223,7 +399,7 @@
    "jp_addr": "0x00018B88",
    "jp_word": "0x81280008",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r3 = n * K (new divisor)"
   },
   {
@@ -235,7 +411,7 @@
    "jp_addr": "0x00018B8C",
    "jp_word": "0x39080008",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r11 = n * K for the S rescale"
   },
   {
@@ -247,7 +423,7 @@
    "jp_addr": "0x00018B94",
    "jp_word": "0x7D2907B4",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r9 = S, sign-extended (moved from 0x18B88)"
   },
   {
@@ -259,7 +435,7 @@
    "jp_addr": "0x00018BAC",
    "jp_word": "0x7C0007B4",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_SetSlowMotion (active): r8 = &S (moved from 0x18B8C; drops extsw of the old divisor, always > 0)"
   },
   {
@@ -271,7 +447,7 @@
    "jp_addr": "0x00018BF4",
    "jp_word": "0x38000001",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_StopSlowMotion: r9 = &divisor"
   },
   {
@@ -283,7 +459,7 @@
    "jp_addr": "0x00018BF8",
    "jp_word": "0x39200000",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_StopSlowMotion: r0 = K"
   },
   {
@@ -295,7 +471,7 @@
    "jp_addr": "0x00018BFC",
    "jp_word": "0x980B0019",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_StopSlowMotion: halfword at +0x18: start request 0, stop request K (nonzero)"
   },
   {
@@ -307,7 +483,7 @@
    "jp_addr": "0x00018C00",
    "jp_word": "0x992B0018",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): App_StopSlowMotion: divisor = K"
   },
   {
@@ -319,7 +495,7 @@
    "jp_addr": "0x00018C18",
    "jp_word": "0xC0028254",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): Game_GetTimeScale: K / divisor (= 1/n, the game's slow-motion scale)"
   },
   {
@@ -327,78 +503,72 @@
    "guard": "g_hsg_fps",
    "us_orig": "0x881F0004",
    "us_new": "0x38000001",
-   "match": "window match (+-6 insns)",
+   "match": "disassembly",
    "jp_addr": "0x000192A8",
    "jp_word": "0x881F0004",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
-   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Render: phase 4 InterpDraw(fraction) instead of phase 2 Draw (base InterpDraw calls Draw)",
-   "review": "window match inside a function whose length changed; check the surrounding code before using"
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Render: phase 4 InterpDraw(fraction) instead of phase 2 Draw (base InterpDraw calls Draw)"
   },
   {
    "us_addr": "0x0001B150",
    "guard": "g_hsg_fps",
    "us_orig": "0x881E0004",
    "us_new": "0x38000001",
-   "match": "no match",
-   "jp_addr": null,
-   "jp_word": null,
-   "orig_same": null,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
-   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: always take the fixed-step + interpolation path (was: slow motion active)",
-   "review": "no unique JP match; function changed in JP 1.27"
+   "match": "disassembly",
+   "jp_addr": "0x0001B0D0",
+   "jp_word": "0x881E0004",
+   "orig_same": true,
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: always take the fixed-step + interpolation path (was: slow motion active)"
   },
   {
    "us_addr": "0x0001B1D0",
    "guard": "g_hsg_fps",
    "us_orig": "0x881E0004",
    "us_new": "0x38000001",
-   "match": "window match (+-6 insns)",
+   "match": "disassembly",
    "jp_addr": "0x0001B150",
    "jp_word": "0x881E0004",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
-   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: phase 3 InterpUpdate(fraction) every tick",
-   "review": "window match inside a function whose length changed; check the surrounding code before using"
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: phase 3 InterpUpdate(fraction) every tick"
   },
   {
    "us_addr": "0x0001B6DC",
    "guard": "g_hsg_fps",
    "us_orig": "0x881E0004",
    "us_new": "0x38000001",
-   "match": "window match (+-6 insns)",
+   "match": "disassembly",
    "jp_addr": "0x0001B858",
    "jp_word": "0x881E0004",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
-   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: renderer step flag 1 on logic ticks, as in slow motion (the interp path after the logic phases steps the renderer clock a second time)",
-   "review": "window match inside a function whose length changed; check the surrounding code before using"
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: renderer step flag 1 on logic ticks, as in slow motion (the interp path after the logic phases steps the renderer clock a second time)"
   },
   {
    "us_addr": "0x0001B7A8",
    "guard": "g_hsg_fps",
    "us_orig": "0x881E0004",
    "us_new": "0x38000001",
-   "match": "no match",
-   "jp_addr": null,
-   "jp_word": null,
-   "orig_same": null,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
-   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: renderer rate multiplier on every tick",
-   "review": "no unique JP match; function changed in JP 1.27"
+   "match": "disassembly",
+   "jp_addr": "0x0001B420",
+   "jp_word": "0x881E0004",
+   "orig_same": true,
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: renderer rate multiplier on every tick"
   },
   {
    "us_addr": "0x0001B7CC",
    "guard": "g_hsg_fps",
    "us_orig": "0xFC006818",
    "us_new": "0xC009FFEC",
-   "match": "no match",
-   "jp_addr": null,
-   "jp_word": null,
-   "orig_same": null,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
-   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: renderer rate = 30 * M (M = 1 / steps this frame, from hsg_fps.c)",
-   "review": "no unique JP match; function changed in JP 1.27"
+   "match": "disassembly",
+   "jp_addr": "0x0001B444",
+   "jp_word": "0xFC006818",
+   "orig_same": true,
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: renderer rate = 30 * M (M = 1 / steps this frame, from hsg_fps.c)"
   },
   {
    "us_addr": "0x008CF894",
@@ -409,8 +579,68 @@
    "jp_addr": "0x008DEED8",
    "jp_word": "0x3800003C",
    "orig_same": true,
-   "jp_status": "not applied: not needed to boot (optional feature; its runtime side is off on JP)",
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23)",
    "us_note": "fps (HSG_FPS, hsg_fps.c): Renderer_WaitVBlankAndFlip: interval 30/fps - 1: flip on every vblank at the 30 FPS setting"
+  },
+  {
+   "us_addr": "0x00019528",
+   "guard": "g_hsg_fps",
+   "us_orig": "0x7D2907B4",
+   "us_new": "0x3D20018F",
+   "match": "disassembly",
+   "jp_addr": "0x00019560",
+   "jp_word": "0x7D2907B4",
+   "orig_same": true,
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23); new word lis r9,0x190",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Render: lis r9,0x18F (was extsw r9,r9 of S+1; the S+1 / D conversion below is now dead)"
+  },
+  {
+   "us_addr": "0x00019554",
+   "guard": "g_hsg_fps",
+   "us_orig": "0xEC200824",
+   "us_new": "0xC029FFF0",
+   "match": "disassembly",
+   "jp_addr": "0x0001958C",
+   "jp_word": "0xEC200824",
+   "orig_same": true,
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23); new word lfs 0x18FFFF0",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Render: phase 4 fraction f1 = lfs 0x18EFFF0 (draw fraction from hsg_fps.c, was fdivs (S+1)/D)"
+  },
+  {
+   "us_addr": "0x0001B65C",
+   "guard": "g_hsg_fps",
+   "us_orig": "0x7D2907B4",
+   "us_new": "0x3D20018F",
+   "match": "disassembly",
+   "jp_addr": "0x0001B7CC",
+   "jp_word": "0x7D2907B4",
+   "orig_same": true,
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23); new word lis r9,0x190",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: lis r9,0x18F (was extsw r9,r9 of S+1; the S+1 / D conversion below is now dead)"
+  },
+  {
+   "us_addr": "0x0001B68C",
+   "guard": "g_hsg_fps",
+   "us_orig": "0xEC200824",
+   "us_new": "0xC029FFF0",
+   "match": "disassembly",
+   "jp_addr": "0x0001B7FC",
+   "jp_word": "0xEC200824",
+   "orig_same": true,
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23); new word lfs 0x18FFFF0",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): Main_Tick: phase 3 fraction f1 = lfs 0x18EFFF0 (draw fraction from hsg_fps.c, was fdivs (S+1)/D)"
+  },
+  {
+   "us_addr": "0x0090DC3C",
+   "guard": "g_hsg_fps",
+   "us_orig": "0xC3A2A6CC",
+   "us_new": "0xC3A2E1C4",
+   "match": "disassembly",
+   "jp_addr": "0x0091D280",
+   "jp_word": "0xC3A2A8C0",
+   "orig_same": true,
+   "jp_status": "applied (patches above): verified by side-by-side disassembly (11-23); new word lfs f29,-0x1BF0(r2) = 0xDAC414",
+   "us_note": "fps (HSG_FPS, hsg_fps.c): renderer effect-timer step 0x90DC18: skip threshold f29 = lfs 0xD9C214 (was 0.0); 1e30 on frames that close no stock 30 Hz frame, so its per-call countdowns keep the stock rate"
   }
  ]
 }

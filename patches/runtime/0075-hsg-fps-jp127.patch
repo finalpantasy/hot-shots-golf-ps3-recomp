@@ -1,0 +1,146 @@
+diff --git a/libs/system/hsg_fps.c b/libs/system/hsg_fps.c
+--- a/libs/system/hsg_fps.c
++++ b/libs/system/hsg_fps.c
+@@ -85,6 +85,17 @@
+  * many snapshot frames switch to 2 frames per step (back at the end), so a word's
+  * change per logic step can be compared at two frame rates in one run). A "[fps]" line every 10 s gives frames/s, logic steps/s
+  * and the renderer clock rate (game seconds per wall second).
++ *
++ * The addresses above are the US 1.03 EBOOT's. The JP 1.27 EBOOT (BCJS30089,
++ * hsg_program.c) has the same code at other addresses; hsg_fps_boot() picks
++ * the set by program (k_us / k_jp127 below). JP 1.27, each checked by its
++ * code: data +0x10000 (TLS template ends at 0xDAC398, the words below are
++ * zero padding that nothing refers to, divisor block 0xDAC410 used at +0, +8,
++ * +0x48, +0xC8 only), GameMain 0xDC8F80, sequence 0xDC8F68, renderer pointer
++ * 0x18E87EC, .bss end 0x18FE030 (A at 0x18FFFF0, same 64 KB page), input
++ * device vcall returning to 0x9E4F00, UI vcalls returning to 0x1B590 /
++ * 0x1B06C / 0x1B098 (Main_Tick 0x1AC44). Its "fps" lines are in
++ * config/insn-patches-jp127.json.
+  */
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -100,16 +111,42 @@
+ #include <time.h>
+ #endif
+ 
+-#define HSG_FPS_KF_ADDR   0x00D9C1F0u
+-#define HSG_FPS_K_ADDR    0x00D9C1F4u
+-#define HSG_FPS_M_ADDR    0x00D9C1FCu
+-#define HSG_FPS_A_ADDR    0x018EFFF0u   /* f32 draw fraction, past .bss */
+-#define HSG_FPS_G_ADDR    0x00D9C214u   /* f32 effect-timer skip threshold */
+-#define HSG_BSS_END       0x018ED4B0u   /* end of the EBOOT's last segment (memsz) */
+-#define HSG_DIV_ADDR      0x00D9C210u   /* slow-motion divisor D */
+-#define HSG_GAMEMAIN      0x00DB8D80u   /* +4 slow motion on, +8 S */
+-#define HSG_SEQ_PTR       0x00DB8D68u   /* [ptr]+0xC: global sequence */
+-#define HSG_RENDERER_PTR  0x018D7C6Cu   /* [ptr]+0x260: target FPS */
++/* Game addresses of one program (US 1.03 or JP 1.27). */
++typedef struct {
++    u32 kf, k, m, a, g;       /* guest words: f32 K, s32 K, f32 M, f32 draw fraction, f32 gate */
++    u32 bss_end;              /* end of the EBOOT's last segment (memsz) */
++    u32 div;                  /* slow-motion divisor D */
++    u32 gamemain;             /* +0 tick, +4 slow motion on, +8 S */
++    u32 seq_ptr;              /* [ptr]+0xC: global sequence */
++    u32 renderer_ptr;         /* [ptr]+0x260: target FPS */
++    u32 lr_input;             /* Input_Update's device vcall returns here */
++    u32 lr_ui[3];             /* Main_Tick's per-frame UI vcalls return here */
++    u32 snap_lo, snap_hi;     /* .data/.bss span for HSG_FPS_SNAP */
++    int dbg_slots;            /* HSG_FPS_DEBUG slot list is this program's */
++} hsg_fps_addrs;
++
++static const hsg_fps_addrs k_us = {
++    0x00D9C1F0u, 0x00D9C1F4u, 0x00D9C1FCu, 0x018EFFF0u, 0x00D9C214u,
++    0x018ED4B0u, 0x00D9C210u, 0x00DB8D80u, 0x00DB8D68u, 0x018D7C6Cu,
++    0x009D58BCu, { 0x0001AFF0u, 0x0001B078u, 0x0001B0A4u },
++    0x00D20000u, 0x018F0000u, 1 };
++static const hsg_fps_addrs k_jp127 = {
++    0x00DAC3F0u, 0x00DAC3F4u, 0x00DAC3FCu, 0x018FFFF0u, 0x00DAC414u,
++    0x018FE030u, 0x00DAC410u, 0x00DC8F80u, 0x00DC8F68u, 0x018E87ECu,
++    0x009E4F00u, { 0x0001B590u, 0x0001B06Cu, 0x0001B098u },
++    0x00D30000u, 0x01900000u, 0 };
++static const hsg_fps_addrs* s_ad = &k_us;
++
++#define HSG_FPS_KF_ADDR   (s_ad->kf)
++#define HSG_FPS_K_ADDR    (s_ad->k)
++#define HSG_FPS_M_ADDR    (s_ad->m)
++#define HSG_FPS_A_ADDR    (s_ad->a)      /* f32 draw fraction, past .bss */
++#define HSG_FPS_G_ADDR    (s_ad->g)      /* f32 effect-timer skip threshold */
++#define HSG_BSS_END       (s_ad->bss_end)
++#define HSG_DIV_ADDR      (s_ad->div)    /* slow-motion divisor D */
++#define HSG_GAMEMAIN      (s_ad->gamemain)
++#define HSG_SEQ_PTR       (s_ad->seq_ptr)
++#define HSG_RENDERER_PTR  (s_ad->renderer_ptr)
+ #define HSG_SEQ_GAME      0x49u
+ #define HSG_FPS_K         240           /* sub-steps per logic step: < 256, low byte != 0 */
+ 
+@@ -174,12 +211,10 @@ void hsg_fps_boot(void)
+ {
+     const char* e = getenv("HSG_FPS");
+     if (!e || !*e) return;
+-    {   /* Every address here is the US 1.03 EBOOT's (hsg_program.c). */
++    {   /* US 1.03 or JP 1.27 addresses (hsg_program.c). */
+         extern int hsg_program_is_jp127(void);
+-        if (hsg_program_is_jp127()) {
+-            fprintf(stderr, "[fps] HSG_FPS=%s ignored: JP 1.27 program, the frame route has US 1.03 addresses\n", e);
+-            return;
+-        }
++        s_ad = hsg_program_is_jp127() ? &k_jp127 : &k_us;
++        if (s_ad == &k_jp127) fprintf(stderr, "[fps] JP 1.27 program: JP 1.27 frame route addresses\n");
+     }
+     int fps = 0;
+     if (!strcmp(e, "unlocked") || !strcmp(e, "max")) fps = -1;
+@@ -275,13 +310,13 @@ void hsg_fps_poll(u32 port_no);
+ int hsg_fps_skip_icall(u32 lr, u64* r4)
+ {
+     if (!s_on) return 0;
+-    if (lr == 0x009D58BCu) {
++    if (lr == s_ad->lr_input) {
+         hsg_fps_poll(0);
+         if (s_on && s_hold && !s_ui_frames && r4) *r4 = 0;
+         return 0;
+     }
+     if (!s_hold || s_ui_frames) return 0;
+-    return lr == 0x0001AFF0u || lr == 0x0001B078u || lr == 0x0001B0A4u;
++    return lr == s_ad->lr_ui[0] || lr == s_ad->lr_ui[1] || lr == s_ad->lr_ui[2];
+ }
+ 
+ /* Frame cap period for the current settings: none when unlocked, or when the
+@@ -320,7 +355,7 @@ static void set_guard(int on)
+     {   /* HSG_FPS_DEBUG=1: the per-tick virtual calls Main_Tick makes on every frame. */
+         static int dbg = -1;
+         if (dbg < 0) { const char* e = getenv("HSG_FPS_DEBUG"); dbg = e && *e == '1'; }
+-        if (dbg && on) {
++        if (dbg && on && s_ad->dbg_slots) {   /* US 1.03 slots */
+             static const u32 slot[][2] = { {0x18A414Cu, 0xC}, {0x18A4154u, 0xC}, {0x185EFE0u, 0x10},
+                                            {0x18A7104u, 0x40}, {0x18A7100u, 0x40}, {0x18A7128u, 0x40} };
+             for (int i = 0; i < 6; i++) {
+@@ -527,7 +562,7 @@ static void snap_frame(void)
+         return;
+     }
+     if (idx == 0) {
+-        static const u32 span[][2] = { {0x00D20000u, 0x018F0000u}, {0x10000000u, 0x20000000u} };
++        const u32 span[][2] = { {s_ad->snap_lo, s_ad->snap_hi}, {0x10000000u, 0x20000000u} };
+         for (int k = 0; k < 2; k++) {
+             u32 x = span[k][0];
+             while (x < span[k][1] && nrg < 8192) {
+diff --git a/libs/system/hsg_program.c b/libs/system/hsg_program.c
+--- a/libs/system/hsg_program.c
++++ b/libs/system/hsg_program.c
+@@ -7,7 +7,8 @@
+  * BCJS30089), where those addresses are other code and data. ppu_load_elf
+  * hands the ELF file to hsg_program_identify() before any guest code runs; it
+  * is recognised by the FNV-1a-64 of the whole file. On the JP program each
+- * US-address patch stands down (hsg_program_is_jp127() != 0). Any other file,
++ * US-address patch stands down (hsg_program_is_jp127() != 0); hsg_fps.c
++ * switches to its JP 1.27 address set instead. Any other file,
+  * the US 1.03 and fixed 1.02 EBOOTs included, leaves everything as it was.
+  */
+ #include <stdio.h>
+@@ -27,7 +28,7 @@ void hsg_program_identify(const uint8_t* elf, size_t size)
+     for (size_t i = 0; i < size; i++) h = (h ^ elf[i]) * 1099511628211ull;
+     if (h == HSG_JP127_FNV) {
+         s_jp127 = 1;
+-        fprintf(stderr, "[hsg] program: JP 1.27 (BCJS30089); US 1.03 address patches off\n");
++        fprintf(stderr, "[hsg] program: JP 1.27 (BCJS30089); US 1.03 address patches off, HSG_FPS on JP addresses\n");
+     }
+ }
+ 

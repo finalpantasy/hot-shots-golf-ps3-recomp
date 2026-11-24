@@ -46,8 +46,9 @@ commands = [
   ["${python}", "tools/spu_lift_jobs.py", "--manifest", "tools/spu_jobs-jp127.json", "--input", "${eboot}", "--lifted", "${out}/spu", "--out", "${out}/spu/spu_jobs_register.c"]
 ]
 
-# No --insn-patches: the JP target starts with no game-address instruction
-# patches (config/insn-patches-jp127.json lists the US ones and their JP status).
+# --insn-patches config/insn-patches-jp127.json: the JP game-address instruction
+# patches (the HSG_FPS lines, guard g_hsg_fps); the file also lists the US ones
+# and their JP status.
 [[stages]]
 name = "lift"
 inputs = [
@@ -56,11 +57,12 @@ inputs = [
   "A:/hsg-ultimate/analysis/jp127.imports.json",
   "external/ps3recomp/tools/ppu_lifter.py",
   "external/ps3recomp/tools/gen_hle_nids.py",
-  "tools/jp_lift_hooks.py"
+  "tools/jp_lift_hooks.py",
+  "config/insn-patches-jp127.json"
 ]
 outputs = ["A:/hsg-ultimate/generated/recompiled"]
 commands = [
-  ["${python}", "${ps3recomp}/tools/ppu_lifter.py", "${eboot}", "--functions", "${out}/analysis/jp127.functions.json", "--hle-stubs", "${out}/analysis/jp127.imports.json", "--code-end", "0xd27698", "--chunks", "64", "--output", "${out}/generated/recompiled"],
+  ["${python}", "${ps3recomp}/tools/ppu_lifter.py", "${eboot}", "--functions", "${out}/analysis/jp127.functions.json", "--hle-stubs", "${out}/analysis/jp127.imports.json", "--code-end", "0xd27698", "--chunks", "64", "--insn-patches", "config/insn-patches-jp127.json", "--output", "${out}/generated/recompiled"],
   ["${python}", "tools/jp_lift_hooks.py", "${out}/generated/recompiled"],
   ["${python}", "${ps3recomp}/tools/gen_hle_nids.py", "--all", "--out", "${out}/generated/recompiled/ppu_hle_nids.cpp"]
 ]
