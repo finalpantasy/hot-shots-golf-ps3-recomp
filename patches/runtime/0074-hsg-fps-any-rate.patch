@@ -1,0 +1,667 @@
+diff --git a/libs/system/hsg_fps.c b/libs/system/hsg_fps.c
+--- a/libs/system/hsg_fps.c
++++ b/libs/system/hsg_fps.c
+@@ -1,24 +1,32 @@
+ /*
+- * ps3recomp - HSG_FPS=60|90|120: high frame rate for Hot Shots Golf 1.03
++ * ps3recomp - HSG_FPS: high and unlocked frame rates for Hot Shots Golf 1.03
+  *
+  * The title runs its logic at 30 Hz, one step per flip. It already has a
+  * fixed-step + interpolation mode, used for its slow motion: Main_Tick
+  * (0x1AB94) counts a sub-frame S = (S+1) % D (GameMain 0xDB8D80 +8, divisor D
+  * at 0xD9C210), runs the logic phases only when S wraps to 0, and on every
+- * frame runs task phase 3 InterpUpdate((S+1)/D); Main_Render draws with phase
+- * 4 InterpDraw. The "fps" lines of config/insn-patches-1.03.json (guard
++ * frame runs task phase 3 InterpUpdate(f); Main_Render draws with phase 4
++ * InterpDraw(f). The "fps" lines of config/insn-patches-1.03.json (guard
+  * g_hsg_fps) take that path on every frame, outside slow motion too, and this
+  * file drives it:
+  *
++ *   - Logic stays on a fixed 30 Hz clock of host time (an accumulator): a
++ *     frame is a logic step (S = 0) when the clock has reached the next step,
++ *     otherwise an in-between frame (S != 0). In slow motion a step is n/30 s.
++ *   - The draw fraction f is the exact fraction of the step that has passed
++ *     at this frame, a float in [0, 1), written to HSG_FPS_A_ADDR. The game
++ *     computed f = (S+1)/D; the patched Main_Tick (0x1B65C/0x1B68C) and
++ *     Main_Render (0x19528/0x19554) load it from that word instead, so any
++ *     frame rate (144, 165, unlocked) gets an even, fractional f, and a logic
++ *     frame draws the part of the new step that has already passed instead of
++ *     snapping to its start.
+  *   - D = K * n, where n is the game's own slow-motion factor (1 when there is
+- *     none) and K = HSG_FPS_K_ADDR (12: one logic step in twelfths). The
+- *     patched App_SetSlowMotion / App_StopSlowMotion scale by K, and
+- *     Game_GetTimeScale returns K/D (= 1/n, what the game asks for).
+- *   - Before each tick (the title's port-0 pad poll, hsg_fps_poll) S is set
+- *     from host time, so a logic step happens every 1/30 s (n/30 s in slow
+- *     motion) of wall clock whatever the frame rate, and the in-between
+- *     frames draw the fraction of the step that has passed. Below 30 FPS
+- *     every frame is a logic step, as in the stock game.
++ *     none) and K = HSG_FPS_K_ADDR (240). S only marks logic / in-between
++ *     frames now (and App_IsInterpSubFrame); the patched App_SetSlowMotion /
++ *     App_StopSlowMotion scale by K, and Game_GetTimeScale returns K/D
++ *     (= 1/n, what the game asks for). K must stay below 256 with a nonzero
++ *     low byte: App_StopSlowMotion stores it as the halfword +0x18/+0x19 (stop
++ *     request = low byte).
+  *   - The renderer time step (0x8D27AC, renderer +0x280 clock and +0x59C
+  *     phase) gets rate 30 * M with M = 1 / (the steps this frame advanced),
+  *     so the renderer clock follows game time (HSG_FPS_M_ADDR). A logic
+@@ -28,9 +36,21 @@
+  *     layer shifts its history on every poll; a press on an in-between frame
+  *     would be gone before the logic saw it): hsg_fps_pad_filter. Input
+  *     devices get their 2 ticks (60 Hz units) only on logic frames.
+- *   - Flip pacing: the patched Renderer_WaitVBlankAndFlip flips on every
+- *     vblank at the 30 FPS setting; hsg_fps_vblank_ms() asks the present
+- *     thread (cellGcm_fifo_kick_wait) for extra vblanks at 30*N Hz above 60.
++ *   - Renderer effect timers (8 entries at renderer +0x2B0, stride 0x50,
++ *     stepped by 0x90DC18 from the renderer time step: an int countdown at
++ *     +0x34, a float frame count at +0x38 and a random jitter) count one per
++ *     call, not by the step's length: at N frames per logic step they ran N
++ *     times too fast. The patched 0x90DC3C loads the skip threshold from
++ *     HSG_FPS_G_ADDR: 0 (stock) on frames that close a 30 Hz frame of the
++ *     stock game (the logic frame, or 1/30 s of host time in slow motion,
++ *     where the stock game also counted every frame), 1e30 (skip) otherwise.
++ *   - Frame pacing: the frame cap is a deadline cadence on a high-resolution
++ *     waitable timer, taken once per tick before the step decision (so the
++ *     fraction is sampled on an even cadence). The present thread completes
++ *     each flip as soon as it has executed it (hsg_fps_vblank_ms() != 0), so
++ *     the 60 Hz vblank ticker never limits the rate. With vsync on
++ *     (D3D12_VSYNC unset) and a target at or above the display's rate the
++ *     cap is off and the swap chain paces; HSG_FPS=unlocked has no cap.
+  *
+  * The route is on only in SEQ_GAME (0x49, the course) at the 30 FPS setting.
+  * Menus and the 60 FPS swing gauge keep the stock path: in the menus the
+@@ -48,12 +68,23 @@
+  *   HSG_FPS_KF_ADDR 0xD9C1F0  f32 K  (Game_GetTimeScale numerator)
+  *   HSG_FPS_K_ADDR  0xD9C1F4  s32 K  (slow-motion scale)
+  *   HSG_FPS_M_ADDR  0xD9C1FC  f32 M  (renderer rate multiplier)
++ *   HSG_FPS_G_ADDR  0xD9C214  f32 effect-timer skip threshold (+4 of the
++ *                   parameter block at 0xD9C210, which no code reads or writes:
++ *                   only +0, +8, +0x48 and +0xC8 are used)
++ * and one past the end of .bss (0x18ED4B0), in the same 64 KB page, below
++ * every runtime allocator (sys_memory starts at 0x10000000):
++ *   HSG_FPS_A_ADDR  0x18EFFF0 f32 f  (draw fraction)
+  *
+- * Env: HSG_FPS=60|90|120; HSG_FPS_MENUS=1; HSG_FPS_PACE=frames (fixed
+- * cadence D = N, one logic step every N frames, no host clock);
+- * HSG_FPS_LOG=<csv> (one line per frame: qpc ms, flip, logic steps, S, D, M).
+- * A "[fps]" line every 10 s gives frames/s, logic steps/s and the renderer
+- * clock rate (game seconds per wall second).
++ * Env: HSG_FPS=<31..1000>|unlocked|monitor (60/90/120 as before);
++ * HSG_FPS_MENUS=1; HSG_FPS_PACE=frames (fixed cadence, round(fps/30) frames
++ * per logic step, no host clock; for tests); HSG_FPS_LOG=<csv> (one line per
++ * frame); HSG_FPS_SNAP=<dir> with HSG_FPS_SNAP_AT=<logic step> and
++ * HSG_FPS_SNAP_N=<frames>: the guest words each frame changed (.data/.bss and
++ * the sys_memory heap), for finding state that advances per frame instead of
++ * per logic step; HSG_FPS_SNAP_N2=<frames>: with HSG_FPS_PACE=frames, after that
++ * many snapshot frames switch to 2 frames per step (back at the end), so a word's
++ * change per logic step can be compared at two frame rates in one run). A "[fps]" line every 10 s gives frames/s, logic steps/s
++ * and the renderer clock rate (game seconds per wall second).
+  */
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -72,20 +103,27 @@
+ #define HSG_FPS_KF_ADDR   0x00D9C1F0u
+ #define HSG_FPS_K_ADDR    0x00D9C1F4u
+ #define HSG_FPS_M_ADDR    0x00D9C1FCu
++#define HSG_FPS_A_ADDR    0x018EFFF0u   /* f32 draw fraction, past .bss */
++#define HSG_FPS_G_ADDR    0x00D9C214u   /* f32 effect-timer skip threshold */
++#define HSG_BSS_END       0x018ED4B0u   /* end of the EBOOT's last segment (memsz) */
+ #define HSG_DIV_ADDR      0x00D9C210u   /* slow-motion divisor D */
+ #define HSG_GAMEMAIN      0x00DB8D80u   /* +4 slow motion on, +8 S */
+ #define HSG_SEQ_PTR       0x00DB8D68u   /* [ptr]+0xC: global sequence */
+ #define HSG_RENDERER_PTR  0x018D7C6Cu   /* [ptr]+0x260: target FPS */
+ #define HSG_SEQ_GAME      0x49u
++#define HSG_FPS_K         240           /* sub-steps per logic step: < 256, low byte != 0 */
+ 
+ int g_hsg_fps = 0;          /* guard of every "fps" --insn-patches line */
+ 
+-static int s_n;             /* fps / 30 when HSG_FPS is on, else 0 */
+-static int s_k;             /* sub-steps per logic step (D = s_k * n) */
+-static int s_pace_frames;   /* HSG_FPS_PACE=frames */
+-static int s_menus;         /* HSG_FPS_MENUS=1 */
+-static int s_ui_frames;     /* HSG_FPS_UI=frames: UI updates every frame */
+-static FILE* s_log;
++static int    s_cfg;          /* the route is configured (HSG_FPS above 30) */
++static double s_rate;         /* target frames/s; 0 = unlocked */
++static int    s_monitor;      /* HSG_FPS=monitor: the rate of the window's display */
++static int    s_vsync_off;    /* D3D12_VSYNC=0 (present with tearing, no vblank wait) */
++static int    s_k;            /* sub-steps per logic step (D = s_k * n) */
++static int    s_pace_frames;  /* HSG_FPS_PACE=frames */
++static int    s_menus;        /* HSG_FPS_MENUS=1 */
++static int    s_ui_frames;    /* HSG_FPS_UI=frames: UI updates every frame */
++static FILE*  s_log;
+ 
+ static double now_ms(void)
+ {
+@@ -113,6 +151,25 @@ static u32 renderer_fps(void)
+     return (r && r < 0xF0000000u) ? vm_read32(r + 0x260) : 0;
+ }
+ 
++/* Refresh rate of the display the game window is on (the primary display
++ * before the window exists), in Hz. */
++static double monitor_hz(void)
++{
++#ifdef _WIN32
++    extern void* rsx_backend_get_hwnd(void);
++    HWND h = (HWND)rsx_backend_get_hwnd();
++    POINT o = {0, 0};
++    HMONITOR m = h ? MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY)
++                   : MonitorFromPoint(o, MONITOR_DEFAULTTOPRIMARY);
++    MONITORINFOEXW mi; memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
++    DEVMODEW dm; memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
++    if (m && GetMonitorInfoW(m, (MONITORINFO*)&mi) &&
++        EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
++        return (double)dm.dmDisplayFrequency;
++#endif
++    return 60.0;
++}
++
+ void hsg_fps_boot(void)
+ {
+     const char* e = getenv("HSG_FPS");
+@@ -124,52 +181,74 @@ void hsg_fps_boot(void)
+             return;
+         }
+     }
+-    int fps = atoi(e);
++    int fps = 0;
++    if (!strcmp(e, "unlocked") || !strcmp(e, "max")) fps = -1;
++    else if (!strcmp(e, "monitor")) fps = -2;
++    else { char* end = NULL; long v = strtol(e, &end, 10); fps = (end && *end == 0) ? (int)v : 0; }
++    const int ok = fps == -1 || fps == -2 || (fps > 30 && fps <= 1000);
+     const char* lg = getenv("HSG_FPS_LOG");
+-    if (lg && *lg && (fps == 30 || fps == 60 || fps == 90 || fps == 120)) {
++    if (lg && *lg && (ok || fps == 30)) {
+         s_log = fopen(lg, "w");
+-        if (s_log) fprintf(s_log, "ms,flip,logic_flips,S,D,M,seq,rclock,rfps,slow,phase\n");
++        if (s_log) fprintf(s_log, "ms,flip,logic_flips,S,D,M,seq,rclock,rfps,slow,phase,A\n");
+     }
+-    if (fps != 60 && fps != 90 && fps != 120) {
+-        if (fps != 30) fprintf(stderr, "[fps] HSG_FPS=%s ignored (use 60, 90 or 120)\n", e);
++    if (!ok) {
++        if (fps != 30) fprintf(stderr, "[fps] HSG_FPS=%s ignored (use 31..1000, unlocked or monitor)\n", e);
+         else if (s_log) fprintf(stderr, "[fps] HSG_FPS=30: stock route, frame log only\n");
+         return;
+     }
+     /* The words must be the zero padding and the divisor its default 2;
+      * anything else is another binary or layout, and the route stays off. */
+     if (vm_read32(HSG_FPS_KF_ADDR) != 0u || vm_read32(HSG_FPS_K_ADDR) != 0u ||
+-        vm_read32(HSG_FPS_M_ADDR) != 0u || vm_read32(HSG_DIV_ADDR) != 2u) {
+-        fprintf(stderr, "[fps] guest words at 0x%08X are not this build's layout; HSG_FPS off\n",
+-                HSG_FPS_KF_ADDR);
++        vm_read32(HSG_FPS_M_ADDR) != 0u || vm_read32(HSG_DIV_ADDR) != 2u ||
++        vm_read32(HSG_FPS_A_ADDR) != 0u || vm_read32(HSG_FPS_G_ADDR) != 0u) {
++        fprintf(stderr, "[fps] guest words at 0x%08X / 0x%08X are not this build's layout; HSG_FPS off\n",
++                HSG_FPS_KF_ADDR, HSG_FPS_A_ADDR);
+         return;
+     }
++    const char* v = getenv("D3D12_VSYNC");
++    s_vsync_off = v && *v == '0';
++    s_monitor = fps == -2;
++    s_rate = fps > 0 ? (double)fps : 0.0;
+     const char* p = getenv("HSG_FPS_PACE");
+-    s_pace_frames = p && !strcmp(p, "frames");
++    s_pace_frames = 0;
++    if (p && !strcmp(p, "frames")) {
++        const double r = s_monitor ? monitor_hz() : s_rate;
++        s_pace_frames = r > 0 ? (int)(r / 30.0 + 0.5) : 4;
++        if (s_pace_frames < 2) s_pace_frames = 2;
++        if (s_pace_frames > 32) s_pace_frames = 32;
++    }
+     const char* m = getenv("HSG_FPS_MENUS");
+     s_menus = m && *m == '1';
+     const char* u = getenv("HSG_FPS_UI");
+     s_ui_frames = u && !strcmp(u, "frames");
+-    s_n = fps / 30;
+-    s_k = s_pace_frames ? s_n : 12;
++    s_k = s_pace_frames ? s_pace_frames : HSG_FPS_K;
+     vm_write_f32(HSG_FPS_KF_ADDR, (float)s_k);
+     vm_write32(HSG_FPS_K_ADDR, (u32)s_k);
+-    vm_write_f32(HSG_FPS_M_ADDR, (float)s_k);
+-    fprintf(stderr, "[fps] HSG_FPS=%d: logic 30 Hz, frames interpolated (%s, K=%d)%s\n", fps,
+-            s_pace_frames ? "fixed cadence" : "host clock", s_k,
++    vm_write_f32(HSG_FPS_M_ADDR, 1.0f);
++    s_cfg = 1;
++    if (s_monitor) fprintf(stderr, "[fps] HSG_FPS=monitor (%.0f Hz now)", monitor_hz());
++    else if (s_rate > 0) fprintf(stderr, "[fps] HSG_FPS=%.0f", s_rate);
++    else fprintf(stderr, "[fps] HSG_FPS=unlocked");
++    fprintf(stderr, ": logic 30 Hz, frames interpolated (%s, K=%d), vsync %s%s\n",
++            s_pace_frames ? "fixed cadence" : "host clock", s_k, s_vsync_off ? "off" : "on",
+             s_menus ? ", menus too" : ", course only");
+ }
+ 
+ /* State of the pacer, all on the title's main thread (its pad poll). */
+ static int    s_on;               /* the guard as last set */
+ static u32    s_last_flip = 0xFFFFFFFFu;   /* GameMain+0 tick of the last decision */
+-static double s_step_t0;          /* host ms of the last logic step, 0 = none yet */
++static double s_step_t0;          /* host ms of the current logic step's start, 0 = none yet */
+ static double s_dt;               /* smoothed frame time */
+ static double s_prev_ms;
+ static int    s_hold;             /* the coming tick is an in-between frame */
+ static int    s_prev_s = -1, s_prev_d;
++static double s_prev_a;           /* draw fraction of the previous frame */
+ static unsigned long long s_steps, s_frames;   /* logic steps / frames while on */
+ static u32    s_stock_div = 2;    /* divisor in stock units while the route is off */
+ static double s_last_m;           /* M written this frame */
++static double s_last_a;           /* fraction written this frame */
++static double s_cap_ms;           /* frame cap period, 0 = none */
++static double s_deadline;         /* host ms the next frame may start at */
+ 
+ /* Logic steps so far (every flip while off counts as one): the PAD_CLOCK=flips
+  * clock under HSG_FPS, so a flip-timed pad script presses at the same game
+@@ -205,6 +284,18 @@ int hsg_fps_skip_icall(u32 lr, u64* r4)
+     return lr == 0x0001AFF0u || lr == 0x0001B078u || lr == 0x0001B0A4u;
+ }
+ 
++/* Frame cap period for the current settings: none when unlocked, or when the
++ * swap chain already waits for the vblank and the target is at or above the
++ * display's rate (the vblank paces; a second, slightly different clock would
++ * only make it miss vblanks). */
++static double cap_ms(void)
++{
++    const double r = s_monitor ? monitor_hz() : s_rate;
++    if (r <= 0) return 0.0;
++    if (!s_vsync_off && r >= monitor_hz() - 0.5) return 0.0;
++    return 1000.0 / r;
++}
++
+ static void set_guard(int on)
+ {
+     if (on == s_on) return;
+@@ -216,8 +307,10 @@ static void set_guard(int on)
+         d = slow ? d * (u32)s_k : (u32)s_k;
+         vm_write32(HSG_DIV_ADDR, d);
+         vm_write32(HSG_GAMEMAIN + 8, 0);
+-        s_step_t0 = 0; s_prev_s = -1;
++        s_step_t0 = 0; s_prev_s = -1; s_prev_a = 0; s_deadline = 0;
++        s_cap_ms = cap_ms();
+     } else {
++        vm_write_f32(HSG_FPS_G_ADDR, 0.0f);
+         d = slow ? (d / (u32)s_k ? d / (u32)s_k : 1u) : s_stock_div;
+         vm_write32(HSG_DIV_ADDR, d);
+         if (slow) vm_write32(HSG_GAMEMAIN + 8, 0);
+@@ -238,8 +331,46 @@ static void set_guard(int on)
+             }
+         }
+     }
+-    fprintf(stderr, "[fps] seq=0x%X fps=%u: interpolation %s\n", seq_now(), renderer_fps(),
+-            on ? "on" : "off");
++    fprintf(stderr, "[fps] seq=0x%X fps=%u: interpolation %s (cap %.3f ms)\n", seq_now(), renderer_fps(),
++            on ? "on" : "off", on ? s_cap_ms : 0.0);
++}
++
++/* Wait until host time t (ms): a high-resolution waitable timer to about
++ * half a millisecond before, then yield until t. */
++static void wait_until(double t)
++{
++    double left = t - now_ms();
++    if (left <= 0) return;
++#ifdef _WIN32
++    if (left > 0.8) {
++        static HANDLE tm; static int tried;
++        if (!tried) {
++            tried = 1;
++            tm = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
++                                        TIMER_ALL_ACCESS);
++            if (!tm) tm = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
++        }
++        LARGE_INTEGER due; due.QuadPart = -(LONGLONG)((left - 0.5) * 10000.0);   /* relative, 100 ns */
++        if (tm && SetWaitableTimer(tm, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(tm, (DWORD)left + 20);
++        else Sleep((DWORD)(left - 0.8));
++    }
++    while (now_ms() < t) SwitchToThread();
++#else
++    struct timespec ts = { (time_t)(left / 1000.0), (long)((left - (double)(long)(left / 1000.0) * 1000.0) * 1e6) };
++    nanosleep(&ts, NULL);
++#endif
++}
++
++/* Frame cap: frame k starts no earlier than t0 + k * period. A frame that
++ * starts late keeps the cadence (the next ones start at once until it is
++ * caught up); one more than a period late restarts it. */
++static void pace_wait(void)
++{
++    if (s_cap_ms <= 0) return;
++    const double t = now_ms();
++    if (s_deadline == 0 || t - s_deadline > s_cap_ms) s_deadline = t;
++    else wait_until(s_deadline);
++    s_deadline += s_cap_ms;
+ }
+ 
+ /* Once per tick, before Main_Tick reads S: choose whether this tick is a logic
+@@ -248,22 +379,25 @@ static void pace(void)
+ {
+     const double t = now_ms();
+     int d = (int)vm_read32(HSG_DIV_ADDR);
+-    if (d < 1 || d > 100000) d = s_k;
++    if (d < 1 || d > 1000000) d = s_k;
+     int s_new;
++    double a;
+     if (s_pace_frames) {
+         s_new = ((int)vm_read32(HSG_GAMEMAIN + 8) + 1) % d;
+         if (s_new < 0) s_new = 0;
++        a = (double)s_new / (double)d;
+     } else {
+         /* One logic step per 1/30 s of host time (n/30 s in slow motion). A
+-         * frame takes the step once the frame after it would land past the
+-         * middle of the next step, so a host near 30 FPS steps on nearly
+-         * every frame instead of alternating long and short steps. A frame
++         * frame is a logic step once the step clock has passed the next step;
++         * it then draws the part of the new step that has passed. A frame
+          * that comes late does not lose the time: the step clock advances by
+          * whole steps, so the following frames step until it has caught up.
+-         * Only a backlog over 2 steps (a hitch, a load, a host below 30 FPS)
+-         * is dropped, as the stock game would. */
++         * Only a backlog over 2 steps (a hitch, a load) is dropped, as the
++         * stock game would. */
+         const double step = 1000.0 / 30.0 * (double)d / (double)s_k;
+         if (s_prev_ms != 0) { const double f = t - s_prev_ms; s_dt = s_dt == 0 ? f : s_dt + (f - s_dt) * 0.25; }
++        /* The game's slow motion changed D: keep the fraction continuous. */
++        if (s_step_t0 != 0 && s_prev_d > 0 && s_prev_d != d) s_step_t0 = s_prev_ms - s_prev_a * step;
+         /* A host at or below 30 FPS gets the stock cadence: every frame is one
+          * 30 Hz frame (a logic step, or 1/n of one in slow motion). Pacing by
+          * the clock there only adds in-between frames after hitches and runs
+@@ -273,29 +407,49 @@ static void pace(void)
+         if (slow_host && s_step_t0 != 0 && s_prev_d == d) {
+             const int sp = s_prev_s < 0 ? 0 : s_prev_s;
+             s_new = sp + s_k >= d ? 0 : sp + s_k;
+-            s_step_t0 = t - (double)s_new / (double)d * step;
+-        } else if (s_step_t0 == 0 || t + s_dt * 0.5 >= s_step_t0 + step) {
+-            const double next = s_step_t0 + step;
+-            s_step_t0 = (s_step_t0 == 0 || t - next > 2.0 * step) ? t : next;
+-            s_new = 0;
++            a = (double)s_new / (double)d;
++            s_step_t0 = t - a * step;
+         } else {
+-            s_new = (int)((t - s_step_t0) / step * (double)d);
+-            if (s_prev_s > 0 && s_prev_d == d && s_new < s_prev_s) s_new = s_prev_s;   /* monotonic */
+-            if (s_new < 1) s_new = 1;
+-            if (s_new > d - 1) s_new = d - 1;
++            if (s_step_t0 == 0) {
++                s_step_t0 = t;
++                s_new = 0;
++            } else if (t >= s_step_t0 + step) {
++                const double next = s_step_t0 + step;
++                s_step_t0 = t - next > 2.0 * step ? t : next;
++                s_new = 0;
++            } else {
++                s_new = (int)((t - s_step_t0) / step * (double)d);
++                if (s_new < 1) s_new = 1;
++                if (s_new > d - 1) s_new = d - 1;
++            }
++            a = (t - s_step_t0) / step;
++            if (a < 0) a = 0;
++            if (a > 0.999) a = 0.999;     /* behind by over a step: the next frames step at once */
+         }
+         /* The tick adds one: store the value before it. */
+         vm_write32(HSG_GAMEMAIN + 8, (u32)((s_new + d - 1) % d));
+     }
++    vm_write_f32(HSG_FPS_A_ADDR, (float)a);
++    {   /* Effect timers (0x90DC18): one count per 30 Hz frame of the stock game. */
++        static double t30;
++        int open;
++        if (vm_read8(HSG_GAMEMAIN + 4) == 0 || s_pace_frames) {
++            open = s_new == 0;
++            t30 = t;
++        } else {   /* slow motion: the stock game counted every (30 Hz) frame */
++            open = t - t30 >= 1000.0 / 30.0 - 0.5;
++            if (open) t30 = t - t30 > 100.0 ? t : t30 + 1000.0 / 30.0;
++        }
++        vm_write_f32(HSG_FPS_G_ADDR, open ? 0.0f : 1e30f);
++    }
+     s_prev_ms = t;
+     /* Steps this frame advances: a logic frame closes the previous step. */
+     double adv;
+-    if (s_prev_s < 0 || s_prev_d != d) adv = 1.0 / (double)d;
+-    else if (s_new == 0) adv = (double)(d - s_prev_s) / (double)d;
+-    else adv = (double)(s_new - s_prev_s) / (double)d;
+-    if (adv < 1.0 / 1024.0) adv = 1.0 / 1024.0;
++    if (s_prev_s < 0) adv = a > 0 ? a : 1.0 / (double)d;
++    else adv = (s_new == 0 ? 1.0 : 0.0) + a - s_prev_a;
++    if (adv < 1.0 / 4096.0) adv = 1.0 / 4096.0;
+     vm_write_f32(HSG_FPS_M_ADDR, (float)(1.0 / adv));
+-    s_prev_s = s_new; s_prev_d = d;
++    s_prev_s = s_new; s_prev_d = d; s_prev_a = a;
+     s_hold = s_new != 0;
+     s_frames++;
+     if (s_new == 0) s_steps++; else s_between++;
+@@ -313,6 +467,7 @@ static void pace(void)
+         rep_t = t; rep_f = s_frames; rep_s = s_steps; rep_rc = rc;
+     }
+     s_last_m = 1.0 / adv;
++    s_last_a = a;
+ }
+ 
+ /* HSG_FPS_LOG: one line per frame (stock route too, with HSG_FPS=30). */
+@@ -322,16 +477,108 @@ static void log_frame(u32 fc)
+     const u32 r = vm_read32(HSG_RENDERER_PTR);
+     const double rc = (r && r < 0xF0000000u) ? (double)vm_read_f32(r + 0x280) : 0;
+     const double ph = (r && r < 0xF0000000u) ? (double)vm_read_f32(r + 0x59C) : 0;
+-    fprintf(s_log, "%.3f,%u,%u,%d,%d,%.4f,%u,%.4f,%u,%u,%.4f\n", now_ms(), fc, hsg_fps_logic_flips(),
++    fprintf(s_log, "%.3f,%u,%u,%d,%d,%.4f,%u,%.4f,%u,%u,%.4f,%.5f\n", now_ms(), fc, hsg_fps_logic_flips(),
+             s_on ? s_prev_s : -1, s_on ? s_prev_d : 0, s_on ? s_last_m : 0.0, seq_now(), rc,
+-            renderer_fps(), (unsigned)vm_read8(HSG_GAMEMAIN + 4), ph);
++            renderer_fps(), (unsigned)vm_read8(HSG_GAMEMAIN + 4), ph, s_on ? s_last_a : -1.0);
+     if (++lines % 32 == 0) fflush(s_log);
+ }
+ 
++/* HSG_FPS_SNAP: from logic step HSG_FPS_SNAP_AT on, for HSG_FPS_SNAP_N
++ * frames, write <dir>/f<i>.bin: the guest words that changed since the
++ * previous frame's poll (u32 address, old, new; big-endian words as stored),
++ * after a 16-byte header (frame index, S, logic flag, fraction * 1e6). The
++ * first frame only takes the copy. Committed pages of .data/.bss and of the
++ * sys_memory window, found once at the first frame. */
++#ifdef _WIN32
++typedef struct { u32 a, n; u8* copy; } snap_rg;
++static void snap_frame(void)
++{
++    static int on = -1, nrg, idx;
++    static u32 at, nfr, n2;
++    static const char* dir;
++    static snap_rg rg[8192];
++    if (on < 0) {
++        dir = getenv("HSG_FPS_SNAP");
++        const char* a = getenv("HSG_FPS_SNAP_AT"); const char* n = getenv("HSG_FPS_SNAP_N");
++        at = a ? (u32)strtoul(a, NULL, 0) : 0; nfr = n ? (u32)strtoul(n, NULL, 0) : 8;
++        const char* e2 = getenv("HSG_FPS_SNAP_N2");
++        n2 = e2 && s_pace_frames ? (u32)strtoul(e2, NULL, 0) : 0;
++        on = dir && *dir && at ? 1 : 0;
++        if (on) CreateDirectoryA(dir, NULL);
++    }
++    if (on != 1 || hsg_fps_logic_flips() < at) return;
++    /* HSG_FPS_SNAP_N2: frames mode switches between N and 2 frames per step
++     * on a logic frame (S = 0 decided; Main_Tick wraps S with the new D). */
++    if (n2 && s_prev_s == 0 && vm_read8(HSG_GAMEMAIN + 4) == 0) {
++        static int base_k;
++        if (!base_k) base_k = s_k;
++        const int want = ((u32)idx > n2 && (u32)idx <= nfr) ? 2 : base_k;
++        if (want != s_k) {
++            s_k = want;
++            vm_write_f32(HSG_FPS_KF_ADDR, (float)s_k);
++            vm_write32(HSG_FPS_K_ADDR, (u32)s_k);
++            vm_write32(HSG_DIV_ADDR, (u32)s_k);
++            vm_write32(HSG_GAMEMAIN + 8, (u32)(s_k - 1));   /* the tick still wraps to 0 */
++            fprintf(stderr, "[fps] snapshot %d: %d frames per step from here\n", idx, s_k);
++        }
++    }
++    if ((u32)idx > nfr) {
++        if (s_k == s_pace_frames) { on = 2; fprintf(stderr, "[fps] snapshots done\n"); }
++        return;
++    }
++    if (idx == 0) {
++        static const u32 span[][2] = { {0x00D20000u, 0x018F0000u}, {0x10000000u, 0x20000000u} };
++        for (int k = 0; k < 2; k++) {
++            u32 x = span[k][0];
++            while (x < span[k][1] && nrg < 8192) {
++                MEMORY_BASIC_INFORMATION mb;
++                if (!VirtualQuery(vm_base + x, &mb, sizeof mb)) break;
++                const u32 base = (u32)((u8*)mb.BaseAddress - vm_base);
++                u32 end = base + (u32)mb.RegionSize;
++                if (end > span[k][1] || end < base) end = span[k][1];
++                if (mb.State == MEM_COMMIT && !(mb.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && end > x) {
++                    rg[nrg].a = x; rg[nrg].n = end - x;
++                    rg[nrg].copy = (u8*)malloc(rg[nrg].n);
++                    if (!rg[nrg].copy) break;
++                    memcpy(rg[nrg].copy, vm_base + x, rg[nrg].n);
++                    nrg++;
++                }
++                x = end;
++            }
++        }
++        unsigned long long tot = 0; for (int i = 0; i < nrg; i++) tot += rg[i].n;
++        fprintf(stderr, "[fps] snapshot: %d regions, %.1f MB\n", nrg, tot / 1048576.0);
++        idx = 1;
++        return;
++    }
++    char path[600]; snprintf(path, sizeof path, "%s/f%02d.bin", dir, idx);
++    FILE* f = fopen(path, "wb");
++    if (f) {
++        const u32 hdr[4] = { (u32)idx, (u32)s_prev_s, (u32)(s_prev_s == 0), (u32)(s_last_a * 1e6) };
++        fwrite(hdr, 4, 4, f);
++    }
++    unsigned long long nch = 0;
++    for (int i = 0; i < nrg; i++) {
++        const u32* cur = (const u32*)(vm_base + rg[i].a);
++        u32* old = (u32*)rg[i].copy;
++        const u32 nw = rg[i].n / 4;
++        for (u32 w = 0; w < nw; w++) {
++            if (cur[w] != old[w]) {
++                if (f) { const u32 rec[3] = { rg[i].a + w * 4, old[w], cur[w] }; fwrite(rec, 4, 3, f); }
++                old[w] = cur[w]; nch++;
++            }
++        }
++    }
++    if (f) fclose(f);
++    fprintf(stderr, "[fps] snapshot %d: S=%d A=%.4f %llu words changed\n", idx, s_prev_s, s_last_a, nch);
++    idx++;
++}
++#endif
++
+ /* cellPadGetData, before the report is built. */
+ void hsg_fps_poll(u32 port_no)
+ {
+-    if ((!s_n && !s_log) || port_no != 0) return;
++    if ((!s_cfg && !s_log) || port_no != 0) return;
+     extern u32 cellGcm_flip_request_count(void);
+     const u32 fc = cellGcm_flip_request_count();
+     /* One decision per Main_Tick: GameMain+0 counts ticks and is bumped at the
+@@ -340,10 +587,13 @@ void hsg_fps_poll(u32 port_no)
+     const u32 tick = vm_read32(HSG_GAMEMAIN);
+     if (tick == s_last_flip) return;
+     s_last_flip = tick;
+-    if (s_n) {
++    if (s_cfg) {
+         const int want = (s_menus || seq_now() == HSG_SEQ_GAME) && renderer_fps() == 30;
+         set_guard(want);
+-        if (want) pace(); else s_hold = 0;
++        if (want) { pace_wait(); pace(); } else s_hold = 0;
++#ifdef _WIN32
++        if (want) snap_frame();
++#endif
+     }
+     if (s_log) log_frame(fc);
+ }
+@@ -353,7 +603,7 @@ void hsg_fps_pad_filter(u32 port_no, u32 ea)
+ {
+     enum { PADLEN = 4 + 2 * 64 };
+     static u8 saved[8][PADLEN]; static int have[8];
+-    if (!s_n || port_no >= 8 || !ea) return;
++    if (!s_cfg || port_no >= 8 || !ea) return;
+     if (s_on && s_hold && have[port_no]) {
+         for (int i = 0; i < PADLEN; i++) vm_write8(ea + (u32)i, saved[port_no][i]);
+     } else {
+@@ -362,10 +612,11 @@ void hsg_fps_pad_filter(u32 port_no, u32 ea)
+     }
+ }
+ 
+-/* Present thread: the vblank period it should add ticks at, or 0 for none
+- * (the stock 60 Hz ticker is enough). Above 60 FPS while the route is on. */
++/* Present thread: nonzero while the route is on. It then completes each flip
++ * as soon as the FIFO drain has executed it, instead of on the 60 Hz vblank
++ * tick, so the frame rate is set by the cap above (or the swap chain), not by
++ * the ticker. Off (menus, swing gauge, stock), the stock cadence stays. */
+ double hsg_fps_vblank_ms(void)
+ {
+-    if (s_n <= 2 || !s_on) return 0.0;
+-    return 1000.0 / (30.0 * (double)s_n);
++    return s_on ? 1.0 : 0.0;
+ }
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2082,26 +2082,19 @@ void cellGcm_fifo_kick_wait(unsigned ms)
+     static int on = -1;
+     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
+     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+-    /* HSG_FPS=90|120 (libs/system/hsg_fps.c): vblanks at 30*N Hz while the
+-     * title flips on every vblank. The host ticker keeps its own 16 ms ticks;
+-     * this adds one whenever a period has passed since the last tick of
+-     * either source, so the guest can flip up to 30*N times a second. */
++    /* HSG_FPS (libs/system/hsg_fps.c), while its route is on: complete each
++     * flip as soon as the drain below has executed it, before and after the
++     * wait (a no-op when no flip is waiting), instead of on the 60 Hz vblank
++     * tick. The guest's next flip waits for this one, so the ticker would
++     * otherwise cap the frame rate at 60; hsg_fps.c sets the rate. The wait
++     * is at most 1 ms, so a flip the drain executes without a kick still
++     * completes within a millisecond. */
+     {   extern double hsg_fps_vblank_ms(void);
+-        const double per = hsg_fps_vblank_ms();
+-        if (per > 0.0) {
+-            static LARGE_INTEGER f;
+-            LARGE_INTEGER c;
+-            if (!f.QuadPart) QueryPerformanceFrequency(&f);
+-            QueryPerformanceCounter(&c);
+-            double left = per - (double)(c.QuadPart - s_vblank_qpc) * 1000.0 / (double)f.QuadPart;
+-            if (left > 0.0) {
+-                DWORD w = (DWORD)left;
+-                if (w > ms) w = ms;
+-                if (ev) WaitForSingleObject(ev, w); else Sleep(w);
+-                QueryPerformanceCounter(&c);
+-                left = per - (double)(c.QuadPart - s_vblank_qpc) * 1000.0 / (double)f.QuadPart;
+-            }
+-            if (left <= 0.5) { cellGcmTickVBlank(); cellGcmTickFlip(); }
++        if (hsg_fps_vblank_ms() != 0.0) {
++            cellGcmTickFlip();
++            const DWORD w = ms < 1u ? ms : 1u;
++            if (ev) WaitForSingleObject(ev, w); else Sleep(w);
++            cellGcmTickFlip();
+             return;
+         }
+     }
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -744,6 +744,25 @@ static int speed_chk_vtx(void)
+ }
+ static void ck(int k, int bad) { s_ck_n[k]++; if (bad) s_ck_bad[k]++; }
+ static void rsxperf_report(double frames);   /* RSX_VTX_CACHE / texture check stats */
++/* RSX_PRESENT_LOG=<csv>: one line per Present (host ms on the QPC clock, the
++ * guest flip count, the HRESULT), for frame-pacing measurements (HSG_FPS). */
++static void rsx_present_log(HRESULT hr)
++{
++    static int on = -1; static FILE* f; static unsigned n;
++    if (on < 0) {
++        const char* e = getenv("RSX_PRESENT_LOG");
++        f = e && *e ? fopen(e, "w") : NULL;
++        on = f ? 1 : 0;
++        if (f) fprintf(f, "ms,flip,hr%c", 10);
++    }
++    if (!on) return;
++    extern unsigned cellGcm_flip_request_count(void);
++    fprintf(f, "%.3f,%u,%08lX%c", perf_now() * 1000.0, cellGcm_flip_request_count(), (unsigned long)hr, 10);
++    if (++n % 64 == 0) fflush(f);
++}
++/* The game window, for code outside the backend (HSG_FPS=monitor reads its
++ * display's refresh rate). NULL before the window exists. */
++void* rsx_backend_get_hwnd(void) { return (void*)s_d3d.hwnd; }
+ static void rsx_hitch_note(void)
+ {
+     static int thr = -1;
+@@ -10250,6 +10269,7 @@ skip_dump_consider: ;
+         }
+         if (_pf0) s_prof_frames++;
+         rsx_hitch_note();
++        rsx_present_log(phr);
+     }
+     rdoc_frame_end();
+ 

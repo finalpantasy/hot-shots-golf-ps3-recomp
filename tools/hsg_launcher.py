@@ -16,7 +16,10 @@ settings file (the newest 10 are kept), ending with the exit code.
 Where each setting comes from (checked against the sources, nothing invented):
   Command-line flags: port/cli_options.cpp (parser and --help text) and docs/CLI.md.
   HSG_TWEAKS:         patches/runtime/0059-guest-tweaks.patch (libs/system/hsg_tweaks.c).
-  HSG_FPS:            patches/runtime/0058 (30 = off, 60/90/120 on the course).
+  HSG_FPS:            patches/runtime/0058 + 0074 (30 = off; 31..1000, "unlocked" or
+                      "monitor" on the course; logic stays 30 Hz, frames interpolated).
+  D3D12_VSYNC=0:      libs/video/rsx_d3d12_backend.c (present without vsync, tearing
+                      allowed: for rates above the display's and VRR displays).
   HSG_DLC_EARN:       patches/runtime/0070 (DLC club/ball classes 3-4 sold in the shop;
                       on by default but only acts with PS3_NPDRM_STRICT=1;
                       "dlc_earn": false passes =0).
@@ -53,9 +56,24 @@ ASPECTS = ["stretch", "fit", "expand"]
 EXPERIMENTAL_ASPECTS = set()
 # Source: --windowed (default), --fullscreen, --hidden in port/cli_options.cpp.
 WINDOW_MODES = ["windowed", "fullscreen", "hidden"]
-# FPS: HSG_FPS is not read by any code in this repo yet. It is exported only when
-# the player picks a value other than "Default", and current builds ignore it.
-FPS_CHOICES = ["Default", "30", "60", "90", "120"]
+# FPS: HSG_FPS (libs/system/hsg_fps.c, patches 0058 and 0074). "30 (stock)" exports
+# nothing. Older settings files may hold "Default", "30" or "90"; they still work.
+FPS_CHOICES = ["30 (stock)", "60", "120", "144", "165", "180", "240", "Unlocked", "Match monitor"]
+FPS_STOCK = ("30 (stock)", "Default", "30", "")
+
+
+def fps_env(choice):
+    """HSG_FPS value for a frame-rate choice, or None for the stock 30."""
+    c = str(choice).strip()
+    if c in FPS_STOCK:
+        return None
+    if c == "Unlocked":
+        return "unlocked"
+    if c == "Match monitor":
+        return "monitor"
+    if c.isdigit() and 30 < int(c) <= 1000:
+        return c
+    return None
 
 DEFAULTS = {
     "exe": "",                # blank = look for the exe (see find_exe)
@@ -67,7 +85,8 @@ DEFAULTS = {
     "tex_replace": "",        # --tex-replace <dir>   (port/cli_options.cpp, patch 0047)
     "tex_replace_mb": 768,    # --tex-replace-mb      (docs/CLI.md default 768)
     "tex_dump": "",           # --tex-dump <dir>      (port/cli_options.cpp, patch 0047)
-    "fps": "Default",         # HSG_FPS               (patch 0058)
+    "fps": "30 (stock)",      # HSG_FPS               (patches 0058, 0074)
+    "vsync": True,            # D3D12_VSYNC=0 when off (only with a rate above 30)
     "tweaks": "",             # HSG_TWEAKS=<json>     (patch 0059)
     "mute": False,            # --mute                (port/cli_options.cpp)
     "dlc_earn": True,         # HSG_DLC_EARN=0 when off (patch 0070)
@@ -204,8 +223,14 @@ def validate(s, settings_file):
     if s["aspect"] in EXPERIMENTAL_ASPECTS:
         warns.append("Aspect 'expand' is experimental (patch 0055). Builds without it "
                      "reject the option and exit with code 2.")
-    if s["fps"] in ("60", "90", "120"):
-        warns.append("Frame rates above 30 are opt-in (patch 0058) and apply on the course only.")
+    if fps_env(s["fps"]) is None and str(s["fps"]).strip() not in FPS_STOCK:
+        errs.append("Unknown frame rate: %s" % s["fps"])
+    if fps_env(s["fps"]):
+        warns.append("Frame rates above 30 are opt-in (patches 0058, 0074) and apply on the "
+                     "course only; menus and the swing gauge keep the stock 30/60.")
+        if s["vsync"] and fps_env(s["fps"]) not in ("monitor",):
+            warns.append("With vsync on, the rate cannot pass the display's refresh rate. "
+                         "Turn vsync off for higher rates (tearing, or a VRR display).")
     if s["tweaks"]:
         warns.append("Guest tweaks are experimental (patch 0059).")
     if s["extra_args"]:
@@ -241,8 +266,10 @@ def build_command(s, settings_file):
             argv += [flag, _abs(base, s[key])]
     if s["tweaks"]:
         env["HSG_TWEAKS"] = _abs(base, s["tweaks"])           # patch 0059
-    if s["fps"] != "Default":
-        env["HSG_FPS"] = s["fps"]                             # patch 0058
+    if fps_env(s["fps"]):
+        env["HSG_FPS"] = fps_env(s["fps"])                    # patches 0058, 0074
+        if not s["vsync"]:
+            env["D3D12_VSYNC"] = "0"                          # rsx_d3d12_backend.c
     if not s["dlc_earn"]:
         env["HSG_DLC_EARN"] = "0"                             # patch 0070 (default on)
     if s["extra_args"]:
@@ -398,9 +425,15 @@ def run_gui(settings_file):
     ttk.Label(fr, text="Frame rate").grid(row=0, column=0, sticky="w", pady=2)
     ttk.Combobox(fr, textvariable=var("fps"), state="readonly",
                  values=FPS_CHOICES).grid(row=0, column=1, sticky="w", padx=4)
-    ttk.Label(fr, text="Sets HSG_FPS. 60, 90 and 120 are opt-in and apply on the course; "
-                       "game logic stays at 30. Menus stay at 30.",
+    ttk.Label(fr, text="Sets HSG_FPS. Rates above 30 apply on the course; game logic stays "
+                       "at 30 and the frames between are interpolated, so the game runs at "
+                       "its normal speed. Menus stay at 30 and the swing gauge at 60. "
+                       "Match monitor uses the refresh rate of the game window's display.",
               foreground="#a60", wraplength=520).grid(row=1, column=1, sticky="w", padx=4)
+    ttk.Checkbutton(fr, text="Vsync (off: no rate limit from the display; tearing unless "
+                             "the display has VRR)",
+                    variable=var("vsync", tk.BooleanVar)).grid(row=2, column=1, sticky="w",
+                                                               padx=4, pady=2)
 
     # Advanced
     a = tab("Advanced")

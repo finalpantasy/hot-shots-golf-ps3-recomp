@@ -11,14 +11,14 @@
       "completed_at": "2026-11-19T22:34:27.149961+00:00"
     },
     "lift": {
-      "fingerprint": "cb5b49b541a556e82bb079b81c4752ca42ded02e7c4eb43c0fd096814ac90e59",
-      "outputs": "280f28e31b5724f956a89b546499cd63b362bfbb32ade5316990d7288f4d0dfe",
-      "completed_at": "2026-11-19T22:21:56.382175+00:00"
+      "fingerprint": "f85012e8779043ac969e1681452c6c98514979312ae576edca833fbc5750e183",
+      "outputs": "7a75bb2a3af5cb96b36022c65c3d7981c9e6b4c61b40659d9eef20c15cf9b430",
+      "completed_at": "2026-11-23T15:11:03.015655+00:00"
     },
     "build": {
-      "fingerprint": "30c6bed7ffd244dc66697bcdd05869e5f0ba564533f305bbfff6692aeb627bf2",
-      "outputs": "dc398355284718d7b47a51efffbbd82f7f54c6dd5eef3bde572fb28d094022c6",
-      "completed_at": "2026-11-21T02:08:37.464228+00:00"
+      "fingerprint": "c704d8e7750d45acda8fb5fca72402714e4a8b65ef47d57d209653442e9ec0b8",
+      "outputs": "eb98385534f2e627ff07becc03989e57037f16a67bee48f1a860eef9aae13586",
+      "completed_at": "2026-11-23T15:14:08.042391+00:00"
     }
   }
 }
