@@ -30,8 +30,8 @@ Where each setting comes from (checked against the sources, nothing invented):
   HSG_TWEAKS:         patches/runtime/0059-guest-tweaks.patch (libs/system/hsg_tweaks.c).
   HSG_FPS:            patches/runtime/0058 + 0074 (30 = off; 31..1000, "unlocked" or
                       "monitor" on the course; logic stays 30 Hz, frames interpolated).
-                      The code stands down on the JP 1.27 program (patch 0072,
-                      libs/system/hsg_program.c), so the Ultimate edition runs at 30.
+                      The JP 1.27 program (Ultimate edition) has its own address set
+                      (patch 0075, picked by libs/system/hsg_program.c).
   D3D12_VSYNC=0:      libs/video/rsx_d3d12_backend.c (present without vsync, tearing
                       allowed: for rates above the display's and VRR displays).
   HSG_DLC_EARN:       patches/runtime/0070 (DLC club/ball classes 3-4 sold in the shop;
@@ -117,9 +117,9 @@ def fps_env(choice):
     return None
 
 
-# Flip to True once the frame-rate code runs on the JP 1.27 program (today it stands down,
-# patch 0072). This one flag controls the env, the warning and the greyed-out GUI controls.
-ULT_FPS_SUPPORTED = False
+# True since patch 0075 (HSG_FPS address set for the JP 1.27 program). False greys out the
+# Ultimate edition's rates above 30; this one flag controls the env, warning and GUI controls.
+ULT_FPS_SUPPORTED = True
 
 
 def fps_locked(s):
