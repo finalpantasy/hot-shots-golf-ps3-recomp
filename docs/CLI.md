@@ -80,25 +80,30 @@ The executable expects the US title ID `NPUA80864` in `PARAM.SFO`. On Windows it
 
 ## Settings launcher
 
-`tools/hsg_launcher.py` is a small settings window, so you do not have to type flags or environment variables. It needs only Python 3 (Tkinter comes with it). From the project folder:
+`HotShotsGolfLauncher.exe` is a settings window, so you do not have to type flags or environment variables. It needs no Python. Build it from the repository with `.venv/Scripts/python.exe tools/build_launcher.py` (needs PyInstaller; the result is `dist/HotShotsGolfLauncher.exe`). The same code runs from source with `python tools/hsg_launcher.py`.
+
+Put it next to `HotShotsGolfRecomp.exe` (US 1.03). The Ultimate edition exe goes in an `ultimate` folder beside it.
+
+- **Edition** (top of the window): World Invitational (US 1.03, the default) or Ultimate Edition (JP 1.27, English). Each edition has its own exe, EBOOT.elf, game, hdd0, hdd1, save and dev_flash paths under Advanced.
+- **Display**: resolution, aspect mode, window mode (windowed, fullscreen or hidden).
+- **Frame rate**: `HSG_FPS` choices and vsync. The frame-rate code stands down on the JP 1.27 program (patch 0072), so the Ultimate edition runs at 30 and the other rates are greyed out.
+- **Textures**: tick "Use an HD texture pack" (off by default), pick the folder (`--tex-replace`) and the memory cap (`--tex-replace-mb`, default 768). The texture dump folder (`--tex-dump`) is here too.
+- **Save profiles**: the game takes one save root (`--savedata`), so a profile is its own save root per edition, `profiles/<name>/<edition>/savedata` next to the settings file. hdd0 is shared. Default keeps your existing save folder, and nothing is moved or changed. A new profile starts empty, or is a copy of the selected profile. Removing saves is always done by hand.
+- **Ultimate setup**: builds the Ultimate game data (`tools/build_ultimate_data.py`, with `tools/jp127_english.py` and `translations/jp127/message_text.tsv`, all inside the exe) from your US base game, the extracted JP updates 01.01 to 01.27 and, optionally, the extracted US updates. It shows the log, has a dry run, and stops with a plain error when an input folder is missing. "Extract JP update PKGs" runs `external/ps3recomp/tools/pkg_extract.py` over a folder of update `.pkg` files into folders `01.01` .. `01.27` when that script is bundled. The decrypted JP 1.27 `EBOOT.elf` goes in `<output folder>/eboot/jp127.elf` (or `ultimate/jp127.elf`).
+- **Advanced**: paths, guest tweaks, mute and extra arguments. A blank path is found automatically (the grey text shows where) or means the default from the table above, and no flag is passed.
+
+Press Check to see the exact command, or Save and Play to save and start the game. If an exe or ELF is missing, the window shows the missing path in red and does not start. Settings go in `hsg_settings.json` next to the launcher. Use Settings folder (or `--settings <file or folder>`) to keep the file elsewhere.
+
+Without a window (the exe is a Windows GUI program: use `| Out-String` in PowerShell, or `--out-file`, to see the text):
 
 ```
-.venv/Scripts/python.exe tools/hsg_launcher.py
+HotShotsGolfLauncher.exe --print-command                    # print the command and environment, do not start
+HotShotsGolfLauncher.exe --run                              # start the game from the saved settings
+HotShotsGolfLauncher.exe --print-command --edition ult --profile Alex --set fps=\"60\"
+HotShotsGolfLauncher.exe --ultimate-setup --out D:/ultimate --base-dir <base game> --updates <jp updates> [--us-updates <dir>] [--dry]
+HotShotsGolfLauncher.exe --pkg-extract <in.pkg> <out dir>
 ```
 
-The window has four tabs. Display holds resolution, aspect mode and window mode (windowed, fullscreen or hidden). Textures holds the HD pack folder, its memory budget and the texture dump folder. Frame rate holds the experimental frame rate choice. Advanced holds the exe path, the guest tweaks file, mute, the game, hdd0, hdd1, save and dev_flash folders, and a box for extra arguments. A blank path means the default from the table above, and the launcher passes no flag for it.
+Experimental items are marked in the window:
 
-Press Check to see the exact command, or Save and Play to save and start the game. If `HotShotsGolfRecomp.exe` or `EBOOT.elf` is missing, the window shows the missing path in red and does not start. Settings go in `hsg_settings.json` next to the launcher. Use Settings folder (or `--settings <file or folder>`) to keep the file elsewhere.
-
-Without a window:
-
-```
-python tools/hsg_launcher.py --print-command   # print the command and environment, do not start
-python tools/hsg_launcher.py --run             # start the game from the saved settings
-```
-
-Experimental items are marked in the window. They are shown even where the current build does not support them yet:
-
-- Aspect `expand` is planned for patch 0055. Current builds accept only `stretch` and `fit`, and exit with code 2 on `expand`.
-- Frame rate (`HSG_FPS`) is in progress. Nothing in the code reads it yet, so it has no effect.
 - Guest tweaks (`HSG_TWEAKS=<file.json>`) come from patch 0059. They write game memory values while the title runs.

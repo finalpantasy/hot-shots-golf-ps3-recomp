@@ -33,14 +33,39 @@ longest string in code points (group) and over all groups (header). All little-e
 import argparse, hashlib, os, re, struct, sys, zlib
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "tools"))
+if getattr(sys, "frozen", False):          # PyInstaller launcher: bundled data sits in _MEIPASS
+    ROOT = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+else:
+    ROOT = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(ROOT / "tools"))
 UPD_JP = Path("A:/hsg-updates/x/BCJS30089")
 US_LAYERS = [ROOT / "work/game/base-1.00/USRDIR"] + \
     [Path("A:/hsg-updates/x/NPUA80864") / v / "USRDIR" for v in ("01.01", "01.02", "01.03")]
 AS_LAYERS = [Path("A:/Everybody's Golf 6 (Asia) (En,Zh,Ko)/PS3_GAME/USRDIR")] + \
     [Path("A:/hsg-updates/x/BCAS20276") / v / "USRDIR" for v in ("01.01", "01.02", "01.03")]
 TRANS = ROOT / "translations/jp127/message_text.tsv"
+
+
+def configure(jp_updates=None, base_usrdir=None, us_updates=None, asia_dir=None,
+              asia_updates=None, translations=None):
+    """Point the tool at other folders (the launcher's Ultimate setup). None keeps the default.
+    us_updates / asia_updates hold the extracted updates 01.01..01.03 of NPUA80864 / BCAS20276;
+    asia_dir is the Asia PS3_GAME folder. A missing layer is skipped."""
+    global UPD_JP, US_LAYERS, AS_LAYERS, TRANS
+    if jp_updates:
+        UPD_JP = Path(jp_updates)
+    if base_usrdir or us_updates:
+        base = Path(base_usrdir) if base_usrdir else US_LAYERS[0]
+        up = Path(us_updates) if us_updates else US_LAYERS[1].parent.parent
+        US_LAYERS = [base] + [up / v / "USRDIR" for v in ("01.01", "01.02", "01.03")]
+    if asia_dir or asia_updates:
+        base = Path(asia_dir) / "USRDIR" if asia_dir else AS_LAYERS[0]
+        up = Path(asia_updates) if asia_updates else AS_LAYERS[1].parent.parent
+        AS_LAYERS = [base] + [up / v / "USRDIR" for v in ("01.01", "01.02", "01.03")]
+    if translations:
+        TRANS = Path(translations)
+
+
 MSG_REL = "xbdata/menu/message_text.JP_00.xb"
 PLACEHOLDER = {"", " ", "???", "？？？", "-", "－"}
 
@@ -187,7 +212,8 @@ def jp_hash(s):
     return hashlib.sha1(s.encode("utf-8", "surrogateescape")).hexdigest()[:16]
 
 
-def load_translations(path=TRANS):
+def load_translations(path=None):
+    path = path or TRANS
     """key 'table:group:index' -> (jp_hash, en). Lines: key<TAB>jp-hash<TAB>en; '#' comments."""
     tr = {}
     if not path.exists():

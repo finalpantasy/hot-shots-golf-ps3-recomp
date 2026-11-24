@@ -2,6 +2,13 @@
 """Assemble the game data for the JP 1.27 build (Minna no Golf 6, BCJS30089).
 
 usage: build_ultimate_data.py [--base us|asia] [--out A:/hsg-ultimate] [--lang en|ja] [--dry]
+           [--base-dir <game folder with USRDIR and PARAM.SFO>]   (default work/game/base-1.00 for us)
+           [--updates <folder holding the extracted JP updates 01.01 .. 01.27>]
+                                                                  (default A:/hsg-updates/x/BCJS30089)
+           [--us-updates <folder holding extracted US updates 01.01 .. 01.03>]   (English source, optional)
+           [--asia-dir <Asia PS3_GAME folder>] [--asia-updates <folder>]         (English source, optional)
+           [--translations <message_text.tsv>]
+Missing inputs end the run with "[error] ..." and exit code 2 before anything is written.
 
 Writes (nothing goes into git; every path is outside the repo):
   <out>/game/                      the "disc" (/dev_bdvd, --game-dir):
@@ -36,7 +43,9 @@ size and mtime are kept, so a second run only adds what changed.
 import argparse, os, re, shutil, struct, sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # jp127_english sits beside this file
+
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)     else Path(__file__).resolve().parent.parent
 UPD = Path("A:/hsg-updates/x/BCJS30089")
 BASES = {
     "us": dict(usrdir=ROOT / "work/game/base-1.00/USRDIR", sfo=ROOT / "work/game/base-1.00/PARAM.SFO",
@@ -91,10 +100,14 @@ def sfo_set(entries, key, value):
 
 # ---- file placement ---------------------------------------------------------
 class Placer:
-    def __init__(self, dry):
+    def __init__(self, dry, total=0):
         self.dry, self.linked, self.copied, self.kept = dry, 0, 0, 0
+        self.total, self.n = total, 0
 
     def put(self, src, dst):
+        self.n += 1
+        if self.total and self.n % 2000 == 0:
+            print(f"[data] progress {self.n}/{self.total} files", flush=True)
         st = src.stat()
         if dst.exists():
             dt = dst.stat()
@@ -150,19 +163,65 @@ def update_files():
     return vers, files
 
 
+def check_inputs(a, cfg):
+    """Return a list of plain-English problems with the inputs (empty = good)."""
+    bad = []
+    if not (cfg["usrdir"].is_dir() and cfg["sfo"].is_file()):
+        bad.append(f"Base game folder is missing or incomplete: need USRDIR/ and PARAM.SFO in "
+                   f"{cfg['sfo'].parent}")
+    vers = []
+    if UPD.is_dir():
+        vers = sorted(p.name for p in UPD.iterdir() if re.fullmatch(r"01\.\d\d", p.name) and (p / "USRDIR").is_dir())
+    if not vers:
+        bad.append(f"JP update folder has no extracted updates: {UPD} must hold folders 01.01 .. 01.27, "
+                   f"each with a USRDIR folder (extract the JP update PKGs first)")
+    elif vers[-1] != "01.27" or len(vers) != 27:
+        bad.append(f"JP updates in {UPD} are incomplete: found {len(vers)} (01.01 .. {vers[-1]}), need all 27 up to 01.27")
+    elif not (UPD / "01.27" / "PARAM.SFO").is_file():
+        bad.append(f"{UPD / '01.27' / 'PARAM.SFO'} is missing")
+    if a.lang == "en" and not Path(a.translations).is_file():
+        bad.append(f"Translation table not found: {a.translations}")
+    return bad
+
+
 def main():
+    global UPD
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", choices=sorted(BASES), default="us")
     ap.add_argument("--out", default="A:/hsg-ultimate")
     ap.add_argument("--lang", choices=["en", "ja"], default="en")
     ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--base-dir", help="base game folder (holds USRDIR and PARAM.SFO); default per --base")
+    ap.add_argument("--updates", help="extracted JP updates (01.01 .. 01.27); default " + str(UPD))
+    ap.add_argument("--us-updates", help="extracted US updates NPUA80864 (01.01 .. 01.03); English source")
+    ap.add_argument("--asia-dir", help="Asia PS3_GAME folder; English source")
+    ap.add_argument("--asia-updates", help="extracted Asia updates BCAS20276; English source")
+    ap.add_argument("--translations", default=None, help="message_text.tsv (default: the bundled one)")
     a = ap.parse_args()
-    cfg, out = BASES[a.base], Path(a.out)
+    cfg, out = dict(BASES[a.base]), Path(a.out)
+    if a.base_dir:
+        b = Path(a.base_dir)
+        cfg["usrdir"], cfg["sfo"] = b / "USRDIR", b / "PARAM.SFO"
+    if a.updates:
+        UPD = Path(a.updates)
+    import jp127_english
+    jp127_english.configure(jp_updates=UPD, base_usrdir=cfg["usrdir"] if a.base == "us" else None,
+                            us_updates=a.us_updates, asia_dir=a.asia_dir, asia_updates=a.asia_updates,
+                            translations=a.translations)
+    if a.translations is None:
+        a.translations = str(jp127_english.TRANS)
+    bad = check_inputs(a, cfg)
+    if bad:
+        for b in bad:
+            print("[error] " + b, flush=True)
+        return 2
+    if out.drive and not Path(out.drive + "/").exists():
+        print(f"[error] Output drive {out.drive} does not exist", flush=True)
+        return 2
     game, hdd = out / "game", out / "hdd0/game/BCJS30089"
-    pl = Placer(a.dry)
 
     vers, upd = update_files()
-    print(f"[data] JP updates {vers[0]}..{vers[-1]}: {len(upd)} files after layering")
+    print(f"[data] JP updates {vers[0]}..{vers[-1]}: {len(upd)} files after layering", flush=True)
 
     base = {}
     for dp, _, fs in os.walk(cfg["usrdir"]):
@@ -177,6 +236,7 @@ def main():
 
     merged = dict(base)
     merged.update(upd)
+    pl = Placer(a.dry, len(merged) + len(upd))
     # A stale file from an earlier run with another base must not survive.
     want = {(game / "USRDIR" / r).as_posix().lower() for r in merged}
     want_hdd = {(hdd / "USRDIR" / r).as_posix().lower() for r in upd}
@@ -211,8 +271,9 @@ def main():
     print(f"[data] {'would place' if a.dry else 'placed'}: {pl.linked} linked, {pl.copied} copied, "
           f"{pl.kept} unchanged, {stale} stale removed -> {game} and {hdd}")
     if a.lang == "en":
-        import jp127_english
-        print("[data] english:", jp127_english.build(out, a.dry))
+        print("[data] building English archives ...", flush=True)
+        print("[data] english:", jp127_english.build(out, a.dry), flush=True)
+    print("[data] done" + (" (dry run, nothing written)" if a.dry else ""), flush=True)
     return 0
 
 
