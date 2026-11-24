@@ -2,7 +2,7 @@
 
 A native Windows port of the PS3 game Hot Shots Golf: World Invitational (US, `NPUA80864`, known as Everybody's Golf 6 outside North America), made by statically recompiling the PS3 executable to x86-64 with [ps3recomp](https://github.com/sp00nznet/ps3recomp). No emulator runs underneath it.
 
-**It is playable.** The port targets the official update 1.03. It boots, shows the menus and plays full rounds with a keyboard or an Xbox-style controller. It runs at any resolution, including 1440p and 4K, with ultrawide support, HD texture packs and an opt-in 60, 90 or 120 FPS mode on the course. Intro and replay movies play through the video decoder built into Windows.
+**It is playable.** The port targets the official update 1.03, with the Ultimate Edition as a second build. It boots, shows the menus and plays full rounds with a keyboard or an Xbox-style controller. It runs at any resolution, including 1440p and 4K, with ultrawide support, HD texture packs and opt-in frame rates up to 240 FPS on the course, and an Ultimate Edition (the Japanese 1.27 build with English text). Intro and replay movies play through the video decoder built into Windows.
 
 You must own the game. The game's code and data belong to Sony and Clap Hanz, and this project distributes no game files. See [Playing](#playing) for what you supply.
 
@@ -22,18 +22,18 @@ Captured from the current build: the 1440p and 16:9 shots on 2026-11-22, the ult
 
 ## Status
 
-Updated 2026-11-22.
+Updated 2026-11-23.
 
 | Area | State |
 | --- | --- |
-| Game version | Official US 1.03 (`Ver.1.03` on the title screen) |
+| Game version | Official US 1.03 (`Ver.1.03` on the title screen). Ultimate Edition: Japanese 1.27 with English text, built from your own US disc and JP updates; some online-only lobby textures stay Japanese |
 | Boot, menus, rounds | Work. Full rounds play from the title through the leaderboard |
 | Resolution | Any size from 160 to 16384 px, including 1440p and 4K. `--aspect fit` keeps 16:9 with black bars; `--aspect expand` widens the view for ultrawide screens |
 | HD textures | `--tex-dump`, `--tex-replace` and `tools/make_hd_pack.py` build and load replacement packs. No pack is included |
-| Frame rate | 30 by default. Opt-in 60, 90 or 120 FPS on the course (`HSG_FPS`) by interpolating frames; game logic stays at 30. Menus stay at 30 |
+| Frame rate | 30 by default. Opt-in 60, 120, 144, 165, 180, 240, Unlocked or Match monitor on the course (`HSG_FPS`), with a vsync toggle, in both editions. Frames are interpolated; game logic stays at 30 Hz. Menus stay at 30 and the swing gauge runs at 60. Per-step timing is verified; sustained rates above 30 FPS are not yet measured |
 | Shadows | Opt-in sharper shadow maps (`RSX_SHADOW_SCALE`) |
 | Timing and stability | 59.94 Hz timing, cuts to shader-compile stutter, and no "Not Responding" freezes during render stalls |
-| Launcher | `tools/hsg_launcher.py`: a Tkinter settings window. Settings are in `hsg_settings.json` and logs go to `logs/` |
+| Launcher | `HotShotsGolfLauncher.exe`: a standalone settings window with an edition picker, Ultimate data setup, HD texture option and save profiles. No Python needed. Settings are in `hsg_settings.json` and logs go to `logs/` |
 | Input | Xbox-style controllers (XInput) and the keyboard |
 | Audio | The mixer produces sound |
 | Intro and replay movies | Play (Windows H.264 decoder). `HSG_MOVIES=0` skips them |
@@ -43,13 +43,13 @@ Details and evidence are in [docs/STATUS.md](docs/STATUS.md), [docs/MODERN-PC-RO
 
 ## Playing
 
-The release zip (`HotShotsGolfRecomp-<date>-win64.zip`) holds the game program and a settings launcher. It holds no game files. You need your own copy of the game, and you must own it.
+The release zip (`HotShotsGolfRecomp-<version>-win64.zip`) holds the launcher and the game programs. It holds no game files. You need your own copy of the game, and you must own it.
 
 **In the zip**
 
-- `HotShotsGolfRecomp.exe`: the game, about 264 MB, no extra DLLs.
-- `hsg_launcher.py` and `Play Hot Shots Golf.cmd`: a settings window (resolution, aspect, window mode, frame rate, HD textures) that starts the game. It needs Python 3 with Tkinter, which the python.org installer includes.
-- `hsg_settings.json`: starting settings with paths relative to this folder.
+- `HotShotsGolfLauncher.exe`: a settings window that starts the game. It needs no Python.
+- `HotShotsGolfRecomp.exe`: the US 1.03 game, about 264 MB, no extra DLLs.
+- `ultimate/HotShotsGolfRecomp.exe`: the Ultimate Edition (Japanese 1.27 with English text).
 
 **What you supply, in the same folder as the exe**
 
@@ -58,13 +58,16 @@ The release zip (`HotShotsGolfRecomp-<date>-win64.zip`) holds the game program a
 | `EBOOT.elf` | next to the exe | The decrypted executable from the official 1.03 update for the US game (`NPUA80864`). The exe checks it against a known hash and refuses any other file. |
 | `game/` | next to the exe | The extracted base game: `PARAM.SFO` and `USRDIR/` from the 1.00 package. |
 | `dev_flash/` | next to the exe | The firmware folder from your own `PS3UPDAT.PUP`. The game needs its fonts (`data/font/`). |
+| `hdd0/game/NPUA80864/USRDIR/` (optional) | under this folder | The data files from the official 1.01 and 1.02 updates, every file except `EBOOT.BIN`, with 1.02 copied over 1.01. They add Toro and Kuro and the other 1.02 data. |
 
-The official executables are encrypted with a per-game license file. This project decrypted the 1.03 `EBOOT.elf` in RPCS3 with the owner's own license file for the title. You need to do the same with your own license. The project does not supply one. [docs/recomp-process.md](docs/recomp-process.md) describes the extraction steps.
+The official executables are encrypted with a per-game license file. You decrypt `EBOOT.elf` with your own license, for example in RPCS3. The project does not supply one. [docs/recomp-process.md](docs/recomp-process.md) describes the extraction steps.
+
+**Ultimate Edition.** The launcher builds the game data from your US base game and the extracted Japanese updates 01.01 to 01.27, and can extract the update `.pkg` files first. You also supply the decrypted JP 1.27 `EBOOT.elf`. `PLAYING.md` in the zip has the steps, and [docs/CLI.md](docs/CLI.md) lists the launcher options.
 
 **Start the game**
 
-1. Put the three items next to the exe.
-2. Double-click `Play Hot Shots Golf.cmd`, check the settings, and press Play. Without Python, run the exe with flags instead, for example:
+1. Put the items next to the exe.
+2. Double-click `HotShotsGolfLauncher.exe`, pick the edition, check the settings, and press Save and Play. You can also run the exe with flags, for example:
    `HotShotsGolfRecomp.exe --elf EBOOT.elf --game-dir game --dev-flash dev_flash --width 1920 --height 1080 --aspect fit`
    All flags are in [docs/CLI.md](docs/CLI.md).
 3. Saves, caches and logs stay in this folder (`hdd0`, `hdd1`, `savedata`, `cache`, `logs`). Delete the folder to remove everything.
@@ -72,11 +75,10 @@ The official executables are encrypted with a per-game license file. This projec
 **Options**
 
 - Resolution: any size, including 1440p and 4K. `--aspect fit` keeps 16:9 with black bars. `--aspect expand` widens the view for ultrawide screens.
-- Frame rate: set `fps` to 60, 90 or 120 in the launcher (`HSG_FPS`). This applies on the course only. Game logic stays at 30 and menus stay at 30 FPS.
-- HD textures: `--tex-replace <folder>` loads replacement textures. Build a pack from your own game with `--tex-dump` and `tools/make_hd_pack.py` (repository). No pack is included.
+- Frame rate: pick 60 up to 240, Unlocked or Match monitor in the launcher (`HSG_FPS`). This applies on the course only. Game logic stays at 30 and menus stay at 30 FPS.
+- HD textures: tick the option in the launcher or pass `--tex-replace <folder>`. Build a pack from your own game with `--tex-dump` and `tools/make_hd_pack.py` (repository). No pack is included.
+- Save profiles: a separate save folder per profile and edition.
 - Sharper shadows are opt-in (`RSX_SHADOW_SCALE=2` to `4`).
-
-**Controls.** Xbox-style controllers work. The keyboard works when no controller is connected. See the table in the README.
 
 **Needs.** Windows 10 or 11 on x86-64, a D3D12 GPU, and about 4 GB of free disk space for the game files, saves and caches. No minimum CPU, GPU or RAM has been tested; it was developed on a high-end Windows 11 PC. The first run on a new shader cache pauses while shaders compile.
 
@@ -128,7 +130,7 @@ The lift writes about 2.3 GB of C++ and the first build takes a long time. Later
 
 ## Release goals
 
-1. One ready-to-run executable with a small settings launcher. Players do not build anything.
+1. Ready-to-run executables with a standalone settings launcher. Players do not build anything.
 2. Portable by default. Every file stays in the executable's folder, so deleting the folder removes the game.
 3. A command-line flag for every setting.
 
