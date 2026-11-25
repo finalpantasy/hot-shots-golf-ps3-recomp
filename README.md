@@ -1,6 +1,6 @@
-# Hot Shots Golf: World Invitational PC Port (PS3 Static Recompilation)
+# Hot Shots Golf: World Invitational PC Port (Everybody's Golf 6 for Windows, PS3 Static Recompilation)
 
-A native Windows port of the PS3 game Hot Shots Golf: World Invitational (US, `NPUA80864`, known as Everybody's Golf 6 outside North America), made by statically recompiling the PS3 executable to x86-64 with [ps3recomp](https://github.com/sp00nznet/ps3recomp). No emulator runs underneath it.
+A native PC (Windows) port of the PS3 game Hot Shots Golf: World Invitational (US, `NPUA80864`; Everybody's Golf 6 in Europe and Australia; Minna no Golf 6, みんなのGOLF 6, in Japan), made by statically recompiling the PS3 executable to x86-64 with [ps3recomp](https://github.com/sp00nznet/ps3recomp). It is a recompilation, not an emulator: no PS3 emulator runs underneath it. It plays at 4K and ultrawide resolutions and offers opt-in frame rates up to 240 FPS on the course.
 
 **It is playable.** The port targets the official update 1.03, with the Ultimate Edition as a second build. It boots, shows the menus and plays full rounds with a keyboard or an Xbox-style controller. It runs at any resolution, including 1440p and 4K, with ultrawide support, HD texture packs and opt-in frame rates up to 240 FPS on the course, and an Ultimate Edition (the Japanese 1.27 build with English text). Intro and replay movies play through the video decoder built into Windows.
 
@@ -20,9 +20,33 @@ You must own the game. The game's code and data belong to Sony and Clap Hanz, an
 
 Captured from the current build: the 1440p and 16:9 shots on 2026-11-22, the ultrawide shots on 2026-11-21. The 1440p course shots use an HD texture pack built from the owner's own game files.
 
+## Ultimate Edition: rare characters and the capsule machine
+
+The Ultimate Edition (the Japanese 1.27 build with English text) adds a launcher setting, **Unlocks**, with three modes:
+
+- **Original:** the game's own progression, unchanged.
+- **Grind:** earn capsule tickets by playing Challenge mode, then spend them in the game's own capsule machine (the Japanese rare-character gacha). The machine is restored for offline play: press Triangle in the offline Shop.
+- **Unlock all:** the 15 rare characters at 7 stars, with their gacha outfits.
+
+In Grind mode, Challenge results pay tickets for placement, holes, first wins and under-par scores. Easier and repeated events pay less. 12 points make one ticket, and the launcher's ticket rate can be 0.5x, 1x or 2x. The ticket count is shown at round end. Capsule odds are 72% blue, 20% purple and 8% red, and a red is guaranteed after 25 draws without one. Duplicates fill a rarity gauge; once every character is maxed, tickets turn into shop points. Each unlock mode keeps its own save folder.
+
+The capsule screens, name plates and 1st, 2nd and 3rd place ordinals are in English.
+
+![Select Character in the Ultimate Edition with the rare Yuna in her gacha outfit, 7-star stats and a Gauge Shot preview](docs/images/ultimate-rare-yuna-character-select-2026-11-24.png)
+
+![Rare Yuna in her gacha outfit teeing off on hole 1 in the Ultimate Edition](docs/images/ultimate-rare-yuna-round-2026-11-24.png)
+
+![The capsule machine's odds table in English, showing each rare character, its rarity stars, the chance in percent and the 1-Spin and 10-Spin buttons](docs/images/ultimate-capsule-machine-odds-2026-11-24.png)
+
+![Four capsule machine result screens: a new 3-star character, a duplicate, the rarity gauge filling and another new character, all with English name plates](docs/images/ultimate-capsule-get-screens-2026-11-24.png)
+
+![The Rare Character List screen after a draw, showing collected characters with stars and unknown ones as question marks](docs/images/ultimate-rare-character-list-2026-11-24.png)
+
+Captured from test runs of the Ultimate Edition on 2026-11-24.
+
 ## Status
 
-Updated 2026-11-23.
+Updated 2026-11-24.
 
 | Area | State |
 | --- | --- |
@@ -33,7 +57,8 @@ Updated 2026-11-23.
 | Frame rate | 30 by default. Opt-in 60, 120, 144, 165, 180, 240, Unlocked or Match monitor on the course (`HSG_FPS`), with a vsync toggle, in both editions. Frames are interpolated; game logic stays at 30 Hz. Menus stay at 30 and the swing gauge runs at 60. Per-step timing is verified; sustained rates above 30 FPS are not yet measured |
 | Shadows | Opt-in sharper shadow maps (`RSX_SHADOW_SCALE`) |
 | Timing and stability | 59.94 Hz timing, cuts to shader-compile stutter, and no "Not Responding" freezes during render stalls |
-| Launcher | `HotShotsGolfLauncher.exe`: a standalone settings window with an edition picker, Ultimate data setup, HD texture option and save profiles. No Python needed. Settings are in `hsg_settings.json` and logs go to `logs/` |
+| Ultimate unlocks | Launcher setting for the Ultimate Edition: Original, Grind (earn capsule tickets in Challenge mode, spend them in the offline capsule machine) or Unlock all (15 rare characters at 7 stars with gacha outfits). English capsule screens and name plates; ticket rate 0.5x, 1x or 2x; separate saves per mode. The ticket display at round end is being reworked |
+| Launcher | `HotShotsGolfLauncher.exe`: a standalone settings window with an edition picker, Ultimate data setup, Unlocks mode and ticket rate, HD texture option and save profiles. No Python needed. Settings are in `hsg_settings.json` and logs go to `logs/` |
 | Input | Xbox-style controllers (XInput) and the keyboard |
 | Audio | The mixer produces sound |
 | Intro and replay movies | Play (Windows H.264 decoder). `HSG_MOVIES=0` skips them |
@@ -78,6 +103,7 @@ The official executables are encrypted with a per-game license file. You decrypt
 - Frame rate: pick 60 up to 240, Unlocked or Match monitor in the launcher (`HSG_FPS`). This applies on the course only. Game logic stays at 30 and menus stay at 30 FPS.
 - HD textures: tick the option in the launcher or pass `--tex-replace <folder>`. Build a pack from your own game with `--tex-dump` and `tools/make_hd_pack.py` (repository). No pack is included.
 - Save profiles: a separate save folder per profile and edition.
+- Ultimate Edition unlocks: Original, Grind or Unlock all, with a ticket rate of 0.5x, 1x or 2x (see [Ultimate Edition: rare characters and the capsule machine](#ultimate-edition-rare-characters-and-the-capsule-machine)).
 - Sharper shadows are opt-in (`RSX_SHADOW_SCALE=2` to `4`).
 
 **Needs.** Windows 10 or 11 on x86-64, a D3D12 GPU, and about 4 GB of free disk space for the game files, saves and caches. No minimum CPU, GPU or RAM has been tested; it was developed on a high-end Windows 11 PC. The first run on a new shader cache pauses while shaders compile.
