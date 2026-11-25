@@ -268,9 +268,19 @@ void toast(const char* fmt, ...)
     g_toast.push_back(buf);
 }
 
+// The host overlay is a fallback (HSG_GRIND_OVERLAY=1): by default the grind news shows in the
+// game's own UI (hsg_jp127_native_ui.cpp) and the lines only go to the log.
+bool overlay_on()
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("HSG_GRIND_OVERLAY"); on = e && *e == '1'; }
+    return on != 0;
+}
+
 void toast_flush(int ms)
 {
     if (g_toast.empty()) return;
+    if (!overlay_on()) { g_toast.clear(); return; }
     if ((int)g_toast.size() > kToastLines) {   // keep the first lines, summarize the rest
         const int more = (int)g_toast.size() - (kToastLines - 1);
         g_toast.resize(kToastLines - 1);
@@ -557,6 +567,9 @@ const char* kind_name(Event k)
          : k == Event::Cosplay ? "cosplay" : "test";
 }
 int g_test_points = 0;   // Event::Test amount (HSG_UNLOCKS_TEST_AWARD)
+int g_round_serial = 0;   // round ends seen (PrizeManager ctor, grind)
+int g_award_serial = -1;  // g_round_serial of the last round that paid
+long long g_last_add = 0; // its points, 1/100
 
 // The one place grind progress is granted. Tournament / Vs / Cosplay: tier 0-6, holes,
 // placement (1-based; for Vs and Cosplay 1 = won, 2 = lost), under_par (strokes under par, negative = over),
@@ -611,6 +624,7 @@ long long award_points(ppu_context* ctx, Event kind, int tier, int holes, int pl
     }
     const long long add = (base + bonus) * rate_pct() / 100;
     g_store.cpoints += add;
+    if (kind != Event::Test) g_award_serial = g_round_serial, g_last_add = add;
     const long long per = (long long)kPointsPerTicket * kCent;
     const int t = (int)(g_store.cpoints / per);
     g_store.cpoints -= t * per;
@@ -795,6 +809,16 @@ double star_odds(int star)
     if (star >= 4 && star <= 6) return kOddsPurple / tot / 3.0;
     return star == 7 ? kOddsRed / tot : 0.0;
 }
+bool round_award(long long* add_cents, int* tickets, long long* progress_cents, int* per_ticket)
+{
+    if (g_award_serial != g_round_serial || g_round_serial == 0) return false;
+    *add_cents = g_last_add;
+    *tickets = g_store.tickets;
+    *progress_cents = g_store.cpoints;
+    *per_ticket = kPointsPerTicket;
+    return true;
+}
+bool overlay_enabled() { return overlay_on(); }
 void toast_line(const char* utf8) { g_toast.push_back(utf8); }
 void toast_post(int ms) { toast_flush(ms); }
 }  // namespace hsg
@@ -862,5 +886,6 @@ void func_00348384(ppu_context* ctx)
     drain(ctx);
     if (mode() != Mode::Grind || !vm_base) return;
     if (g_debug) { snap_diff("round-end"); g_snap_tick = g_tick; }
+    g_round_serial++;
     on_round_end(ctx);
 }

@@ -831,6 +831,134 @@ def make_capsule_asset():
     return asset
 
 
+# ---- grind rows on the round results panel (HSG_UNLOCKS=grind, port/hsg_jp127_native_ui.cpp) --
+# The single-player results panel (layout_result_ranking.lay, group "st") shows Score / Points as
+# label chips (result_01 index001/002) with digit parts. We add a second block in the same
+# style: label chips "Ticket Pts" / "Tickets" (our renders, painted into the empty right strip of
+# result_03 as two new chips appended to its map), digit parts for the values, a '.' chip and
+# a score_bg shadow. The port shows the block only in grind mode after a paying round and then
+# moves the game's Score / Points block left so the two sit side by side; otherwise it hides it.
+# translations/jp127/grind_labels.rgba.z holds the label images (u16 w, u16 h, RGBA per label;
+# `labels` regenerates it with Pillow). Idempotent: an archive that has the parts is left alone.
+GRIND_REL = "xbdata/menu/result/result.JP_00.xb"
+GRIND_LAYOUT = "data/menu/result/layout_result_ranking.lay"
+GRIND_TEX = "result_03"
+GRIND_CHIPS = [("tkpts001", "196,3,255,22", "Ticket Pts"), ("tkt001", "196,25,255,44", "Tickets")]
+GRIND_ANCHOR = "score_bg0,chip,4,58,236,319,404,361,255,255,255,255,"   # last row of the st block
+GRIND_PARTS = [                 # drawn front to back (a group lists its backgrounds last)
+    "idx_tkpts0,chip,5,1,328,319,408,341,255,255,255,255,",
+    "idx_tickets0,chip,5,2,328,339,408,361,255,255,255,255,",
+    "tkpts0,digit3,4,25,402,319,454,341,255,255,255,255,",
+    "tkdot0,chip,4,35,454,319,460,341,255,255,255,255,",
+    "tkfrac0,digit1,4,25,460,319,473,341,255,255,255,255,",
+    "tickets0,digit5,4,25,408,339,473,361,255,255,255,255,",
+]
+GRIND_BG = "tk_bg0,chip,4,58,324,319,492,361,255,255,255,255,"   # after the game's score_bg0
+
+
+def grind_asset():
+    return TRANS.parent / "grind_labels.rgba.z"
+
+
+def grind_images():
+    p = grind_asset()
+    if not p.exists():
+        return None
+    raw = zlib.decompress(p.read_bytes())
+    out, pos = [], 0
+    while pos < len(raw):
+        w, h = struct.unpack_from("<HH", raw, pos)
+        pos += 4
+        out.append((w, h, raw[pos:pos + w * h * 4]))
+        pos += w * h * 4
+    return out
+
+
+def grind_label_rect(tex, mapt, rect):
+    head = mapt.split("\n")[1].split(",")
+    lw, lh = int(head[1]), int(head[2])
+    w, h = dds_dims(tex)
+    x0, y0, x1, y1 = (int(v) for v in rect.split(","))
+    return round(x0 * w / lw), round(y0 * h / lh), round((x1 + 1) * w / lw), round((y1 + 1) * h / lh)
+
+
+def grind_ui_patch(rel, fb, stats):
+    if rel != GRIND_REL:
+        return
+    lh = fb_hash(GRIND_LAYOUT)
+    th, mapt = find_texture(fb, GRIND_TEX)
+    imgs = grind_images()
+    if lh not in fb.index or th is None or imgs is None or len(imgs) != len(GRIND_CHIPS):
+        stats["grind_ui_skipped"] = 1
+        return
+    lay = fb.get(lh).decode("utf-8")
+    nl = "\r\n" if "\r\n" in lay else "\n"
+    if "idx_tickets0," in lay:
+        stats["grind_ui"] = "present"
+        return
+    st = lay.find(nl + "#st" + nl)
+    at = lay.find(GRIND_ANCHOR, st)
+    nxt = lay.find(nl + "#", st + 4)
+    maplines = mapt.split("\n")
+    head = maplines[1].split(",")
+    # the map must be the one we know: only retire001 (chip 0), nothing in the right strip
+    if st < 0 or at < 0 or (nxt >= 0 and at > nxt) or [l for l in maplines[2:] if l.strip()] != \
+            ["result_03@retire001,3,3,194,82"] or head[1:3] != ["256", "90"]:
+        stats["grind_ui_skipped"] = 1
+        return
+    end = at + len(GRIND_ANCHOR)
+    lay = lay[:at] + "".join(p + nl for p in GRIND_PARTS) + lay[at:end] + nl + GRIND_BG + lay[end:]
+    tex = bytearray(fb.get(th))
+    for (chip, rect, _), img in zip(GRIND_CHIPS, imgs):
+        if not paint_label(tex, grind_label_rect(tex, mapt, rect), "clear", img):
+            stats["grind_ui_skipped"] = 1
+            return
+    mraw = fb.get(th + MAP_DELTA & 0xFFFFFFFF).decode("utf-8")
+    mnl = "\r\n" if "\r\n" in mraw else "\n"
+    mraw = mraw.rstrip("\r\n") + "".join(mnl + "%s@%s,%s" % (GRIND_TEX, c, r) for c, r, _ in GRIND_CHIPS) + mnl
+    fb.put(lh, lay.encode("utf-8"))
+    fb.put(th, bytes(tex))
+    fb.put(th + MAP_DELTA & 0xFFFFFFFF, mraw.encode("utf-8"))
+    stats["grind_ui"] = "added"
+
+
+def make_grind_asset(font="C:/Windows/Fonts/bahnschrift.ttf"):
+    """Labels like the panel's own Score / Points chips: white, near-black outline, right-aligned.
+    Drawn on an 80 x 20 map-unit cell at 3x (240 x 60 px, the result_01 chip size), then squeezed
+    to the result_03 chip (60 x 20 units): the part rect is 80 units wide, so the game stretches
+    it back to the original proportions."""
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+    files = jp_update_files()
+    jp = fb_load(files[GRIND_REL])
+    us, asia = english_sources(GRIND_REL)
+    if us or asia:
+        merge_layout(jp, fb_load(us or asia), "data/menu/result/")
+    th, mapt = find_texture(jp, GRIND_TEX)
+    tex = jp.get(th)
+    blobs = bytearray()
+    for _, rect, text in GRIND_CHIPS:
+        x0, y0, x1, y1 = grind_label_rect(tex, mapt, rect)
+        cw, ch = 240, 60
+        f = ImageFont.truetype(font, 50)
+        try:
+            f.set_variation_by_name("Regular")
+        except Exception:
+            pass
+        mask = Image.new("L", (cw, ch), 0)
+        d = ImageDraw.Draw(mask)
+        bb = d.textbbox((0, 0), text, font=f, anchor="ls")
+        cap = d.textbbox((0, 0), "P", font=f, anchor="ls")
+        base = 8 + 4 + (cap[3] - cap[1])        # cap top at y=12 inside the 4 px outline (orig 8)
+        d.text((cw - 5 - 4 - bb[2], base), text, font=f, fill=255, anchor="ls")
+        t = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        t.paste((16, 16, 16, 255), (0, 0), mask.filter(ImageFilter.MaxFilter(9)))
+        t.paste((255, 255, 255, 255), (0, 0), mask)
+        t = t.resize((x1 - x0, y1 - y0), Image.LANCZOS)
+        blobs += struct.pack("<HH", x1 - x0, y1 - y0) + t.tobytes()
+    grind_asset().write_bytes(zlib.compress(bytes(blobs), 9))
+    return grind_asset()
+
+
 # ---- driver -----------------------------------------------------------------------------
 def write_out(data, dsts, dry):
     for d in dsts:
@@ -872,6 +1000,7 @@ def build(out, dry=False, needs=None, report=None):
                 tot["rare_labels"] = paint_rare_labels(jp)
             borrow_textures(rel, jp, tot)
             paint_capsule_labels(rel, jp, tot)
+            grind_ui_patch(rel, jp, tot)
             if report is not None:
                 report.extend((rel,) + k for k in kept)
         tot["archives"] += 1
@@ -893,6 +1022,7 @@ def main():
     if a.cmd == "labels":
         print("[english] wrote", make_label_asset())
         print("[english] wrote", make_capsule_asset())
+        print("[english] wrote", make_grind_asset())
         return 0
     if a.cmd == "apply":
         print("[english]", build(out, a.dry))

@@ -224,7 +224,7 @@ elseif(HSG_TARGET_PROFILE STREQUAL "jp-1.27")
     # HSG_UNLOCKS offline rare characters).
     target_compile_definitions(${PROJECT_NAME} PRIVATE HSG_TARGET_JP_1_27=1)
     target_sources(${PROJECT_NAME} PRIVATE hsg_jp127_hooks.cpp hsg_jp127_unlocks.cpp
-        hsg_jp127_capsule.cpp)
+        hsg_jp127_capsule.cpp hsg_jp127_native_ui.cpp)
 elseif(NOT HSG_TARGET_PROFILE STREQUAL "fix-1.02")
     message(FATAL_ERROR "Unsupported HSG_TARGET_PROFILE: ${HSG_TARGET_PROFILE}")
 endif()

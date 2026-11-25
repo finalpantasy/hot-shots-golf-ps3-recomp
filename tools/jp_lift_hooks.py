@@ -21,6 +21,10 @@ HOOKS = {
     0x0044BD0C: "gashapon TUS rare bit set (pc, star-1): capsule debug log",
     0x0044C4E4: "gashapon TUS write of slots 1-63: capsule debug log",
     0x00772D94: "ordinal suffix index (rank): English data gets st/nd/rd/th instead of the JP 0",
+    0x0052C658: "message text lookup (table, group, index): native grind UI text and trace",
+    0x00A46050: "sprintf (dest, fmt, ...): native grind UI text and trace",
+    0x00334020: "results panel st fill (prize_layout_ranking): native grind ticket rows",
+    0x00168730: "Shop help bar text (shop task, text): native capsule machine hint",
 }
 
 

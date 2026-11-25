@@ -66,7 +66,11 @@ bool store_all_maxed();
 // Our odds and pity for one capsule over levels[15] (no state change): pc, star 1-7.
 // False when every rare is at 7 stars.
 bool store_roll(const int* levels, int pity, int* pc, int* star, bool* forced);
-void toast_line(const char* utf8);  // collect, then toast_post
+void toast_line(const char* utf8);  // collect, then toast_post (shown only with HSG_GRIND_OVERLAY=1)
+bool overlay_enabled();             // HSG_GRIND_OVERLAY=1: the host toast fallback is on
+// The last round end paid grind points: points added and progress toward the next ticket in
+// 1/100 points, tickets banked, points per ticket. False when the last round paid nothing.
+bool round_award(long long* add_cents, int* tickets, long long* progress_cents, int* per_ticket);
 void toast_post(int ms);
 
 // ---- capsule.cpp -> unlocks.cpp ---------------------------------------------------------
