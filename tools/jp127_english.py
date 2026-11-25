@@ -327,6 +327,24 @@ def chip_names(b):
     return [ln.split(",")[0] for ln in b.decode("utf-8", "replace").splitlines()[2:] if ln.strip()]
 
 
+def alpha_blocks(b):
+    """DXT3/DXT5 blocks (all mip levels) with any visible alpha; None for other formats."""
+    fmt, d = b[84:88], b[128:]
+    if fmt == b"DXT5":
+        return sum(1 for x, y in zip(d[0::16], d[1::16]) if x > 16 or y > 16)
+    if fmt == b"DXT3":
+        return sum(1 for i in range(0, len(d) - 15, 16) if any(d[i:i + 8]))
+    return None
+
+
+def blank_in_english(jb, eb):
+    """True when the English texture is (nearly) empty where the JP one has art: the US data
+    ships placeholders for parts it never used (info common_rarity: the odds table's rarity
+    stars), and swapping those in blanks the JP picture (stars hold no text)."""
+    j, e = alpha_blocks(jb), alpha_blocks(eb)
+    return j is not None and e is not None and j >= 16 and e * 20 < j
+
+
 def merge_layout(jp_fb, en_fb, texdir=None):
     """Swap JP textures for English ones in place. Returns (swapped, kept_jp list).
 
@@ -371,6 +389,9 @@ def merge_layout(jp_fb, en_fb, texdir=None):
             continue
         eb = en_fb.get(h)
         if eb == jb or not is_dds(eb):
+            continue
+        if blank_in_english(jb, eb):
+            kept.append((h, "English texture blank", dds_dims(jb)))
             continue
         m = (h + MAP_DELTA) & 0xFFFFFFFF
         jm = jp_fb.get(m) if m in jp_fb.index else None
@@ -653,6 +674,34 @@ def paint_label(tex, rect, bg, img):
     return True
 
 
+# Textures the US never localized in one archive but did in another: the capsule result
+# name plates (lobby_shop_layout chara_sel_name) carry the same 26 names at the same chip
+# rectangles as character select's chara_sel_name, whose US texture is English. Copied at
+# build time from the US archive (nothing stored here).
+BORROW = {
+    "xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb":
+        [("chara_sel_name", "xbdata/menu/phase/chrsel/chrsel.JP_00.xb")],
+}
+
+
+def borrow_textures(rel, fb, stats):
+    for name, src_rel in BORROW.get(rel, ()):
+        us = english_sources(src_rel)[0]
+        th, mapt = find_texture(fb, name)
+        sh, smap = find_texture(fb_load(us), name) if us else (None, None)
+        ok = th is not None and sh is not None
+        if ok:
+            src = fb_load(us).get(sh)
+            dst = fb.get(th)
+            ok = (mapt.split("\n")[2:] == smap.split("\n")[2:] and is_dds(src) and is_dds(dst)
+                  and dds_dims(src) == dds_dims(dst) and src[84:88] == dst[84:88])
+        if ok:
+            fb.put(th, src)
+            stats["borrowed_textures"] = stats.get("borrowed_textures", 0) + 1
+        else:
+            stats["borrow_skipped"] = stats.get("borrow_skipped", 0) + 1
+
+
 def paint_capsule_labels(rel, fb, stats):
     rows = [r for r in capsule_rows()]
     if not rows:
@@ -793,6 +842,9 @@ def write_out(data, dsts, dry):
         d.write_bytes(data)
 
 
+LANG_MARKER = "LANG.txt"
+
+
 def build(out, dry=False, needs=None, report=None):
     tr = load_translations()
     files = jp_update_files()
@@ -818,12 +870,15 @@ def build(out, dry=False, needs=None, report=None):
             tot["textures_swapped"] += sw
             if rel == INFO_REL:
                 tot["rare_labels"] = paint_rare_labels(jp)
+            borrow_textures(rel, jp, tot)
             paint_capsule_labels(rel, jp, tot)
             if report is not None:
                 report.extend((rel,) + k for k in kept)
         tot["archives"] += 1
         write_out(jp.bytes(), [out / "game/USRDIR" / rel, out / "hdd0/game/BCJS30089/USRDIR" / rel], dry)
     tot.update({"msg_" + k: v for k, v in msg_stats.items()})
+    # Read by the port (hsg_jp127_hooks.cpp, ordinal suffixes): the data is English.
+    write_out(b"en\n", [out / "game" / LANG_MARKER], dry)
     return tot
 
 

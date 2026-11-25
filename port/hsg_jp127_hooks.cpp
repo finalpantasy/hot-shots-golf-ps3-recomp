@@ -97,3 +97,51 @@ void func_00788B64(ppu_context* ctx)
         return;
     }
 }
+
+// Ordinal suffix (JP 0x00772D94, r3 = rank, returns the suffix index; callers add it to a
+// chip base, e.g. result_01 th_000..003, or 1 + it to a message group st/nd/rd/th). The JP
+// program runs with region index 0, for which the game returns 0 (the one JP suffix) for
+// every rank; with the English data in place chip 0 is "st", so ranks read "5st". When the
+// data is English (<game dir>/LANG.txt says "en", written by tools/jp127_english.py) this
+// returns the game's own English rule (its region 1 path): 0 st, 1 nd, 2 rd, 3 th, and th
+// for 11-13 of each hundred. Japanese data keeps the lifted function.
+void func_00772D94_lifted(ppu_context* ctx);
+
+namespace {
+bool english_data()
+{
+    static int on = -1;
+    if (on < 0) {
+        on = 0;
+        const char* root = getenv("PS3_VFS_ROOT");
+        char path[1024];
+        if (root && *root && (size_t)snprintf(path, sizeof path, "%s/LANG.txt", root) < sizeof path) {
+            if (FILE* f = fopen(path, "rb")) {
+                char buf[8] = {0};
+                fread(buf, 1, sizeof buf - 1, f);
+                fclose(f);
+                on = (tolower((unsigned char)buf[0]) == 'e' && tolower((unsigned char)buf[1]) == 'n');
+            }
+        }
+        fprintf(stderr, "[jp-ordinal] %s suffixes\n", on ? "English" : "game's own (Japanese)");
+    }
+    return on != 0;
+}
+}  // namespace
+
+void func_00772D94(ppu_context* ctx)
+{
+    if (!english_data()) { func_00772D94_lifted(ctx); return; }
+    int32_t n = (int32_t)ctx->gpr[3];
+    if (n < 0) n = -n;
+    int idx = 3;
+    if (n % 100 < 11 || n % 100 > 13) {
+        switch (n % 10) {
+        case 1: idx = 0; break;
+        case 2: idx = 1; break;
+        case 3: idx = 2; break;
+        default: break;
+        }
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)idx;
+}

@@ -46,6 +46,8 @@
 // HSG_UNLOCKS_SEED=<n> (testing) seeds the capsule RNG so tools/grind_sim.py --replay <n>
 // prints the same draws. HSG_UNLOCKS_TEST_ONEHOLE=1 (testing) ends every Challenge round
 // after its first hole (writes the round's last-hole index, game info +0x323, to 0).
+// HSG_UNLOCKS_TEST_PLACE=<1-20> (testing) overwrites the player's placement (result +0x66) at
+// round end, so the results screen and the award use that rank (ordinal suffix checks).
 //
 // Grind earning (milestone 3, design: memory note grind-ticket-economy):
 //  - The round-end prize screen is built by PrizeManager's constructor (0x00348384,
@@ -666,6 +668,12 @@ RoundInfo read_round(ppu_context* ctx)
     }
     if (r.result) {
         r.place0 = vm_read16(r.result + 0x66);
+        static const int test_place = env_int("HSG_UNLOCKS_TEST_PLACE", 0);
+        if (test_place >= 1 && test_place <= 20 && r.place0 != test_place - 1) {
+            fprintf(stderr, "[hsg-unlocks] test: placement %d -> %d\n", r.place0 + 1, test_place);
+            r.place0 = test_place - 1;
+            vm_write16(r.result + 0x66, (uint16_t)r.place0);
+        }
         r.vs_outcome = (int)(int8_t)vm_read8(r.result + 0x6B);
         r.handicap = vm_read16(r.result + 0x26);
         r.strokes = (int)vm_read32(r.result + 0xD0 + 0x1C);

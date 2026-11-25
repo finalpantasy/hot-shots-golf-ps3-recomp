@@ -20,6 +20,7 @@ HOOKS = {
     0x0044ABF4: "gashapon draw (records, count): HSG_UNLOCKS=grind saves the result to the store",
     0x0044BD0C: "gashapon TUS rare bit set (pc, star-1): capsule debug log",
     0x0044C4E4: "gashapon TUS write of slots 1-63: capsule debug log",
+    0x00772D94: "ordinal suffix index (rank): English data gets st/nd/rd/th instead of the JP 0",
 }
 
 

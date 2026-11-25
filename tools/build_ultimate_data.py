@@ -270,6 +270,9 @@ def main():
             f"base={a.base}\nusrdir={cfg['usrdir']}\nupdates={vers[0]}..{vers[-1]}\n", encoding="utf-8")
     print(f"[data] {'would place' if a.dry else 'placed'}: {pl.linked} linked, {pl.copied} copied, "
           f"{pl.kept} unchanged, {stale} stale removed -> {game} and {hdd}")
+    marker = out / "game" / jp127_english.LANG_MARKER
+    if a.lang != "en" and not a.dry and marker.exists():
+        marker.unlink()     # the port then keeps the Japanese ordinal suffix
     if a.lang == "en":
         print("[data] building English archives ...", flush=True)
         print("[data] english:", jp127_english.build(out, a.dry), flush=True)
