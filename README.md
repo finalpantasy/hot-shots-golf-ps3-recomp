@@ -28,7 +28,7 @@ The Ultimate Edition (the Japanese 1.27 build with English text) adds a launcher
 - **Grind:** earn capsule tickets by playing Challenge mode, then spend them in the game's own capsule machine (the Japanese rare-character gacha). The machine is restored for offline play: press Triangle in the offline Shop.
 - **Unlock all:** the 15 rare characters at 7 stars, with their gacha outfits.
 
-In Grind mode, Challenge results pay tickets for placement, holes, first wins and under-par scores. Easier and repeated events pay less. 12 points make one ticket, and the launcher's ticket rate can be 0.5x, 1x or 2x. The ticket count is shown at round end. Capsule odds are 72% blue, 20% purple and 8% red, and a red is guaranteed after 25 draws without one. Duplicates fill a rarity gauge; once every character is maxed, tickets turn into shop points. Each unlock mode keeps its own save folder.
+In Grind mode, Challenge results pay tickets for placement, holes, first wins and under-par scores. Easier and repeated events pay less. 12 points make one ticket, and the launcher's ticket rate can be 0.5x, 1x or 2x. After a round that pays, the results panel shows Ticket Pts and Tickets next to Score and Points, in the game's own font. The Shop help bar shows the capsule machine button and your ticket count. Capsule odds are 72% blue, 20% purple and 8% red, and a red is guaranteed after 25 draws without one. Duplicates fill a rarity gauge; once every character is maxed, tickets turn into shop points. Each unlock mode keeps its own save folder.
 
 The capsule screens, name plates and 1st, 2nd and 3rd place ordinals are in English.
 
@@ -41,6 +41,10 @@ The capsule screens, name plates and 1st, 2nd and 3rd place ordinals are in Engl
 ![Four capsule machine result screens: a new 3-star character, a duplicate, the rarity gauge filling and another new character, all with English name plates](docs/images/ultimate-capsule-get-screens-2026-11-24.png)
 
 ![The Rare Character List screen after a draw, showing collected characters with stars and unknown ones as question marks](docs/images/ultimate-rare-character-list-2026-11-24.png)
+
+![The round results panel in Grind mode: Score and Points on the left, Ticket Pts and Tickets on the right in the game's font](docs/images/ultimate-grind-results-ticket-points-2026-11-24.png)
+
+![The offline Shop in Grind mode, with the help bar showing the Triangle button for the capsule machine and the ticket count](docs/images/ultimate-shop-capsule-machine-hint-2026-11-24.png)
 
 Captured from test runs of the Ultimate Edition on 2026-11-24.
 
@@ -57,7 +61,7 @@ Updated 2026-11-24.
 | Frame rate | 30 by default. Opt-in 60, 120, 144, 165, 180, 240, Unlocked or Match monitor on the course (`HSG_FPS`), with a vsync toggle, in both editions. Frames are interpolated; game logic stays at 30 Hz. Menus stay at 30 and the swing gauge runs at 60. Per-step timing is verified; sustained rates above 30 FPS are not yet measured |
 | Shadows | Opt-in sharper shadow maps (`RSX_SHADOW_SCALE`) |
 | Timing and stability | 59.94 Hz timing, cuts to shader-compile stutter, and no "Not Responding" freezes during render stalls |
-| Ultimate unlocks | Launcher setting for the Ultimate Edition: Original, Grind (earn capsule tickets in Challenge mode, spend them in the offline capsule machine) or Unlock all (15 rare characters at 7 stars with gacha outfits). English capsule screens and name plates; ticket rate 0.5x, 1x or 2x; separate saves per mode. The ticket display at round end is being reworked |
+| Ultimate unlocks | Launcher setting for the Ultimate Edition: Original, Grind (earn capsule tickets in Challenge mode, spend them in the offline capsule machine) or Unlock all (15 rare characters at 7 stars with gacha outfits). English capsule screens and name plates; ticket rate 0.5x, 1x or 2x; separate saves per mode. Ticket totals appear on the round results panel and the Shop help bar |
 | Launcher | `HotShotsGolfLauncher.exe`: a standalone settings window with an edition picker, Ultimate data setup, Unlocks mode and ticket rate, HD texture option and save profiles. No Python needed. Settings are in `hsg_settings.json` and logs go to `logs/` |
 | Input | Xbox-style controllers (XInput) and the keyboard |
 | Audio | The mixer produces sound |

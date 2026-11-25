@@ -11,6 +11,7 @@ Bundled inside the exe:
   translations/jp127/message_text.tsv                       English table for the JP strings
   translations/jp127/rare_labels.dxt5.z                     English rare/normal label (char select)
   translations/jp127/capsule_labels.tsv + .rgba.z           English capsule machine labels
+  translations/jp127/grind_labels.rgba.z                    Ticket Pts / Tickets results labels
   external/ps3recomp/tools/pkg_extract.py (when present)    PKG extractor (--pkg-extract)
 The exe holds no game data, keys or textures. The build files go to work/launcher-build.
 """
@@ -22,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 VERSION_FILE = """VSVersionInfo(
   ffi=FixedFileInfo(filevers=({a}, {b}, {c}, 0), prodvers=({a}, {b}, {c}, 0), mask=0x3f, flags=0x0,
@@ -68,6 +69,8 @@ def main():
            "--add-data", "%s%s%s" % (ROOT / "translations" / "jp127" / "capsule_labels.tsv", sep,
                                      "translations/jp127"),
            "--add-data", "%s%s%s" % (ROOT / "translations" / "jp127" / "capsule_labels.rgba.z", sep,
+                                     "translations/jp127"),
+           "--add-data", "%s%s%s" % (ROOT / "translations" / "jp127" / "grind_labels.rgba.z", sep,
                                      "translations/jp127"),
            "--exclude-module", "numpy", "--exclude-module", "PIL", "--exclude-module", "matplotlib",
            "--exclude-module", "pydoc_data", "--exclude-module", "pydoc", "--exclude-module", "xml"]
