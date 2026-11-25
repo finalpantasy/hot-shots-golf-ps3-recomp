@@ -9,6 +9,8 @@ Result: <out>/HotShotsGolfLauncher.exe (default dist/, which git ignores).
 Bundled inside the exe:
   tools/build_ultimate_data.py and tools/jp127_english.py   Ultimate setup (--ultimate-setup)
   translations/jp127/message_text.tsv                       English table for the JP strings
+  translations/jp127/rare_labels.dxt5.z                     English rare/normal label (char select)
+  translations/jp127/capsule_labels.tsv + .rgba.z           English capsule machine labels
   external/ps3recomp/tools/pkg_extract.py (when present)    PKG extractor (--pkg-extract)
 The exe holds no game data, keys or textures. The build files go to work/launcher-build.
 """
@@ -60,6 +62,12 @@ def main():
            "--hidden-import", "build_ultimate_data", "--hidden-import", "jp127_english",
            "--hidden-import", "Crypto.Cipher.AES",
            "--add-data", "%s%s%s" % (ROOT / "translations" / "jp127" / "message_text.tsv", sep,
+                                     "translations/jp127"),
+           "--add-data", "%s%s%s" % (ROOT / "translations" / "jp127" / "rare_labels.dxt5.z", sep,
+                                     "translations/jp127"),
+           "--add-data", "%s%s%s" % (ROOT / "translations" / "jp127" / "capsule_labels.tsv", sep,
+                                     "translations/jp127"),
+           "--add-data", "%s%s%s" % (ROOT / "translations" / "jp127" / "capsule_labels.rgba.z", sep,
                                      "translations/jp127"),
            "--exclude-module", "numpy", "--exclude-module", "PIL", "--exclude-module", "matplotlib",
            "--exclude-module", "pydoc_data", "--exclude-module", "pydoc", "--exclude-module", "xml"]

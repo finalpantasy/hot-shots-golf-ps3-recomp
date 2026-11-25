@@ -1,0 +1,80 @@
+# English labels painted into the capsule machine textures (tools/jp127_english.py, "capsule machine labels").
+# Columns: archive, texture (chip-map name or #entry hash), chip, chip rect as in the map, painted rect
+# (map units; pixels for #hash rows; - = the chip), background (clear | fill:<n>), style, English
+# ("{s=0.5}" first: text height as a share of the label, default 0.8).
+# After editing run: python tools/jp127_english.py labels (Pillow) to rebuild capsule_labels.rgba.z.
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	connect001	112,154,273,189	-	clear	navy	Connecting...
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	exp_mess001	162,433,511,466	-	clear	gold	Adding to Rare EXP
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	list_mess001	162,397,511,430	-	clear	gold	Adding to the Rare Character List
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	list001	348,142,511,169	-	clear	white	Rare Character List
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	rarity001	0,470,183,509	-	clear	brown	Rarity
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	probability001	1,341,120,365	-	clear	white	Chance
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	add_mess001	1,370,135,389	-	clear	white	Notices
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	add_mess002	1,391,135,410	-	clear	white	Odds Table
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	n_mess001	63,193,511,218	-	clear	white	* You can view this art in Library on the Main Menu.
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	n_mess002	63,220,511,245	-	clear	white	* Collection complete: no more capsules can be opened.
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	comp_mess001	128,251,511,279	-	clear	orange	Every rare character collected. Congratulations!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	title001	1,447,153,466	-	clear	red	Capsule Machine
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	gacha_mess001	267,0,511,25	-	clear	whiteblue	You already have this one
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	gacha_mess002	267,28,511,53	-	clear	gold	Added to Rare EXP.
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	gacha_mess003	267,56,511,81	-	clear	gold	Top rarity reached!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	gacha_mess004	267,84,511,109	-	clear	gold	A higher rarity came out!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	gacha_mess005	267,112,511,137	-	clear	gold	Your first one!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	p_panel001	1,285,127,309	1,285,66,309	clear	white	Owned
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	p_panel002	1,311,127,335	1,311,66,335	clear	white	Need
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_font	pay001	1,413,144,444	-	clear	white	-Spin
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	w_ch001	3,95,120,114	-	fill:4	box	Character
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	w_ch002	123,95,240,114	-	fill:4	box	Character
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	w_ra001	3,115,130,134	-	fill:4	box	Rarity
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	w_ra002	3,135,130,154	-	fill:4	box	Rarity
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	w_per001	143,115,250,134	-	fill:4	box	Chance (%)
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	w_per002	143,135,250,154	-	fill:4	box	Chance (%)
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	det_sel001	6,76,40,93	-	clear	white	Back
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	det_sel002	46,76,80,93	-	clear	white	OK
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	sort001	85,76,128,93	-	clear	white	Sort
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	sort002	131,76,174,93	-	clear	white	Sort
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	sort003	177,76,220,93	-	clear	white	Details
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	sub001	116,194,252,216	-	clear	navy	Odds Table
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_guidline	sub002	116,219,252,252	-	clear	navy	Notices\n(About Capsules)
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	help_add	mess01_001	0,0,127,19	-	clear	white	Rare Character List
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	mode001	176,96,255,112	-	clear	stat_red	Power
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	mode002	176,113,255,129	-	clear	stat_gold	Control
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	mode003	176,130,255,146	-	clear	stat_green	Impact
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	mode004	176,147,255,163	-	clear	stat_blue	Spin
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	mode005	176,164,255,180	-	clear	stat_purple	Sidespin
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	gpoint001	0,64,83,79	-	clear	strength	Control
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	wpoint001	85,64,168,79	-	clear	weakness	Control
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	gpoint002	0,80,83,95	-	clear	strength	Approach
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	wpoint002	85,80,168,95	-	clear	weakness	Approach
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	gpoint003	0,96,83,111	-	clear	strength	Bunker
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	wpoint003	85,96,168,111	-	clear	weakness	Bunker
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	gpoint004	0,112,83,127	-	clear	strength	Rough
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	wpoint004	85,112,168,127	-	clear	weakness	Rough
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	gpoint005	0,128,83,143	-	clear	strength	Spin
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	wpoint005	85,128,168,143	-	clear	weakness	Spin
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	gpoint006	0,144,83,159	-	clear	strength	Power
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	wpoint006	85,144,168,159	-	clear	weakness	Power
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	gpoint007	0,160,83,175	-	clear	strength	Impact
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	wpoint007	85,160,168,175	-	clear	weakness	Impact
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	gpoint008	0,176,83,191	-	clear	strength	Curve
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	wpoint008	85,176,168,191	-	clear	weakness	Curve
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	gpoint009	0,192,83,207	-	clear	strength	Rain
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	wpoint009	85,192,168,207	-	clear	weakness	Rain
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	class001	138,310,255,332	-	clear	stat_green	(Novice)
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	class002	138,333,255,355	-	clear	stat_blue	(Intermediate)
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	lobby_shop_chip_pal	class003	138,356,255,378	-	clear	stat_red	(Expert)
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	#05a1eaf7	-	-	138,2,510,126	clear	get	Get!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	#25636b79	-	-	138,2,510,126	clear	get	Get!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	#257182fa	-	-	138,2,510,126	clear	get	Get!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	#257f9a7b	-	-	138,2,510,126	clear	get	Get!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	#258db1fc	-	-	138,2,510,126	clear	get	Get!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	#259bc97d	-	-	138,2,510,126	clear	get	Get!
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	#25a9e0fe	-	-	138,2,510,126	clear	get	Get!
+xbdata/menu/ticket_attention/history.JP_00.xb	lobby_shop_chip_font	p_panel001	5,44,124,67	5,44,66,67	clear	white	Owned
+xbdata/menu/ticket_attention/history.JP_00.xb	lobby_shop_chip_font	sub_tex001	1,136,184,164	-	clear	purple	Ticket History
+xbdata/menu/ticket_attention/history.JP_00.xb	lobby_shop_chip_font	sub_tex002	191,136,374,164	-	clear	purple	About Tickets
+xbdata/menu/ticket_attention/history.JP_00.xb	lobby_shop_chip_font	key_as001	1,166,170,184	-	clear	white	About Tickets
+xbdata/menu/ticket_attention/history.JP_00.xb	lobby_shop_chip_font	key_as002	181,166,350,184	-	clear	white	Ticket History
+xbdata/menu/ticket_attention/history.JP_00.xb	lobby_shop_chip_font	ttl_main007	319,106,502,131	-	fill:30	box	{s=0.6}Buy Tickets
+xbdata/menu/ticket_attention/history.JP_00.xb	lobby_shop_chip_font	no_data001	98,190,509,253	-	fill:30	dark	{s=0.42}No ticket purchase history.
+xbdata/menu/online_menu/lobby_shop/lobby_shop_layout.JP_00.xb	#6d5f6b6f	-	-	160,16,868,120	clear	get	Rarity Up!

@@ -2,6 +2,7 @@
 """English menus and text for the JP 1.27 build (Minna no Golf 6, BCJS30089).
 
 usage: jp127_english.py apply  [--out A:/hsg-ultimate] [--dry]
+       jp127_english.py labels                 (regenerate translations/jp127/rare_labels.dxt5.z)
        jp127_english.py needs  OUT.tsv          (JP strings with no English source, for translating)
        jp127_english.py report OUT.tsv          (per-archive texture swap list)
 
@@ -389,6 +390,398 @@ def merge_layout(jp_fb, en_fb, texdir=None):
     return swapped, kept
 
 
+# ---- rare / normal character labels (character select help bar) -------------------------
+# The SELECT prompt on character select ("switch to rare / normal characters") is drawn from
+# chips 1-2 of the help-label texture common_help05 in menu/info. US never shipped English for
+# it, so those two chips stay Japanese. translations/jp127/rare_labels.dxt5.z holds our own
+# English rendering of the two labels ("Normal Characters", "Rare Characters"; system font, no
+# game pixels): the DXT5 blocks of texture rows 0..83 (block rows 0..20, 64 blocks of 16 bytes
+# each), zlib-compressed. `labels` regenerates it (needs Pillow; the launcher does not).
+INFO_REL = "xbdata/menu/info.JP_00.xb"
+LABEL_MAP = 0xD51E9AD9                       # common_help05.map
+LABEL_MAP_TEXT = ("MAP1\ncommon_help05,128,128,32\ncommon_help05@mess01_001,0,0,127,19\n"
+                  "common_help05@mess01_002,0,21,127,40\n")
+LABEL_TEXTS = ("Normal Characters", "Rare Characters")   # chip 1 (normal), chip 2 (rare)
+LABEL_ROWS = 21                              # DXT block rows replaced (pixels 0..83)
+
+
+def label_asset():
+    return TRANS.parent / "rare_labels.dxt5.z"
+
+
+def paint_rare_labels(fb):
+    """Replace the two Japanese chips of common_help05 with the English asset. Returns 1 when
+    patched, 0 when the asset or the expected texture is missing (left as is)."""
+    tex = (LABEL_MAP - MAP_DELTA) & 0xFFFFFFFF
+    p = label_asset()
+    if LABEL_MAP not in fb.index or tex not in fb.index or not p.exists():
+        return 0
+    if not fb.get(LABEL_MAP).decode("utf-8", "replace").replace(chr(13), "").startswith(LABEL_MAP_TEXT):
+        return 0
+    b = bytearray(fb.get(tex))
+    if not is_dds(b) or dds_dims(b) != (256, 256) or b[84:88] != b"DXT5" or len(b) < 128 + 65536:
+        return 0
+    blocks = zlib.decompress(p.read_bytes())
+    if len(blocks) != LABEL_ROWS * 64 * 16:
+        return 0
+    b[128:128 + len(blocks)] = blocks
+    fb.put(tex, bytes(b))
+    return 1
+
+
+def make_label_asset(font="C:/Windows/Fonts/bahnschrift.ttf"):
+    """Render LABEL_TEXTS (white, dark outline, like the US help labels) and write the asset."""
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+    import io
+    img = Image.new("RGBA", (256, LABEL_ROWS * 4), (0, 0, 0, 0))
+    for i, text in enumerate(LABEL_TEXTS):
+        y0, h = i * 42, 40                   # chip rects 0..19 / 21..40 at 2x (256 px texture)
+        f = ImageFont.truetype(font, 29)
+        try:
+            f.set_variation_by_name("SemiBold Condensed")
+        except Exception:
+            pass
+        tile = Image.new("L", (256, h), 0)
+        d = ImageDraw.Draw(tile)
+        bb = d.textbbox((0, 0), text, font=f)
+        d.text((3 - bb[0], (h - (bb[3] - bb[1])) // 2 - bb[1]), text, font=f, fill=255)
+        t = Image.new("RGBA", (256, h), (0, 0, 0, 0))
+        t.paste((33, 32, 33, 255), (0, 0), tile.filter(ImageFilter.MaxFilter(5)))
+        t.paste((255, 255, 255, 255), (0, 0), tile)
+        img.alpha_composite(t, (0, y0))
+    buf = io.BytesIO()
+    img.save(buf, "DDS", pixel_format="DXT5")
+    dds = buf.getvalue()
+    if dds[84:88] != b"DXT5":
+        raise SystemExit("Pillow did not write DXT5")
+    blocks = dds[128:128 + LABEL_ROWS * 64 * 16]
+    label_asset().write_bytes(zlib.compress(blocks, 9))
+    return label_asset()
+
+
+# ---- capsule machine labels (lobby capsule shop hosted offline, HSG_UNLOCKS=grind) ----------
+# The capsule machine screens draw their words from texture atlases that US never localized
+# (lobby_shop_layout, ticket_attention/history; the merged archives keep Japanese there).
+# translations/jp127/capsule_labels.tsv lists each label: archive, texture (its chip-map name,
+# or "#<texture entry hash>"), chip (or "-"), the chip rectangle as the map gives it (so a
+# changed map is skipped), the painted rectangle in map units (or "-" = the chip), the
+# background ("clear" = transparent, "fill:<n>" = repeat the texture column n pixels inside the
+# left edge, for labels on a coloured box), a style name and the English.
+# translations/jp127/capsule_labels.rgba.z holds our own renderings of those English labels
+# (system font, no game pixels): per row u16 width, u16 height, RGBA. At apply time the
+# DXT5 blocks under each painted rectangle are decoded, the old label replaced by the
+# background, our label laid over it, and the blocks encoded again (pure Python, no Pillow).
+# `labels` regenerates the asset (needs Pillow and the game files for the chip sizes).
+CAPSULE_FIELDS = ("archive", "texture", "chip", "chip_rect", "paint_rect", "bg", "style", "english")
+
+
+def capsule_paths():
+    return TRANS.parent / "capsule_labels.tsv", TRANS.parent / "capsule_labels.rgba.z"
+
+
+def capsule_rows():
+    tsv, _ = capsule_paths()
+    rows = []
+    if not tsv.exists():
+        return rows
+    for ln in tsv.read_text(encoding="utf-8").splitlines():
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        p = ln.split("\t")
+        if len(p) == len(CAPSULE_FIELDS):
+            rows.append(dict(zip(CAPSULE_FIELDS, p)))
+    return rows
+
+
+def capsule_images():
+    _, asset = capsule_paths()
+    if not asset.exists():
+        return None
+    raw = zlib.decompress(asset.read_bytes())
+    out, pos = [], 0
+    while pos < len(raw):
+        w, h = struct.unpack_from("<HH", raw, pos)
+        pos += 4
+        out.append((w, h, raw[pos:pos + w * h * 4]))
+        pos += w * h * 4
+    return out
+
+
+def find_texture(fb, name):
+    """(texture hash, chip map text or None) for a chip-map name or "#hash"."""
+    if name.startswith("#"):
+        h = int(name[1:], 16)
+        return (h, None) if h in fb.index else (None, None)
+    for h in fb.keys():
+        b = fb.get(h)
+        if b[:4] == b"MAP1":
+            t = b.decode("utf-8", "replace").replace("\r", "")
+            if t.split("\n")[1].split(",")[0] == name:
+                tex = (h - MAP_DELTA) & 0xFFFFFFFF
+                if tex in fb.index:
+                    return tex, t
+    return None, None
+
+
+def label_rect_px(row, tex, mapt):
+    """Painted rectangle in texture pixels [x0, y0, x1, y1), or None when the map changed."""
+    w, h = dds_dims(tex)
+    if mapt is None:
+        lw, lh = w, h
+        rect = row["paint_rect"]
+    else:
+        head = mapt.split("\n")[1].split(",")
+        lw, lh = int(head[1]), int(head[2])
+        chips = map_chips(mapt.encode("utf-8"))
+        key = mapt.split("\n")[1].split(",")[0] + "@" + row["chip"]
+        if ",".join(chips.get(key, ())) != row["chip_rect"]:
+            return None
+        rect = row["chip_rect"] if row["paint_rect"] == "-" else row["paint_rect"]
+    x0, y0, x1, y1 = (int(v) for v in rect.split(","))
+    sx, sy = w / lw, h / lh
+    if mapt is None:                           # pixel rectangle, end exclusive
+        return x0, y0, x1, y1
+    return round(x0 * sx), round(y0 * sy), round((x1 + 1) * sx), round((y1 + 1) * sy)
+
+
+def _c565(c):
+    return ((c >> 11 & 31) * 255 // 31, (c >> 5 & 63) * 255 // 63, (c & 31) * 255 // 31)
+
+
+def dxt5_decode(b):
+    a0, a1 = b[0], b[1]
+    if a0 > a1:
+        al = [a0, a1] + [((7 - i) * a0 + i * a1) // 7 for i in range(1, 7)]
+    else:
+        al = [a0, a1] + [((5 - i) * a0 + i * a1) // 5 for i in range(1, 5)] + [0, 255]
+    ab = int.from_bytes(b[2:8], "little")
+    c0, c1 = struct.unpack_from("<HH", b, 8)
+    p0, p1 = _c565(c0), _c565(c1)
+    cols = [p0, p1, tuple((2 * x + y) // 3 for x, y in zip(p0, p1)), tuple((x + 2 * y) // 3 for x, y in zip(p0, p1))]
+    cb = struct.unpack_from("<I", b, 12)[0]
+    return [cols[cb >> (2 * i) & 3] + (al[ab >> (3 * i) & 7],) for i in range(16)]
+
+
+def _to565(c):
+    return (c[0] * 31 + 127) // 255 << 11 | (c[1] * 63 + 127) // 255 << 5 | (c[2] * 31 + 127) // 255
+
+
+def dxt5_encode(px):
+    alphas = [p[3] for p in px]
+    a0, a1 = max(alphas), min(alphas)
+    if a0 == a1:
+        ab = 0
+    else:
+        pal = [a0, a1] + [((7 - i) * a0 + i * a1) // 7 for i in range(1, 7)]
+        ab = 0
+        for i, a in enumerate(alphas):
+            ab |= min(range(8), key=lambda k: abs(pal[k] - a)) << (3 * i)
+    vis = [p for p in px if p[3] > 8] or px
+    # endpoints: the two colours farthest apart along the main luminance spread
+    lum = [p[0] * 2 + p[1] * 4 + p[2] for p in vis]
+    hi, lo = vis[lum.index(max(lum))], vis[lum.index(min(lum))]
+    c0, c1 = _to565(hi), _to565(lo)
+    if c0 < c1:
+        c0, c1 = c1, c0
+    if c0 == c1:
+        cb = 0
+    else:
+        q0, q1 = _c565(c0), _c565(c1)
+        cols = [q0, q1, tuple((2 * x + y) // 3 for x, y in zip(q0, q1)), tuple((x + 2 * y) // 3 for x, y in zip(q0, q1))]
+        cb = 0
+        for i, p in enumerate(px):
+            cb |= min(range(4), key=lambda k: sum((cols[k][j] - p[j]) ** 2 for j in range(3))) << (2 * i)
+    return bytes([a0, a1]) + ab.to_bytes(6, "little") + struct.pack("<HHI", c0, c1, cb)
+
+
+def dxt3_decode(b):
+    px = dxt5_decode(bytes([255, 255]) + bytes(6) + bytes(b[8:16]))
+    ab = int.from_bytes(b[:8], "little")
+    return [p[:3] + ((ab >> (4 * i) & 15) * 17,) for i, p in enumerate(px)]
+
+
+def dxt3_encode(px):
+    ab = 0
+    for i, p in enumerate(px):
+        ab |= min(15, (p[3] + 8) // 17) << (4 * i)
+    return ab.to_bytes(8, "little") + dxt5_encode(px)[8:]
+
+
+def paint_label(tex, rect, bg, img):
+    """Paint one label into a DXT5 or DXT3 DDS (bytearray, first mip level) in place."""
+    dec, enc = (dxt3_decode, dxt3_encode) if tex[84:88] == b"DXT3" else (dxt5_decode, dxt5_encode)
+    w, h = dds_dims(tex)
+    bw = (w + 3) // 4
+    x0, y0, x1, y1 = rect
+    iw, ih, rgba = img
+    if (iw, ih) != (x1 - x0, y1 - y0):
+        return False
+    blocks = {}
+
+    def block(bx, by):
+        k = (bx, by)
+        if k not in blocks:
+            o = 128 + (by * bw + bx) * 16
+            blocks[k] = dec(tex[o:o + 16])
+        return blocks[k]
+
+    def pixel(x, y):
+        return block(x // 4, y // 4)[(y % 4) * 4 + x % 4]
+
+    fill = bg.startswith("fill")
+    ref = x0 + (int(bg.split(":")[1]) if fill else 0)
+    lo, hi = (ref + 1, x1 - (ref - x0) - 1) if fill else (x0, x1)
+    base = {}
+    for y in range(y0, y1):
+        r = pixel(ref, y) if fill else (0, 0, 0, 0)
+        for x in range(lo, hi):
+            base[(x, y)] = r
+    for (x, y), b0 in base.items():
+        o = ((y - y0) * iw + (x - x0)) * 4
+        sr, sg, sb, sa = rgba[o:o + 4]
+        da = b0[3]
+        oa = sa + da * (255 - sa) // 255
+        if oa == 0:
+            out = (0, 0, 0, 0)
+        else:
+            out = tuple((s * sa + d * da * (255 - sa) // 255) // oa for s, d in zip((sr, sg, sb), b0[:3])) + (oa,)
+        blk = block(x // 4, y // 4)
+        blk[(y % 4) * 4 + x % 4] = out
+    for (bx, by), px in blocks.items():
+        o = 128 + (by * bw + bx) * 16
+        tex[o:o + 16] = enc(px)
+    return True
+
+
+def paint_capsule_labels(rel, fb, stats):
+    rows = [r for r in capsule_rows()]
+    if not rows:
+        return
+    imgs = capsule_images()
+    if imgs is None or len(imgs) != len(rows):
+        stats["capsule_labels_missing_asset"] = len(rows)
+        return
+    tex_cache = {}
+    for row, img in zip(rows, imgs):
+        if row["archive"] != rel:
+            continue
+        th, mapt = find_texture(fb, row["texture"])
+        if th is None:
+            stats["capsule_labels_skipped"] = stats.get("capsule_labels_skipped", 0) + 1
+            continue
+        if th not in tex_cache:
+            tex_cache[th] = bytearray(fb.get(th))
+        tex = tex_cache[th]
+        rect = label_rect_px(row, tex, mapt) if is_dds(tex) and tex[84:88] in (b"DXT5", b"DXT3") else None
+        if rect is None or not paint_label(tex, rect, row["bg"], img):
+            stats["capsule_labels_skipped"] = stats.get("capsule_labels_skipped", 0) + 1
+            continue
+        stats["capsule_labels"] = stats.get("capsule_labels", 0) + 1
+    for th, tex in tex_cache.items():
+        fb.put(th, bytes(tex))
+
+
+# Styles: fill top, fill bottom, outline (None = no outline), outline width in 1/100 of the height.
+CAPSULE_STYLES = {
+    "gold": ((255, 246, 150), (255, 150, 10), (100, 40, 0), 9),
+    "orange": ((255, 214, 70), (245, 80, 20), (80, 20, 0), 9),
+    "get": ((255, 214, 60), (255, 128, 0), (70, 25, 10), 8),
+    "white": ((255, 255, 255), (255, 255, 255), (35, 35, 40), 9),
+    "whiteblue": ((255, 255, 255), (235, 240, 255), (30, 70, 170), 10),
+    "navy": ((30, 50, 140), (20, 35, 110), (255, 255, 255), 9),
+    "purple": ((140, 50, 180), (100, 25, 140), (255, 255, 255), 9),
+    "red": ((220, 30, 30), (190, 15, 15), (255, 255, 255), 10),
+    "brown": ((110, 70, 60), (80, 45, 40), None, 0),
+    "dark": ((70, 70, 80), (60, 60, 70), (255, 255, 255), 8),
+    "box": ((255, 255, 255), (255, 255, 255), (30, 30, 50), 8),
+    "stat_red": ((230, 40, 40), (200, 20, 20), (255, 255, 255), 10),
+    "stat_gold": ((220, 160, 20), (190, 120, 0), (255, 255, 255), 10),
+    "stat_green": ((40, 170, 40), (20, 130, 20), (255, 255, 255), 10),
+    "stat_blue": ((30, 120, 220), (20, 90, 190), (255, 255, 255), 10),
+    "stat_purple": ((150, 50, 200), (115, 30, 165), (255, 255, 255), 10),
+    "strength": ((255, 150, 30), (235, 100, 0), (255, 255, 255), 10),
+    "weakness": ((40, 100, 220), (20, 70, 190), (255, 255, 255), 10),
+}
+
+
+def render_label(text, w, h, style, font="C:/Windows/Fonts/ARLRDBD.TTF"):
+    """Our own rendering of one English label (Pillow): RGBA bytes of w x h."""
+    from PIL import Image, ImageDraw, ImageFont
+    top, bot, outl, ow = CAPSULE_STYLES[style]
+    scale = 0.80                               # text height / label height; "{s=0.5}" first sets it
+    if text.startswith("{s="):
+        scale, text = float(text[3:text.index("}")]), text[text.index("}") + 1:]
+    lines = text.replace("\\n", "\n").split("\n")
+    pad = max(1, h // 14)
+    ow_px = max(1, round(h * scale / 0.8 / len(lines) * ow / 100)) if outl else 0
+    size = int(h / len(lines) * scale)
+    while True:
+        f = ImageFont.truetype(font, size)
+        boxes = [f.getbbox(t) for t in lines]
+        tw = max(b[2] - b[0] for b in boxes) + 2 * ow_px
+        lh = max(b[3] - b[1] for b in [f.getbbox("Ag")]) + 2 * ow_px
+        if lh * len(lines) <= h - 2 * pad or size <= 6:
+            break
+        size -= 1
+    th = lh * len(lines)
+    big = Image.new("L", (tw + 4, th + 4), 0)
+    d = ImageDraw.Draw(big)
+    y = 2
+    for t, b in zip(lines, boxes):
+        d.text(((tw + 4 - (b[2] - b[0])) // 2 - b[0], y + ow_px - f.getbbox("Ag")[1]), t, font=f, fill=255)
+        y += lh
+    mask = big
+    from PIL import ImageFilter
+    edge = mask.filter(ImageFilter.MaxFilter(2 * ow_px + 1)) if ow_px else None
+    grad = Image.new("RGBA", mask.size)
+    for yy in range(mask.size[1]):
+        k = yy / max(1, mask.size[1] - 1)
+        c = tuple(int(a + (b - a) * k) for a, b in zip(top, bot)) + (255,)
+        grad.paste(c, (0, yy, mask.size[0], yy + 1))
+    lab = Image.new("RGBA", mask.size, (0, 0, 0, 0))
+    if edge is not None:
+        lab.paste(outl + (255,), (0, 0), edge)
+    lab.paste(grad, (0, 0), mask)
+    maxw = w - 2 * pad
+    if lab.size[0] > maxw:                     # condense to fit
+        lab = lab.resize((maxw, lab.size[1]), Image.LANCZOS)
+    out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    out.alpha_composite(lab, ((w - lab.size[0]) // 2, (h - lab.size[1]) // 2))
+    return out.tobytes()
+
+
+def make_capsule_asset():
+    rows = capsule_rows()
+    files = jp_update_files()
+    blobs = bytearray()
+    for row in rows:
+        src = files[row["archive"]]
+        jp = fb_load(src)
+        us, asia = english_sources(row["archive"])
+        if us or asia:
+            merge_layout(jp, fb_load(us or asia), "data/" + row["archive"].split("/", 1)[1].rsplit("/", 1)[0] + "/")
+        th, mapt = find_texture(jp, row["texture"])
+        if th is None:
+            raise SystemExit("capsule label: no texture %s in %s" % (row["texture"], row["archive"]))
+        rect = label_rect_px(row, jp.get(th), mapt)
+        if rect is None:
+            raise SystemExit("capsule label: chip %s rect differs" % row["chip"])
+        w, h = rect[2] - rect[0], rect[3] - rect[1]
+        if row["bg"].startswith("fill"):
+            n = int(row["bg"].split(":")[1])
+            img = render_label(row["english"], w - 2 * (n + 1), h, row["style"])
+            from PIL import Image
+            full = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            full.paste(Image.frombytes("RGBA", (w - 2 * (n + 1), h), img), (n + 1, 0))
+            img = full.tobytes()
+        else:
+            img = render_label(row["english"], w, h, row["style"])
+        blobs += struct.pack("<HH", w, h) + img
+    _, asset = capsule_paths()
+    asset.write_bytes(zlib.compress(bytes(blobs), 9))
+    return asset
+
+
 # ---- driver -----------------------------------------------------------------------------
 def write_out(data, dsts, dry):
     for d in dsts:
@@ -423,6 +816,9 @@ def build(out, dry=False, needs=None, report=None):
             texdir = "data/" + rel.split("/", 1)[1].rsplit("/", 1)[0] + "/"
             sw, kept = merge_layout(jp, en, texdir)
             tot["textures_swapped"] += sw
+            if rel == INFO_REL:
+                tot["rare_labels"] = paint_rare_labels(jp)
+            paint_capsule_labels(rel, jp, tot)
             if report is not None:
                 report.extend((rel,) + k for k in kept)
         tot["archives"] += 1
@@ -433,12 +829,16 @@ def build(out, dry=False, needs=None, report=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["apply", "needs", "report"])
+    ap.add_argument("cmd", choices=["apply", "needs", "report", "labels"])
     ap.add_argument("file", nargs="?")
     ap.add_argument("--out", default="A:/hsg-ultimate")
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
+    if a.cmd == "labels":
+        print("[english] wrote", make_label_asset())
+        print("[english] wrote", make_capsule_asset())
+        return 0
     if a.cmd == "apply":
         print("[english]", build(out, a.dry))
         return 0

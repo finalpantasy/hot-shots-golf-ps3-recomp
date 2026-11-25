@@ -1,0 +1,163 @@
+--- a/libs/network/sceNp.c
++++ b/libs/network/sceNp.c
+@@ -405,6 +405,7 @@
+ #define SCE_NP_TICKET_PARAM_SERIAL_ID   0
+ #define SCE_NP_TICKET_PARAM_SUBJECT_DOB 11
+ 
++int hsg_tus_local_on(void);   /* sceNpTus.c, HSG local TUS (patch 0077) */
+ s32 sceNpManagerRequestTicket2(u32 npId, u32 version, u32 serviceId, u32 cookie,
+                                u32 cookieSize, u32 entitlementId, u32 consumedCount)
+ {
+@@ -412,6 +413,13 @@
+     if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+     if (!npId || !serviceId || cookieSize > SCE_NP_COOKIE_MAX_SIZE)
+         return SCE_NP_AUTH_EINVALID_ARGUMENT;
++    /* HSG local TUS (patch 0077, Hot Shots Golf JP 1.27 capsule machine): with the local
++     * TUS on, a consumable-entitlement request (a capsule ticket used) succeeds with no
++     * callback; port/hsg_jp127_capsule.cpp completes it from its ticket store. */
++    if (hsg_tus_local_on() && entitlementId) {
++        printf("[sceNp] ManagerRequestTicket2(consume %u) -> local ticket\n", consumedCount);
++        return CELL_OK;
++    }
+     if (!np_psnr_enabled()) {
+         printf("[sceNp] ManagerRequestTicket2() -> OFFLINE\n");
+         return SCE_NP_ERROR_OFFLINE;
+--- a/libs/network/sceNpTus.c
++++ b/libs/network/sceNpTus.c
+@@ -356,6 +356,96 @@
+  * -----------------------------------------------------------------------*/
+ 
+ 
++/* ==== HSG local TUS (Hot Shots Golf JP 1.27 capsule machine, patch 0077) ====
++ * Off until the port calls hsg_tus_local_enable() (port/hsg_jp127_capsule.cpp, grind
++ * preset). Then async TUS is answered from an in-memory table so the game's own TUS code
++ * (the capsule machine) completes offline: transaction contexts always succeed, Get/Set/
++ * TryAndSet work on the table at once (PollAsync reports done). The port seeds the table
++ * from its store with hsg_tus_local_poke() and reads it back after writes (hsg_tus_local_
++ * peek(), hsg_tus_local_writes() counts every write). The table is not saved here.
++ * HSG_TUS_LOCAL_LOG=1 logs every slot access. SceNpTusVariable (120 bytes): ownerId SceNpId
++ * @0 (36), hasData s32 @0x24, lastChangedDate @0x28, lastChangedAuthorId @0x34, variable
++ * s64 @0x58, oldVariable s64 @0x60. */
++#define HSG_TUSL_SLOTS 1024
++static int s_tusl_on;
++static unsigned s_tusl_writes;
++static struct { int valid; s64 value; u64 stamp; } s_tusl[HSG_TUSL_SLOTS];
++static u64 s_tusl_clock = 1;
++int hsg_tus_local_on(void) { return s_tusl_on; }
++void hsg_tus_local_enable(void) { s_tusl_on = 1; }
++unsigned hsg_tus_local_writes(void) { return s_tusl_writes; }
++void hsg_tus_local_poke(int slot, long long value)
++{
++    if (slot < 0 || slot >= HSG_TUSL_SLOTS) return;
++    s_tusl[slot].valid = 1; s_tusl[slot].value = (s64)value; s_tusl[slot].stamp = s_tusl_clock++;
++}
++int hsg_tus_local_peek(int slot, long long* value)
++{
++    if (slot < 0 || slot >= HSG_TUSL_SLOTS || !s_tusl[slot].valid) return 0;
++    if (value) *value = (long long)s_tusl[slot].value;
++    return 1;
++}
++static int hsg_tusl_log(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("HSG_TUS_LOCAL_LOG"); on = (e && *e && *e != '0') ? 1 : 0; }
++    return on;
++}
++static void hsg_tusl_write(u32 ea, s32 slot, s64 oldv)
++{
++    for (u32 i = 0; i < TUS_VARIABLE_SIZE; i++) vm_write8(ea + i, 0);
++    const char* who = "PS3Player";
++    for (u32 i = 0; who[i]; i++) { vm_write8(ea + i, (u8)who[i]); vm_write8(ea + 0x34 + i, (u8)who[i]); }
++    const int ok = slot >= 0 && slot < HSG_TUSL_SLOTS && s_tusl[slot].valid;
++    vm_write32(ea + 0x24, ok ? 1u : 0u);
++    vm_write64(ea + 0x28, ok ? s_tusl[slot].stamp : 0);
++    vm_write64(ea + 0x58, ok ? (u64)s_tusl[slot].value : 0);
++    vm_write64(ea + 0x60, (u64)oldv);
++}
++static s32 hsg_tusl_set_multi(const u32* slotIds, const s64* variables, s32 count)
++{
++    for (s32 i = 0; i < count; i++) {
++        const s32 sl = (s32)vm_read32(GUEST_EA(slotIds) + (u32)i * 4);
++        const s64 v = (s64)vm_read64(GUEST_EA(variables) + (u32)i * 8);
++        if (hsg_tusl_log()) printf("[tus-local] set slot %d = %lld (0x%llx)\n", sl, (long long)v, (unsigned long long)v);
++        if (sl >= 0 && sl < HSG_TUSL_SLOTS) { s_tusl[sl].valid = 1; s_tusl[sl].value = v; s_tusl[sl].stamp = s_tusl_clock++; }
++    }
++    s_tusl_writes++;
++    return CELL_OK;
++}
++static s32 hsg_tusl_get_multi(const u32* slotIds, void* variables, s32 count)
++{
++    for (s32 i = 0; i < count; i++) {
++        const s32 sl = (s32)vm_read32(GUEST_EA(slotIds) + (u32)i * 4);
++        hsg_tusl_write(GUEST_EA(variables) + (u32)i * TUS_VARIABLE_SIZE, sl, 0);
++        if (hsg_tusl_log())
++            printf("[tus-local] get slot %d -> %s %lld\n", sl,
++                   (sl >= 0 && sl < HSG_TUSL_SLOTS && s_tusl[sl].valid) ? "has" : "none",
++                   (sl >= 0 && sl < HSG_TUSL_SLOTS) ? (long long)s_tusl[sl].value : 0LL);
++    }
++    return CELL_OK;
++}
++static s32 hsg_tusl_try_set(s32 slotId, s32 op, s64 value, void* variable)
++{
++    /* opeType 0 = overwrite here; others compare value against the current one
++     * (1 eq, 2 ne, 3 gt, 4 ge, 5 lt, 6 le: set when current <op> value holds). */
++    const int have = slotId >= 0 && slotId < HSG_TUSL_SLOTS && s_tusl[slotId].valid;
++    const s64 cur = have ? s_tusl[slotId].value : 0;
++    int doit = 1;
++    switch (op) { case 1: doit = cur == value; break; case 2: doit = cur != value; break;
++                  case 3: doit = cur > value; break; case 4: doit = cur >= value; break;
++                  case 5: doit = cur < value; break; case 6: doit = cur <= value; break; default: break; }
++    if (hsg_tusl_log())
++        printf("[tus-local] try-set slot %d op %d value %lld (cur %lld %s) -> %s\n", slotId, op,
++               (long long)value, (long long)cur, have ? "has" : "none", doit ? "set" : "kept");
++    if (doit && slotId >= 0 && slotId < HSG_TUSL_SLOTS) {
++        s_tusl[slotId].valid = 1; s_tusl[slotId].value = value; s_tusl[slotId].stamp = s_tusl_clock++;
++        s_tusl_writes++;
++    }
++    hsg_tusl_write(GUEST_EA(variable), slotId, cur);
++    return CELL_OK;
++}
++/* ==== END HSG local TUS block ==== */
+ 
+ s32 sceNpTusPollAsync(SceNpTusRequestId reqId, s32* result)
+ {
+@@ -420,6 +510,7 @@
+ 
+ s32 sceNpTusCreateTransactionCtx(s32 titleCtxId)
+ {
++    if (hsg_tus_local_on()) { static s32 n = 0; puts("[tus-local] transaction ctx"); return 0x7101 + (n++ & 0xFF); }   /* HSG local TUS */
+     if (!s_initialized)
+         return (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
+     if (!np_psnr_enabled())
+@@ -433,6 +524,7 @@
+ 
+ s32 sceNpTusDestroyTransactionCtx(s32 transId)
+ {
++    if (hsg_tus_local_on()) return CELL_OK;   /* HSG local TUS */
+     (void)transId;
+     if (!s_initialized)
+         return (s32)SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
+@@ -462,6 +554,7 @@
+ s32 sceNpTusSetMultiSlotVariableAsync(s32 transId, const SceNpId* targetNpId, const u32* slotIds,
+                                      const s64* variables, s32 count, const void* option)
+ {
++    if (hsg_tus_local_on() && slotIds && variables && count > 0) return hsg_tusl_set_multi(slotIds, variables, count);   /* HSG local TUS */
+     (void)transId;
+     if (!slotIds || !variables)
+         return (s32)TUS_COMM_INSUFFICIENT_ARGUMENT;
+@@ -474,6 +567,7 @@
+ s32 sceNpTusGetMultiSlotVariableAsync(s32 transId, const SceNpId* targetNpId, const u32* slotIds,
+                                      void* variables, u32 variableSize, s32 count, const void* option)
+ {
++    if (hsg_tus_local_on() && slotIds && variables && count > 0) return hsg_tusl_get_multi(slotIds, variables, count);   /* HSG local TUS */
+     (void)transId;
+     if (!slotIds || !variables)
+         return (s32)TUS_COMM_INSUFFICIENT_ARGUMENT;
+@@ -488,6 +582,7 @@
+ s32 sceNpTusTryAndSetVariableAsync(s32 transId, const SceNpId* targetNpId, s32 slotId, s32 operation,
+                                    s64 value, void* variable, u32 variableSize, const void* option)
+ {
++    if (hsg_tus_local_on() && variable) return hsg_tusl_try_set(slotId, operation, value, variable);   /* HSG local TUS */
+     (void)transId;
+     (void)operation;
+     (void)value;

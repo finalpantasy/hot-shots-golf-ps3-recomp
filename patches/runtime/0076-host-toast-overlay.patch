@@ -1,0 +1,582 @@
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -49,6 +49,7 @@
+ #include <dxgi1_6.h>
+ #include <d3dcompiler.h>
+ #include "rsx_d3d12_device.h"
++#include "rsx_overlay.h"   /* host toast overlay (rsx_overlay.c) */
+ 
+ /* Link libraries */
+ #pragma comment(lib, "d3d12.lib")
+@@ -9957,6 +9958,14 @@
+     guest_fb_present(fi);
+     scanout_auto_present(fi);
+     composite_present(fi);
++    /* Host toast overlay (rsx_overlay.c), over the finished image and after
++     * keep_disp_copy saved it, so a kept display never holds the panel. Only
++     * on frames that present (a batch kept for the next one would get it
++     * twice); before the readbacks below, so RSX_SHOT captures include it.
++     * Idle cost: one load. */
++    if (s_present_this_frame && rsx_overlay_active())
++        rsx_overlay_d3d12_draw(s_d3d.device, s_d3d.cmd_list, rtv_handle, s_d3d.width,
++                               s_d3d.height, s_d3d.frame_count);
+     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
+                    && s_d3d.dump_skip_left == 0);
+     { static int mind2 = -1;
+--- /dev/null
++++ b/libs/video/rsx_overlay.h
+@@ -0,0 +1,42 @@
++/*
++ * Host-side toast overlay: a few lines of text in a semi-transparent panel,
++ * drawn by the renderer over the presented frame (top right, scaled to the
++ * output size). Game code posts a toast; the D3D12 present path draws it for
++ * the given time with a fade, then pops the next one. Text is rasterized at
++ * runtime with GDI from a Windows system font (no font files, no game assets).
++ *
++ * rsx_overlay_post() is safe from any thread. With nothing posted, the
++ * per-frame cost is one load (rsx_overlay_active()).
++ */
++#ifndef RSX_OVERLAY_H
++#define RSX_OVERLAY_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Queue one toast of n lines (UTF-8, at most 8 are kept) shown for ms
++ * milliseconds from the first frame it is drawn. A line may start with
++ * "\x1b" plus a colour letter: w white (default), g gold, r red, p purple,
++ * b blue, d grey. The first line may start with "@" plus a digit for the
++ * place: 0 top right (default), 1 top left, 2 bottom right, 3 top centre
++ * (the last three keep clear of 12% top and bottom bars). */
++void rsx_overlay_post(const char* const* lines, int n, int ms);
++
++/* Nonzero while a toast is showing or queued. */
++int rsx_overlay_active(void);
++
++#if defined(_WIN32) && defined(__d3d12_h__)
++/* Present path: draw the current toast into the backbuffer (RENDER_TARGET
++ * state, R8G8B8A8_UNORM) through rtv. frame is a counter that advances once
++ * per submitted frame (old textures are released some frames later). */
++void rsx_overlay_d3d12_draw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl,
++                            D3D12_CPU_DESCRIPTOR_HANDLE rtv, unsigned w, unsigned h,
++                            unsigned long long frame);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* RSX_OVERLAY_H */
+--- /dev/null
++++ b/libs/video/rsx_overlay.c
+@@ -0,0 +1,509 @@
++/*
++ * Host-side toast overlay (see rsx_overlay.h).
++ *
++ * One toast at a time: its lines are rasterized once with GDI into a
++ * premultiplied RGBA panel image (dark rounded panel, coloured text), copied
++ * to a texture, and drawn each presented frame as one quad (4 vertices from
++ * SV_VertexID, no vertex buffer) with its own root signature, PSO and
++ * one-slot-per-texture SRV heap. Fade in 0.2 s, fade out over the last 1 s.
++ * Glyphs the UI font lacks (U+2605 star, U+2192 arrow) come from Segoe UI
++ * Symbol, else become "*" / "->".
++ */
++#ifdef _WIN32
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <d3d12.h>
++#include <d3dcompiler.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++#include "rsx_overlay.h"   /* after d3d12.h: declares the D3D12 entry too */
++
++#define OV_MAX_LINES 8
++#define OV_LINE_CH   160
++#define OV_QUEUE     4
++#define OV_SLOTS     8     /* SRV ring: one slot per texture built */
++#define OV_GRAVE     8
++
++typedef struct {
++    wchar_t text[OV_MAX_LINES][OV_LINE_CH];
++    unsigned colour[OV_MAX_LINES];   /* 0xRRGGBB */
++    int n, ms;
++    int pos;                         /* 0 top right, 1 top left, 2 bottom right, 3 top centre */
++} Toast;
++
++static SRWLOCK s_lock = SRWLOCK_INIT;
++static Toast s_queue[OV_QUEUE];
++static int s_qn = 0;
++static volatile LONG s_active = 0;   /* queued + showing */
++
++static unsigned colour_of(char c)
++{
++    switch (c) {
++    case 'g': return 0xFFD873;
++    case 'r': return 0xFF6A5A;
++    case 'p': return 0xD49BFF;
++    case 'b': return 0x8CC8FF;
++    case 'd': return 0xB8B8B8;
++    default:  return 0xFFFFFF;
++    }
++}
++
++void rsx_overlay_post(const char* const* lines, int n, int ms)
++{
++    if (!lines || n <= 0) return;
++    Toast t;
++    memset(&t, 0, sizeof t);
++    t.ms = ms < 1000 ? 1000 : ms;
++    for (int i = 0; i < n && t.n < OV_MAX_LINES; i++) {
++        const char* s = lines[i] ? lines[i] : "";
++        unsigned col = 0xFFFFFF;
++        if (i == 0 && s[0] == '\x1b' && s[1] == '@' && s[2] >= '0' && s[2] <= '3') {   /* position */
++            t.pos = s[2] - '0';
++            s += 3;
++        }
++        if (s[0] == '\x1b' && s[1]) { col = colour_of(s[1]); s += 2; }
++        if (!MultiByteToWideChar(CP_UTF8, 0, s, -1, t.text[t.n], OV_LINE_CH))
++            t.text[t.n][OV_LINE_CH - 1] = 0;
++        t.colour[t.n++] = col;
++    }
++    AcquireSRWLockExclusive(&s_lock);
++    if (s_qn == OV_QUEUE) {   /* full: drop the oldest queued */
++        memmove(&s_queue[0], &s_queue[1], sizeof(Toast) * (OV_QUEUE - 1));
++        s_qn--;
++        InterlockedDecrement(&s_active);
++    }
++    s_queue[s_qn++] = t;
++    InterlockedIncrement(&s_active);
++    ReleaseSRWLockExclusive(&s_lock);
++}
++
++int rsx_overlay_active(void) { return s_active != 0; }
++
++/* ---- render-thread state ------------------------------------------------- */
++static Toast s_cur;
++static int s_have_cur = 0, s_built = 0;
++static ULONGLONG s_t0 = 0;
++static unsigned s_bw = 0, s_bh = 0;          /* backbuffer size it was built for */
++static unsigned s_pw = 0, s_ph = 0;          /* panel size */
++static ID3D12RootSignature* s_rs;
++static ID3D12PipelineState* s_pso;
++static ID3D12DescriptorHeap* s_heap;
++static UINT s_heap_inc;
++static int s_failed = 0;
++static ID3D12Resource *s_tex, *s_up;
++static int s_slot = -1;
++static struct { ID3D12Resource* r; unsigned long long at; } s_grave[OV_GRAVE * 2];
++
++static void grave_add(ID3D12Resource* r, unsigned long long frame)
++{
++    if (!r) return;
++    for (int i = 0; i < OV_GRAVE * 2; i++)
++        if (!s_grave[i].r) { s_grave[i].r = r; s_grave[i].at = frame + OV_GRAVE; return; }
++    r->lpVtbl->Release(r);   /* no room: should not happen (toasts last >= 1 s) */
++}
++static void grave_sweep(unsigned long long frame)
++{
++    for (int i = 0; i < OV_GRAVE * 2; i++)
++        if (s_grave[i].r && frame >= s_grave[i].at) {
++            s_grave[i].r->lpVtbl->Release(s_grave[i].r);
++            s_grave[i].r = NULL;
++        }
++}
++
++static int pipeline_init(ID3D12Device* dev)
++{
++    static const char vs[] =
++        "cbuffer c : register(b0) { float4 r; float4 k; };\n"
++        "struct O { float4 p : SV_POSITION; float2 uv : TEXCOORD; };\n"
++        "O main(uint id : SV_VertexID) { O o; float2 t = float2(id & 1, id >> 1);\n"
++        "  o.p = float4(lerp(r.x, r.z, t.x), lerp(r.y, r.w, t.y), 0, 1); o.uv = t; return o; }\n";
++    static const char ps[] =
++        "cbuffer c : register(b0) { float4 r; float4 k; };\n"
++        "Texture2D tx : register(t0); SamplerState sm : register(s0);\n"
++        "struct O { float4 p : SV_POSITION; float2 uv : TEXCOORD; };\n"
++        "float4 main(O i) : SV_TARGET { return tx.Sample(sm, i.uv) * k.x; }\n";
++    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL, *sig = NULL;
++    HRESULT hr = D3DCompile(vs, sizeof vs - 1, "ov_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err);
++    if (err) { if (FAILED(hr)) fprintf(stderr, "[overlay] VS: %s\n", (const char*)err->lpVtbl->GetBufferPointer(err)); err->lpVtbl->Release(err); err = NULL; }
++    if (SUCCEEDED(hr)) hr = D3DCompile(ps, sizeof ps - 1, "ov_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err);
++    if (err) { if (FAILED(hr)) fprintf(stderr, "[overlay] PS: %s\n", (const char*)err->lpVtbl->GetBufferPointer(err)); err->lpVtbl->Release(err); err = NULL; }
++
++    if (SUCCEEDED(hr)) {
++        D3D12_DESCRIPTOR_RANGE range = {0};
++        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++        range.NumDescriptors = 1;
++        D3D12_ROOT_PARAMETER rp[2];
++        memset(rp, 0, sizeof rp);
++        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++        rp[0].DescriptorTable.NumDescriptorRanges = 1;
++        rp[0].DescriptorTable.pDescriptorRanges = &range;
++        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++        rp[1].Constants.ShaderRegister = 0;
++        rp[1].Constants.Num32BitValues = 8;
++        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++        D3D12_STATIC_SAMPLER_DESC smp = {0};
++        smp.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
++        smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++        smp.MaxLOD = D3D12_FLOAT32_MAX;
++        smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++        D3D12_ROOT_SIGNATURE_DESC rd = {0};
++        rd.NumParameters = 2; rd.pParameters = rp;
++        rd.NumStaticSamplers = 1; rd.pStaticSamplers = &smp;
++        hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
++        if (err) err->lpVtbl->Release(err);
++        if (SUCCEEDED(hr))
++            hr = dev->lpVtbl->CreateRootSignature(dev, 0, sig->lpVtbl->GetBufferPointer(sig),
++                                                  sig->lpVtbl->GetBufferSize(sig),
++                                                  &IID_ID3D12RootSignature, (void**)&s_rs);
++        if (sig) sig->lpVtbl->Release(sig);
++    }
++    if (SUCCEEDED(hr)) {
++        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
++        memset(&pd, 0, sizeof pd);
++        pd.pRootSignature = s_rs;
++        pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
++        pd.VS.BytecodeLength = vb->lpVtbl->GetBufferSize(vb);
++        pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
++        pd.PS.BytecodeLength = pb->lpVtbl->GetBufferSize(pb);
++        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++        pd.RasterizerState.DepthClipEnable = TRUE;
++        D3D12_RENDER_TARGET_BLEND_DESC* b = &pd.BlendState.RenderTarget[0];
++        b->BlendEnable = TRUE;
++        b->SrcBlend = D3D12_BLEND_ONE;          /* premultiplied */
++        b->DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
++        b->BlendOp = D3D12_BLEND_OP_ADD;
++        b->SrcBlendAlpha = D3D12_BLEND_ONE;
++        b->DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
++        b->BlendOpAlpha = D3D12_BLEND_OP_ADD;
++        b->LogicOp = D3D12_LOGIC_OP_NOOP;
++        b->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++        pd.SampleMask = UINT_MAX;
++        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++        pd.NumRenderTargets = 1;
++        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++        pd.DSVFormat = DXGI_FORMAT_UNKNOWN;
++        pd.SampleDesc.Count = 1;
++        hr = dev->lpVtbl->CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void**)&s_pso);
++    }
++    if (SUCCEEDED(hr)) {
++        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
++        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++        hd.NumDescriptors = OV_SLOTS;
++        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++        hr = dev->lpVtbl->CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_heap);
++        s_heap_inc = dev->lpVtbl->GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    }
++    if (vb) vb->lpVtbl->Release(vb);
++    if (pb) pb->lpVtbl->Release(pb);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[overlay] pipeline setup failed (0x%08lX); toasts disabled\n", (unsigned long)hr);
++        return -1;
++    }
++    return 0;
++}
++
++/* ---- text rasterization (GDI) -------------------------------------------- */
++typedef struct { HDC dc; HFONT ui, sym; } Gdi;
++
++static int has_glyph(HDC dc, HFONT f, wchar_t ch)
++{
++    WORD idx = 0xFFFF;
++    SelectObject(dc, f);
++    return GetGlyphIndicesW(dc, &ch, 1, &idx, GGI_MARK_NONEXISTING_GLYPHS) == 1 && idx != 0xFFFF;
++}
++
++/* Draws (or with draw=0 only measures) one line at x,y; returns its width. */
++static int text_line(Gdi* g, const wchar_t* s, int x, int y, int draw)
++{
++    int w = 0;
++    SIZE sz;
++    while (*s) {
++        /* Run of characters the UI font has. */
++        int n = 0;
++        while (s[n] && (s[n] < 0x80 || has_glyph(g->dc, g->ui, s[n]))) n++;
++        if (n) {
++            SelectObject(g->dc, g->ui);
++            if (draw) TextOutW(g->dc, x + w, y, s, n);
++            GetTextExtentPoint32W(g->dc, s, n, &sz);
++            w += sz.cx; s += n;
++            continue;
++        }
++        /* One character it lacks: symbol font, else ASCII. */
++        const wchar_t ch = *s++;
++        if (g->sym && has_glyph(g->dc, g->sym, ch)) {
++            SelectObject(g->dc, g->sym);
++            if (draw) TextOutW(g->dc, x + w, y, &ch, 1);
++            GetTextExtentPoint32W(g->dc, &ch, 1, &sz);
++            w += sz.cx;
++        } else {
++            const wchar_t* alt = ch == 0x2605 ? L"*" : ch == 0x2192 ? L"->" : L"?";
++            SelectObject(g->dc, g->ui);
++            const int an = (int)wcslen(alt);
++            if (draw) TextOutW(g->dc, x + w, y, alt, an);
++            GetTextExtentPoint32W(g->dc, alt, an, &sz);
++            w += sz.cx;
++        }
++    }
++    return w;
++}
++
++/* Builds the premultiplied RGBA panel for s_cur sized for a bw x bh output.
++ * Returns malloc'd pixels (s_pw x s_ph), or NULL. */
++static unsigned char* rasterize(unsigned bw, unsigned bh)
++{
++    int px = (int)(bh * 0.028f + 0.5f);
++    if (px < 14) px = 14;
++    const int pad = px * 7 / 10, lh = px * 5 / 4;
++    Gdi g;
++    g.dc = CreateCompatibleDC(NULL);
++    if (!g.dc) return NULL;
++    g.ui = CreateFontW(-px, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS,
++                       CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
++    g.sym = CreateFontW(-px, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS,
++                        CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI Symbol");
++    HGDIOBJ old_font = SelectObject(g.dc, g.ui);
++    int tw = 0;
++    for (int i = 0; i < s_cur.n; i++) {
++        const int w = text_line(&g, s_cur.text[i], 0, 0, 0);
++        if (w > tw) tw = w;
++    }
++    int pw = tw + 2 * pad, ph = s_cur.n * lh + 2 * pad - (lh - px) ;
++    if (pw > (int)bw * 9 / 10) pw = (int)bw * 9 / 10;
++    if (ph > (int)bh * 9 / 10) ph = (int)bh * 9 / 10;
++    if (pw < 8) pw = 8;
++    if (ph < 8) ph = 8;
++
++    BITMAPINFO bi;
++    memset(&bi, 0, sizeof bi);
++    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
++    bi.bmiHeader.biWidth = pw;
++    bi.bmiHeader.biHeight = -ph;   /* top-down */
++    bi.bmiHeader.biPlanes = 1;
++    bi.bmiHeader.biBitCount = 32;
++    bi.bmiHeader.biCompression = BI_RGB;
++    void* bits = NULL;
++    HBITMAP bmp = CreateDIBSection(g.dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
++    unsigned char* out = NULL;
++    if (bmp && bits) {
++        HGDIOBJ old_bmp = SelectObject(g.dc, bmp);
++        memset(bits, 0, (size_t)pw * ph * 4);
++        SetBkMode(g.dc, TRANSPARENT);
++        SetTextColor(g.dc, RGB(255, 255, 255));
++        for (int i = 0; i < s_cur.n; i++)
++            text_line(&g, s_cur.text[i], pad, pad + i * lh - px / 8, 1);
++        GdiFlush();
++        out = (unsigned char*)malloc((size_t)pw * ph * 4);
++        if (out) {
++            const float bg = 0.66f, rad = (float)pad * 0.8f;
++            const unsigned char* src = (const unsigned char*)bits;
++            for (int y = 0; y < ph; y++) {
++                int line = (y - pad + px / 8) / lh;
++                if (line < 0) line = 0;
++                if (line >= s_cur.n) line = s_cur.n - 1;
++                const unsigned col = s_cur.colour[line];
++                const float cr = ((col >> 16) & 255) / 255.0f, cg = ((col >> 8) & 255) / 255.0f,
++                            cb = (col & 255) / 255.0f;
++                for (int x = 0; x < pw; x++) {
++                    const unsigned char* s = src + ((size_t)y * pw + x) * 4;
++                    unsigned m = s[0] > s[1] ? s[0] : s[1];
++                    if (s[2] > m) m = s[2];
++                    const float c = m / 255.0f;
++                    /* Rounded corners: coverage of the panel shape. */
++                    float shape = 1.0f;
++                    const float fx = x + 0.5f, fy = y + 0.5f;
++                    const float dx = fx < rad ? rad - fx : fx > pw - rad ? fx - (pw - rad) : 0.0f;
++                    const float dy = fy < rad ? rad - fy : fy > ph - rad ? fy - (ph - rad) : 0.0f;
++                    if (dx > 0 && dy > 0) {
++                        const float d = sqrtf(dx * dx + dy * dy) - rad;
++                        shape = d >= 0.5f ? 0.0f : d <= -0.5f ? 1.0f : 0.5f - d;
++                    }
++                    const float a = bg * shape + c * (1.0f - bg * shape);
++                    unsigned char* o = out + ((size_t)y * pw + x) * 4;
++                    o[0] = (unsigned char)(c * cr * 255.0f + 0.5f);
++                    o[1] = (unsigned char)(c * cg * 255.0f + 0.5f);
++                    o[2] = (unsigned char)(c * cb * 255.0f + 0.5f);
++                    o[3] = (unsigned char)(a * 255.0f + 0.5f);
++                }
++            }
++        }
++        SelectObject(g.dc, old_bmp);
++    }
++    if (bmp) DeleteObject(bmp);
++    SelectObject(g.dc, old_font);
++    if (g.ui) DeleteObject(g.ui);
++    if (g.sym) DeleteObject(g.sym);
++    DeleteDC(g.dc);
++    s_pw = (unsigned)pw; s_ph = (unsigned)ph;
++    return out;
++}
++
++/* Texture for s_cur, uploaded through cl. */
++static int build(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, unsigned bw, unsigned bh,
++                 unsigned long long frame)
++{
++    const ULONGLONG t0 = GetTickCount64();
++    unsigned char* px = rasterize(bw, bh);
++    if (!px) return -1;
++    grave_add(s_tex, frame); s_tex = NULL;
++    grave_add(s_up, frame); s_up = NULL;
++
++    D3D12_HEAP_PROPERTIES hp = {0};
++    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC td = {0};
++    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    td.Width = s_pw; td.Height = s_ph; td.DepthOrArraySize = 1; td.MipLevels = 1;
++    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    td.SampleDesc.Count = 1;
++    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    HRESULT hr = dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &td,
++        D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_tex);
++    const UINT pitch = (s_pw * 4 + 255) & ~255u;
++    if (SUCCEEDED(hr)) {
++        D3D12_HEAP_PROPERTIES up = {0};
++        up.Type = D3D12_HEAP_TYPE_UPLOAD;
++        D3D12_RESOURCE_DESC bd = {0};
++        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++        bd.Width = (UINT64)pitch * s_ph; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++        bd.SampleDesc.Count = 1;
++        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++        hr = dev->lpVtbl->CreateCommittedResource(dev, &up, D3D12_HEAP_FLAG_NONE, &bd,
++            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&s_up);
++    }
++    if (SUCCEEDED(hr)) {
++        void* map = NULL;
++        D3D12_RANGE none = {0, 0};
++        hr = s_up->lpVtbl->Map(s_up, 0, &none, &map);
++        if (SUCCEEDED(hr)) {
++            for (unsigned y = 0; y < s_ph; y++)
++                memcpy((unsigned char*)map + (size_t)y * pitch, px + (size_t)y * s_pw * 4, s_pw * 4);
++            s_up->lpVtbl->Unmap(s_up, 0, NULL);
++        }
++    }
++    free(px);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[overlay] texture setup failed (0x%08lX)\n", (unsigned long)hr);
++        return -1;
++    }
++    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
++    dst.pResource = s_tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    src.pResource = s_up; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    src.PlacedFootprint.Footprint.Width = s_pw;
++    src.PlacedFootprint.Footprint.Height = s_ph;
++    src.PlacedFootprint.Footprint.Depth = 1;
++    src.PlacedFootprint.Footprint.RowPitch = pitch;
++    cl->lpVtbl->CopyTextureRegion(cl, &dst, 0, 0, 0, &src, NULL);
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition.pResource = s_tex;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    cl->lpVtbl->ResourceBarrier(cl, 1, &b);
++
++    s_slot = (s_slot + 1) % OV_SLOTS;
++    D3D12_CPU_DESCRIPTOR_HANDLE h;
++    s_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_heap, &h);
++    h.ptr += (SIZE_T)s_slot * s_heap_inc;
++    D3D12_SHADER_RESOURCE_VIEW_DESC sd;
++    memset(&sd, 0, sizeof sd);
++    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    sd.Texture2D.MipLevels = 1;
++    dev->lpVtbl->CreateShaderResourceView(dev, s_tex, &sd, h);
++    s_bw = bw; s_bh = bh;
++    fprintf(stderr, "[overlay] toast %u lines, panel %ux%u for %ux%u output (%llu ms to build)\n",
++            (unsigned)s_cur.n, s_pw, s_ph, bw, bh, (unsigned long long)(GetTickCount64() - t0));
++    return 0;
++}
++
++void rsx_overlay_d3d12_draw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl,
++                            D3D12_CPU_DESCRIPTOR_HANDLE rtv, unsigned w, unsigned h,
++                            unsigned long long frame)
++{
++    if (!s_active) return;   /* the whole idle cost */
++    grave_sweep(frame);
++    if (s_failed || !dev || !cl || !w || !h) return;
++    if (!s_rs && pipeline_init(dev) < 0) { s_failed = 1; return; }
++
++    const ULONGLONG now = GetTickCount64();
++    if (s_have_cur && s_t0 && now - s_t0 >= (ULONGLONG)s_cur.ms) {
++        s_have_cur = 0;
++        InterlockedDecrement(&s_active);
++        if (!s_active) return;
++    }
++    if (!s_have_cur) {
++        AcquireSRWLockExclusive(&s_lock);
++        if (s_qn > 0) {
++            s_cur = s_queue[0];
++            memmove(&s_queue[0], &s_queue[1], sizeof(Toast) * (OV_QUEUE - 1));
++            s_qn--;
++            s_have_cur = 1; s_built = 0; s_t0 = 0;
++        }
++        ReleaseSRWLockExclusive(&s_lock);
++        if (!s_have_cur) return;
++    }
++    if (!s_built || s_bw != w || s_bh != h) {
++        if (build(dev, cl, w, h, frame) < 0) {   /* drop this toast */
++            s_have_cur = 0;
++            InterlockedDecrement(&s_active);
++            return;
++        }
++        s_built = 1;
++    }
++    if (!s_t0) s_t0 = now;
++    const float t = (float)(now - s_t0), dur = (float)s_cur.ms;
++    float fade = t < 200.0f ? t / 200.0f : 1.0f;
++    if (dur - t < 1000.0f) fade = (dur - t) / 1000.0f;
++    if (fade < 0) fade = 0;
++
++    /* Margin 3% of the height, pixel aligned. Top right by default; the other places keep
++       clear of the game's own top / bottom bars (12% of the height). */
++    const float m = floorf(h * 0.03f), bar = floorf(h * 0.12f);
++    float x0, y0;
++    switch (s_cur.pos) {
++    case 1:  x0 = m; y0 = bar; break;
++    case 2:  x0 = (float)w - m - (float)s_pw; y0 = (float)h - bar - (float)s_ph; break;
++    case 3:  x0 = floorf(((float)w - (float)s_pw) * 0.5f); y0 = bar; break;
++    default: x0 = (float)w - m - (float)s_pw; y0 = m; break;
++    }
++    const float x1 = x0 + (float)s_pw, y1 = y0 + (float)s_ph;
++    float k[8];
++    k[0] = x0 / w * 2.0f - 1.0f; k[1] = 1.0f - y0 / h * 2.0f;
++    k[2] = x1 / w * 2.0f - 1.0f; k[3] = 1.0f - y1 / h * 2.0f;
++    k[4] = fade; k[5] = k[6] = k[7] = 0.0f;
++
++    D3D12_GPU_DESCRIPTOR_HANDLE gh;
++    s_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_heap, &gh);
++    gh.ptr += (UINT64)s_slot * s_heap_inc;
++    D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
++    D3D12_RECT sc = {0, 0, (LONG)w, (LONG)h};
++    cl->lpVtbl->SetGraphicsRootSignature(cl, s_rs);
++    cl->lpVtbl->SetPipelineState(cl, s_pso);
++    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_heap);
++    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, gh);
++    cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 8, k, 0);
++    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
++    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
++    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
++    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
++    cl->lpVtbl->DrawInstanced(cl, 4, 1, 0, 0);
++}
++
++#else /* !_WIN32: no host overlay; toasts are dropped. */
++
++#include "rsx_overlay.h"
++
++void rsx_overlay_post(const char* const* lines, int n, int ms) { (void)lines; (void)n; (void)ms; }
++int rsx_overlay_active(void) { return 0; }
++
++#endif /* _WIN32 */

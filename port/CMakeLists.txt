@@ -220,9 +220,11 @@ if(HSG_TARGET_PROFILE STREQUAL "official-1.03")
     target_compile_definitions(${PROJECT_NAME} PRIVATE HSG_TARGET_OFFICIAL_1_03=1)
 elseif(HSG_TARGET_PROFILE STREQUAL "jp-1.27")
     # JP 1.27 (BCJS30089, pipeline-jp127.toml): its own lift, plus the hooks that
-    # tools/jp_lift_hooks.py split out of the lift (archive name fallback).
+    # tools/jp_lift_hooks.py split out of the lift (archive name fallback,
+    # HSG_UNLOCKS offline rare characters).
     target_compile_definitions(${PROJECT_NAME} PRIVATE HSG_TARGET_JP_1_27=1)
-    target_sources(${PROJECT_NAME} PRIVATE hsg_jp127_hooks.cpp)
+    target_sources(${PROJECT_NAME} PRIVATE hsg_jp127_hooks.cpp hsg_jp127_unlocks.cpp
+        hsg_jp127_capsule.cpp)
 elseif(NOT HSG_TARGET_PROFILE STREQUAL "fix-1.02")
     message(FATAL_ERROR "Unsupported HSG_TARGET_PROFILE: ${HSG_TARGET_PROFILE}")
 endif()

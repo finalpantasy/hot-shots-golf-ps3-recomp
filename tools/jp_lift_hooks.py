@@ -14,6 +14,12 @@ from pathlib import Path
 
 HOOKS = {
     0x00788B64: "FB_FindEntryByPath (US 0x00779228): archive name fallback, data/chara|course -> *_localize",
+    0x004452C8: "gashapon manager tick (from Main_Tick): HSG_UNLOCKS applies offline rare levels",
+    0x00348384: "PrizeManager ctor (round over, from game.cpp 0x0068C500): HSG_UNLOCKS=grind earns tickets",
+    0x0044A6C0: "gashapon capsule roll (one draw record): HSG_UNLOCKS=grind applies its odds and pity",
+    0x0044ABF4: "gashapon draw (records, count): HSG_UNLOCKS=grind saves the result to the store",
+    0x0044BD0C: "gashapon TUS rare bit set (pc, star-1): capsule debug log",
+    0x0044C4E4: "gashapon TUS write of slots 1-63: capsule debug log",
 }
 
 

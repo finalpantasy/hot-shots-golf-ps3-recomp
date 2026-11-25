@@ -10,7 +10,8 @@ Windows exe (HotShotsGolfLauncher.exe) so players need no Python.
     --settings <file or folder>                    use another settings file or folder
     --exe <file>                                   override the exe of the chosen edition
     --edition us|ult  --profile NAME               override those two for this run
-    --set key=value                                override any top-level setting (repeatable;
+    --set key=value                                override any top-level setting (repeatable; unlocks=grind
+                                                   or HSG_UNLOCKS=grind, ticket_rate=2 or HSG_TICKET_RATE=2;
                                                    value is JSON, else plain text)
     --out-file <file>                              also write the --print-command text there
     --ultimate-setup <args>                        run tools/build_ultimate_data.py (see its --help)
@@ -122,6 +123,37 @@ def fps_env(choice):
 ULT_FPS_SUPPORTED = True
 
 
+UNLOCK_MODES = {"original": "Original", "grind": "Grind", "all": "Unlock all"}
+UNLOCK_HELP = {
+    "original": "Original: the game as shipped. Rare unlocks are earned the original way.",
+    "grind": "Grind: earn capsule tickets by playing; each ticket draws a rare character or a star.",
+    "all": "Unlock all: every rare character and item is available from the start.",
+}
+TICKET_RATES = ["0.5", "1", "2"]
+TICKET_HELP = "Ticket rate: how fast tickets are earned in Grind (0.5x slower, 2x faster)."
+
+
+def unlocks_mode(s):
+    """The unlock mode that applies: only the Ultimate edition has one ('original' elsewhere)."""
+    m = str(s.get("unlocks", "original")).strip().lower()
+    if s["edition"] != "ult":
+        return "original"
+    return m if m in UNLOCK_MODES else "original"
+
+
+def ticket_rate(s):
+    """Ticket rate as '0.5', '1' or '2' (None when not valid). Accepts 2, 2.0, '2x'."""
+    v = str(s.get("ticket_rate", "1")).strip().lower().rstrip("x")
+    try:
+        f = float(v)
+    except ValueError:
+        return None
+    for r in TICKET_RATES:
+        if f == float(r):
+            return r
+    return None
+
+
 def fps_locked(s):
     """True when the frame-rate choice does not apply to the chosen edition."""
     return s["edition"] == "ult" and not ULT_FPS_SUPPORTED
@@ -149,6 +181,8 @@ DEFAULTS = {
     "vsync": True,            # D3D12_VSYNC=0 when off (only with a rate above 30)
     "tweaks": "",             # HSG_TWEAKS=<json>     (patch 0059)
     "mute": False,            # --mute                (port/cli_options.cpp)
+    "unlocks": "original",    # Ultimate only: HSG_UNLOCKS original|grind|all
+    "ticket_rate": "1",       # Ultimate only: HSG_TICKET_RATE 0.5|1|2 (acts with grind)
     "dlc_earn": True,         # HSG_DLC_EARN=0 when off (patch 0070)
     "extra_args": "",         # free text, appended as-is (hides nothing that exists)
     # Ultimate setup (tools/build_ultimate_data.py). Blank = the default for this install.
@@ -307,6 +341,10 @@ def profile_savedata(s, settings_file, ed=None, profile=None):
     ed = ed or s["edition"]
     profile = profile or s["profile"]
     if profile == DEFAULT_PROFILE or not profile:
+        mode = unlocks_mode(dict(s, edition=ed))
+        if mode != "original":      # rare unlocks are saved in the save: one folder per mode
+            return os.path.join(profiles_root(settings_file), "%s-%s" % (DEFAULT_PROFILE, mode),
+                                ed, "savedata")
         return eff_path(s, settings_file, "savedata", ed)
     return os.path.join(profiles_root(settings_file), profile, ed, "savedata")
 
@@ -405,6 +443,11 @@ def validate(s, settings_file):
             errs.append("Folder not found (%s): %s" % (k, _abs(base, v)))
     if s["profile"] != DEFAULT_PROFILE and s["profile"] not in s["profiles"]:
         errs.append("Unknown save profile: %s" % s["profile"])
+    if s["edition"] == "ult":
+        if str(s["unlocks"]).strip().lower() not in UNLOCK_MODES:
+            errs.append("Unknown unlocks setting: %s (use original, grind or all)" % s["unlocks"])
+        if ticket_rate(s) is None:
+            errs.append("Unknown ticket rate: %s (use 0.5, 1 or 2)" % s["ticket_rate"])
     if s["window_mode"] not in WINDOW_MODES:
         errs.append("Unknown window mode: %s" % s["window_mode"])
     if s["aspect"] not in ASPECTS:
@@ -463,6 +506,10 @@ def build_command(s, settings_file):
         env["HSG_FPS"] = fps_effective(s)                     # patches 0058, 0074
         if not s["vsync"]:
             env["D3D12_VSYNC"] = "0"                          # rsx_d3d12_backend.c
+    if s["edition"] == "ult" and unlocks_mode(s) != "original":
+        env["HSG_UNLOCKS"] = unlocks_mode(s)                  # Ultimate runtime
+        if unlocks_mode(s) == "grind" and ticket_rate(s):
+            env["HSG_TICKET_RATE"] = ticket_rate(s)           # Ultimate runtime
     if not s["dlc_earn"]:
         env["HSG_DLC_EARN"] = "0"                             # patch 0070 (default on)
     if s["extra_args"]:
@@ -510,7 +557,7 @@ def launch(s, settings_file, wait=False):
         raise RuntimeError("\n".join(errs))
     argv, env, cwd = build_command(s, settings_file)
     sd = profile_savedata(s, settings_file)
-    if sd and s["profile"] != DEFAULT_PROFILE:
+    if sd and (s["profile"] != DEFAULT_PROFILE or unlocks_mode(s) != "original"):
         os.makedirs(sd, exist_ok=True)
     full_env = dict(os.environ)
     full_env.update(env)
@@ -677,6 +724,23 @@ def run_gui(settings_file):
     prof_box = ttk.Combobox(top, textvariable=prof_var, state="readonly", width=24)
     prof_box.grid(row=1, column=1, sticky="w", padx=6, pady=(4, 0))
 
+    ttk.Label(top, text="Unlocks").grid(row=2, column=0, sticky="w", pady=(4, 0))
+    uf = ttk.Frame(top)
+    uf.grid(row=2, column=1, sticky="w", padx=6, pady=(4, 0))
+    unl_var = tk.StringVar(value=UNLOCK_MODES[unlocks_mode(dict(s, edition="ult"))])
+    unl_box = ttk.Combobox(uf, textvariable=unl_var, state="readonly", width=14,
+                           values=list(UNLOCK_MODES.values()))
+    unl_box.pack(side="left")
+    ttk.Label(uf, text="  Ticket rate").pack(side="left")
+    tr_var = tk.StringVar(value=(ticket_rate(s) or "1") + "x")
+    tr_box = ttk.Combobox(uf, textvariable=tr_var, state="readonly", width=6,
+                          values=[r + "x" for r in TICKET_RATES])
+    tr_box.pack(side="left", padx=4)
+    unl_note = ttk.Label(top, text="", foreground="#666", wraplength=620)
+    unl_note.grid(row=3, column=1, sticky="w", padx=6)
+    sv_note = ttk.Label(top, text="", foreground="#666", wraplength=620)
+    sv_note.grid(row=4, column=1, sticky="w", padx=6)
+
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -794,6 +858,7 @@ def run_gui(settings_file):
         pl_info.config(text="Saves for %s / %s: %s" % (
             EDITIONS[cur["edition"]], cur["profile"],
             sd or "(the game's own default, next to the exe)"))
+        sv_note.config(text="Save folder: " + (sd or "(the game's own default, next to the exe)"))
 
     def new_profile(copy):
         name = simpledialog.askstring("New profile", "Profile name:", parent=root)
@@ -1034,6 +1099,8 @@ def run_gui(settings_file):
                     out[k] = DEFAULTS[k]
         out["edition"] = ed_key()
         out["profile"] = prof_var.get()
+        out["unlocks"] = next((k for k, v in UNLOCK_MODES.items() if v == unl_var.get()), "original")
+        out["ticket_rate"] = tr_var.get().rstrip("x") or "1"
         out["editions"][cur_ed["v"]] = {k: PV[k].get().strip() for k in ED_KEYS}
         if out["aspect"].startswith("expand"):
             out["aspect"] = "expand"
@@ -1069,6 +1136,15 @@ def run_gui(settings_file):
             vs_box.config(state="normal")
             V["fps"].set(state["fps_saved"] if state["fps_saved"] else "30 (stock)")
             fps_note.config(text="")
+        ult = new == "ult"
+        unl_box.config(state="readonly" if ult else "disabled")
+        grind = ult and unl_var.get() == UNLOCK_MODES["grind"]
+        tr_box.config(state="readonly" if grind else "disabled")
+        if ult:
+            unl_note.config(text=UNLOCK_HELP[next(k for k, v in UNLOCK_MODES.items() if v == unl_var.get())]
+                            + ("  " + TICKET_HELP if grind else ""))
+        else:
+            unl_note.config(text="Unlocks and ticket rate are for the Ultimate edition only.")
         refresh_hints()
         profile_info()
         check()
@@ -1142,6 +1218,8 @@ def run_gui(settings_file):
     ttk.Button(bf, text="Save", command=save).pack(side="right")
     ttk.Button(bf, text="Save and Play", command=play).pack(side="right", padx=4)
     ed_box.bind("<<ComboboxSelected>>", apply_edition)
+    unl_box.bind("<<ComboboxSelected>>", apply_edition)
+    tr_box.bind("<<ComboboxSelected>>", apply_edition)
     prof_box.bind("<<ComboboxSelected>>", lambda e: (refresh_profiles(), profile_info(), check()), add="+")
     root.title("Hot Shots Golf Launcher - " + state["file"])
     load_paths()
@@ -1182,6 +1260,7 @@ def main(argv=None):
                 s["profiles"].append(a.profile)     # this run only; nothing is saved here
         for kv in a.set:
             k, _, v = kv.partition("=")
+            k = {"HSG_UNLOCKS": "unlocks", "HSG_TICKET_RATE": "ticket_rate"}.get(k, k)
             if k not in GLOBAL_KEYS:
                 print("error: unknown setting " + k, file=sys.stderr)
                 return 2
